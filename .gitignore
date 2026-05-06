@@ -1,0 +1,84 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual envs ---
+venv/
+.venv/
+env/
+
+# --- Secrets / config ---
+.env
+.env.*
+!.env.example
+secrets.*
+*.key
+*.pem
+credentials.json
+
+# --- Databases ---
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# --- Data files ---
+data/
+*.parquet
+*.csv
+*.feather
+*.h5
+*.hdf5
+*.npz
+*.pkl
+*.pickle
+*.arrow
+
+# --- ML artifacts ---
+mlruns/
+catboost_info/
+lightning_logs/
+wandb/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# --- Logs / reports ---
+logs/
+*.log
+reports/**/*.png
+reports/**/*.jpg
+reports/**/*.html
+reports/accounts/
+reports/backtest/
+
+# --- Editor / OS ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# --- Backups / scratch ---
+*.bak
+*.orig
+*.tmp
+*~
+
+# --- Project-specific scratch dirs ---
+home/
+analysis/output/
+research/output/
+backtest/results/

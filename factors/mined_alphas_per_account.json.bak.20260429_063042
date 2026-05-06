@@ -1,0 +1,160 @@
+{
+  "B01": [
+    {
+      "name": "gp_alpha_1_00",
+      "expression": "max2(X11, log_abs1(X10))",
+      "fitness": 0.09844148592090371,
+      "ic": 0.10493119594975632
+    },
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "log_abs1(X10)",
+      "fitness": 0.07329745379896221,
+      "ic": 0.069543281189252
+    }
+  ],
+  "B02": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "max2(X11, log_abs1(X10))",
+      "fitness": 0.10700043035366828,
+      "ic": 0.10493119594975632
+    },
+    {
+      "name": "gp_alpha_2_00",
+      "expression": "log_abs1(X10)",
+      "fitness": 0.08641790746324589,
+      "ic": 0.069543281189252
+    }
+  ],
+  "B03": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X7",
+      "fitness": 0.06480898239516779,
+      "ic": 0.05595738667209934
+    },
+    {
+      "name": "gp_alpha_2_00",
+      "expression": "X3",
+      "fitness": 0.06679088853266955,
+      "ic": 0.05595037639293758
+    }
+  ],
+  "B04": [
+    {
+      "name": "gp_alpha_2_00",
+      "expression": "max2(log_abs1(X10), X11)",
+      "fitness": 0.10460926218414887,
+      "ic": 0.10493119594975632
+    },
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "sqrt_abs(X10)",
+      "fitness": 0.08361860329067926,
+      "ic": 0.069543281189252
+    }
+  ],
+  "B05": [
+    {
+      "name": "gp_alpha_4_00",
+      "expression": "max2(X7, X11)",
+      "fitness": 0.06648837901632257,
+      "ic": 0.08767688159537941
+    },
+    {
+      "name": "gp_alpha_2_01",
+      "expression": "sqrt_abs(X10)",
+      "fitness": 0.04630023837058546,
+      "ic": 0.069543281189252
+    },
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X7",
+      "fitness": 0.06376180373293126,
+      "ic": 0.05595738667209934
+    },
+    {
+      "name": "gp_alpha_0_01",
+      "expression": "X3",
+      "fitness": 0.06247797056118427,
+      "ic": 0.05595037639293758
+    }
+  ],
+  "B06": [
+    {
+      "name": "gp_alpha_1_00",
+      "expression": "max2(max2(log_abs1(X10), X11), X11)",
+      "fitness": 0.1101573371363082,
+      "ic": 0.10493119594975632
+    },
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "sqrt_abs(sqrt_abs(sqrt_abs(sqrt_abs(max2(X11, X10)))))",
+      "fitness": 0.10386966924671989,
+      "ic": 0.0988158309477051
+    }
+  ],
+  "B07": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "sqrt_abs(X10)",
+      "fitness": 0.06705102623299106,
+      "ic": 0.069543281189252
+    },
+    {
+      "name": "gp_alpha_2_00",
+      "expression": "log_abs1(X11)",
+      "fitness": 0.0614361718580392,
+      "ic": 0.06784140858275556
+    },
+    {
+      "name": "gp_alpha_2_01",
+      "expression": "X3",
+      "fitness": 0.06589570885766105,
+      "ic": 0.05595037639293758
+    }
+  ],
+  "B08": [
+    {
+      "name": "gp_alpha_1_01",
+      "expression": "sqrt_abs(add(X10, add(X10, X11)))",
+      "fitness": 0.07271483926662795,
+      "ic": 0.09675527262313224
+    },
+    {
+      "name": "gp_alpha_1_05",
+      "expression": "sqrt_abs(sqrt_abs(add(X10, sqrt_abs(add(X10, X11)))))",
+      "fitness": 0.04906112519614552,
+      "ic": 0.09226792631817643
+    },
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "sqrt_abs(sqrt_abs(X10))",
+      "fitness": 0.07646793299928595,
+      "ic": 0.069543281189252
+    }
+  ],
+  "B09": [
+    {
+      "name": "gp_alpha_1_01",
+      "expression": "X7",
+      "fitness": 0.06296231329941317,
+      "ic": 0.05595738667209934
+    },
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X3",
+      "fitness": 0.06405506677393741,
+      "ic": 0.05595037639293758
+    }
+  ],
+  "B10": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "max2(X11, max2(X11, log_abs1(X10)))",
+      "fitness": 0.0983481521894142,
+      "ic": 0.10493119594975632
+    }
+  ]
+}

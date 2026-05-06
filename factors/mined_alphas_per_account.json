@@ -1,0 +1,885 @@
+{
+  "B01": [
+    {
+      "name": "gp_alpha_1_00",
+      "expression": "max2(X11, log_abs1(X10))",
+      "fitness": 0.09844148592090371,
+      "ic": 0.10493119594975632
+    },
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "log_abs1(X10)",
+      "fitness": 0.07329745379896221,
+      "ic": 0.069543281189252
+    }
+  ],
+  "B02": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "max2(X11, log_abs1(X10))",
+      "fitness": 0.10700043035366828,
+      "ic": 0.10493119594975632
+    },
+    {
+      "name": "gp_alpha_2_00",
+      "expression": "log_abs1(X10)",
+      "fitness": 0.08641790746324589,
+      "ic": 0.069543281189252
+    }
+  ],
+  "B03": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X7",
+      "fitness": 0.06480898239516779,
+      "ic": 0.05595738667209934
+    },
+    {
+      "name": "gp_alpha_2_00",
+      "expression": "X3",
+      "fitness": 0.06679088853266955,
+      "ic": 0.05595037639293758
+    }
+  ],
+  "B04": [
+    {
+      "name": "gp_alpha_2_00",
+      "expression": "max2(log_abs1(X10), X11)",
+      "fitness": 0.10460926218414887,
+      "ic": 0.10493119594975632
+    },
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "sqrt_abs(X10)",
+      "fitness": 0.08361860329067926,
+      "ic": 0.069543281189252
+    }
+  ],
+  "B05": [
+    {
+      "name": "gp_alpha_4_00",
+      "expression": "max2(X7, X11)",
+      "fitness": 0.06648837901632257,
+      "ic": 0.08767688159537941
+    },
+    {
+      "name": "gp_alpha_2_01",
+      "expression": "sqrt_abs(X10)",
+      "fitness": 0.04630023837058546,
+      "ic": 0.069543281189252
+    },
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X7",
+      "fitness": 0.06376180373293126,
+      "ic": 0.05595738667209934
+    },
+    {
+      "name": "gp_alpha_0_01",
+      "expression": "X3",
+      "fitness": 0.06247797056118427,
+      "ic": 0.05595037639293758
+    }
+  ],
+  "B06": [
+    {
+      "name": "gp_alpha_1_00",
+      "expression": "max2(max2(log_abs1(X10), X11), X11)",
+      "fitness": 0.1101573371363082,
+      "ic": 0.10493119594975632
+    },
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "sqrt_abs(sqrt_abs(sqrt_abs(sqrt_abs(max2(X11, X10)))))",
+      "fitness": 0.10386966924671989,
+      "ic": 0.0988158309477051
+    }
+  ],
+  "B07": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "sqrt_abs(X10)",
+      "fitness": 0.06705102623299106,
+      "ic": 0.069543281189252
+    },
+    {
+      "name": "gp_alpha_2_00",
+      "expression": "log_abs1(X11)",
+      "fitness": 0.0614361718580392,
+      "ic": 0.06784140858275556
+    },
+    {
+      "name": "gp_alpha_2_01",
+      "expression": "X3",
+      "fitness": 0.06589570885766105,
+      "ic": 0.05595037639293758
+    }
+  ],
+  "B08": [
+    {
+      "name": "gp_alpha_1_01",
+      "expression": "sqrt_abs(add(X10, add(X10, X11)))",
+      "fitness": 0.07271483926662795,
+      "ic": 0.09675527262313224
+    },
+    {
+      "name": "gp_alpha_1_05",
+      "expression": "sqrt_abs(sqrt_abs(add(X10, sqrt_abs(add(X10, X11)))))",
+      "fitness": 0.04906112519614552,
+      "ic": 0.09226792631817643
+    },
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "sqrt_abs(sqrt_abs(X10))",
+      "fitness": 0.07646793299928595,
+      "ic": 0.069543281189252
+    }
+  ],
+  "B09": [
+    {
+      "name": "gp_alpha_1_01",
+      "expression": "X7",
+      "fitness": 0.06296231329941317,
+      "ic": 0.05595738667209934
+    },
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X3",
+      "fitness": 0.06405506677393741,
+      "ic": 0.05595037639293758
+    }
+  ],
+  "B10": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "max2(X11, max2(X11, log_abs1(X10)))",
+      "fitness": 0.0983481521894142,
+      "ic": 0.10493119594975632
+    }
+  ],
+  "B11": [
+    {
+      "name": "gp_alpha_1_01",
+      "expression": "max2(sqrt_abs(X0), log_abs1(sqrt_abs(X1)))",
+      "fitness": 0.10322300078826968,
+      "ic": 0.11558635369661266,
+      "feature_cols": [
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    }
+  ],
+  "B12": [
+    {
+      "name": "gp_alpha_3_02",
+      "expression": "max2(log_abs1(max2(log_abs1(log_abs1(sub(X2, X1))), sub(X5, X1))), sub(X5, X1))",
+      "fitness": 0.08911648449338153,
+      "ic": 0.14300513029411352,
+      "feature_cols": [
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "o_c",
+        "h_c",
+        "l_c"
+      ],
+      "y_target": "next_5d_ret"
+    },
+    {
+      "name": "gp_alpha_1_00",
+      "expression": "max2(max2(inv(X0), X3), X3)",
+      "fitness": 0.14075027162179166,
+      "ic": 0.13856007401169396,
+      "feature_cols": [
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "o_c",
+        "h_c",
+        "l_c"
+      ],
+      "y_target": "next_5d_ret"
+    }
+  ],
+  "B13": [
+    {
+      "name": "gp_alpha_0_01",
+      "expression": "add(X0, add(X0, X2))",
+      "fitness": 0.14182877887430215,
+      "ic": 0.1430104594713856,
+      "feature_cols": [
+        "std_5",
+        "std_10",
+        "std_20",
+        "v_vma20"
+      ],
+      "y_target": "next_5d_sharpe"
+    }
+  ],
+  "B14": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X1",
+      "fitness": 0.1713669398929718,
+      "ic": 0.14549556681796474,
+      "feature_cols": [
+        "std_5",
+        "std_20",
+        "ma_20",
+        "l_c",
+        "v_vma20"
+      ],
+      "y_target": "next_5d_minret_neg"
+    }
+  ],
+  "B15": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "max2(X2, log_abs1(X1))",
+      "fitness": 0.1547557655410234,
+      "ic": 0.14489257671304,
+      "feature_cols": [
+        "v_vma20",
+        "ret_1",
+        "ret_5",
+        "h_c",
+        "l_c"
+      ],
+      "y_target": "next_3d_ret"
+    },
+    {
+      "name": "gp_alpha_4_00",
+      "expression": "sub(sub(sub(add(sqrt_abs(X1), X2), X1), X1), X1)",
+      "fitness": 0.104066376436222,
+      "ic": 0.1339829512299299,
+      "feature_cols": [
+        "v_vma20",
+        "ret_1",
+        "ret_5",
+        "h_c",
+        "l_c"
+      ],
+      "y_target": "next_3d_ret"
+    }
+  ],
+  "B16": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X3",
+      "fitness": 0.12152056973732886,
+      "ic": -0.10256223047955389,
+      "feature_cols": [
+        "ma_5",
+        "ma_10",
+        "ret_1",
+        "std_5"
+      ],
+      "y_target": "reversal_2d"
+    }
+  ],
+  "CB01": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X10",
+      "fitness": 0.07780440028766891,
+      "ic": -0.04705460592821491,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    },
+    {
+      "name": "gp_alpha_0_01",
+      "expression": "X2",
+      "fitness": 0.06653922977120189,
+      "ic": 0.04573938481105452,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    },
+    {
+      "name": "gp_alpha_2_01",
+      "expression": "mul(X5, X0)",
+      "fitness": 0.05147479561513113,
+      "ic": 0.03731129164525998,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    }
+  ],
+  "CB02": [
+    {
+      "name": "gp_alpha_1_00",
+      "expression": "add(X10, X1)",
+      "fitness": 0.07455782919619473,
+      "ic": -0.05773453843371653,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    },
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X10",
+      "fitness": 0.08639941177867035,
+      "ic": -0.04705460592821491,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    }
+  ],
+  "CB03": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X10",
+      "fitness": 0.05674602009079796,
+      "ic": -0.04705460592821491,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    },
+    {
+      "name": "gp_alpha_5_00",
+      "expression": "X2",
+      "fitness": 0.062177781850896355,
+      "ic": 0.04573938481105452,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    }
+  ],
+  "CB04": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X10",
+      "fitness": 0.08335482832953658,
+      "ic": -0.04705460592821491,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    },
+    {
+      "name": "gp_alpha_0_03",
+      "expression": "X2",
+      "fitness": 0.0691738877462206,
+      "ic": 0.04573938481105452,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    }
+  ],
+  "CB05": [
+    {
+      "name": "gp_alpha_0_01",
+      "expression": "X10",
+      "fitness": 0.06579094324555514,
+      "ic": -0.04705460592821491,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    },
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X2",
+      "fitness": 0.0663498354450299,
+      "ic": 0.04573938481105452,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    }
+  ],
+  "CB06": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "add(X1, X10)",
+      "fitness": 0.0847379132552393,
+      "ic": -0.05773453843371653,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    },
+    {
+      "name": "gp_alpha_1_10",
+      "expression": "sub(X10, X2)",
+      "fitness": 0.06395736210306119,
+      "ic": -0.05302973780337443,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    },
+    {
+      "name": "gp_alpha_1_01",
+      "expression": "mul(X10, X9)",
+      "fitness": 0.06843216482932915,
+      "ic": -0.05193946607008305,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    }
+  ],
+  "CB07": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X10",
+      "fitness": 0.08565485686061387,
+      "ic": -0.04705460592821491,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    }
+  ],
+  "CB08": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X10",
+      "fitness": 0.08157789780112627,
+      "ic": -0.04705460592821491,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    },
+    {
+      "name": "gp_alpha_2_01",
+      "expression": "X2",
+      "fitness": 0.07065953619460703,
+      "ic": 0.04573938481105452,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    }
+  ],
+  "CB09": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X10",
+      "fitness": 0.06567395565705553,
+      "ic": -0.04705460592821491,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    }
+  ],
+  "CB10": [
+    {
+      "name": "gp_alpha_0_01",
+      "expression": "add(X10, X1)",
+      "fitness": 0.06698780531555869,
+      "ic": -0.05773453843371653,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    },
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X10",
+      "fitness": 0.0958582480217075,
+      "ic": -0.04705460592821491,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    },
+    {
+      "name": "gp_alpha_0_03",
+      "expression": "X2",
+      "fitness": 0.0734384406291897,
+      "ic": 0.04573938481105452,
+      "feature_cols": [
+        "o_c",
+        "h_c",
+        "l_c",
+        "v_vma20",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "std_5",
+        "std_10",
+        "std_20",
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    }
+  ],
+  "CB11": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X0",
+      "fitness": 0.08413192705586284,
+      "ic": -0.04705460592821491,
+      "feature_cols": [
+        "ret_1",
+        "ret_5",
+        "ret_10"
+      ],
+      "y_target": "next_1d_ret"
+    }
+  ],
+  "CB12": [
+    {
+      "name": "gp_alpha_3_01",
+      "expression": "sqrt_abs(sqrt_abs(sub(sqrt_abs(sub(X2, X0)), X0)))",
+      "fitness": 0.047140471747674835,
+      "ic": -0.05629250534461578,
+      "feature_cols": [
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "o_c",
+        "h_c",
+        "l_c"
+      ],
+      "y_target": "next_5d_ret"
+    },
+    {
+      "name": "gp_alpha_1_01",
+      "expression": "add(add(X4, X5), X5)",
+      "fitness": 0.05209146984668523,
+      "ic": 0.0482073106518691,
+      "feature_cols": [
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "o_c",
+        "h_c",
+        "l_c"
+      ],
+      "y_target": "next_5d_ret"
+    }
+  ],
+  "CB13": [
+    {
+      "name": "gp_alpha_2_00",
+      "expression": "sqrt_abs(sub(0.036, X2))",
+      "fitness": 0.08559640618079321,
+      "ic": 0.07580220314152664,
+      "feature_cols": [
+        "std_5",
+        "std_10",
+        "std_20",
+        "v_vma20"
+      ],
+      "y_target": "next_5d_sharpe"
+    },
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X1",
+      "fitness": 0.08073392705100257,
+      "ic": 0.040491774665540575,
+      "feature_cols": [
+        "std_5",
+        "std_10",
+        "std_20",
+        "v_vma20"
+      ],
+      "y_target": "next_5d_sharpe"
+    }
+  ],
+  "CB14": [
+    {
+      "name": "gp_alpha_0_02",
+      "expression": "mul(mul(X0, X1), X1)",
+      "fitness": 0.3817673860907626,
+      "ic": 0.38874508410991476,
+      "feature_cols": [
+        "std_5",
+        "std_20",
+        "ma_20",
+        "l_c",
+        "v_vma20"
+      ],
+      "y_target": "next_5d_minret_neg"
+    }
+  ],
+  "CB15": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X0",
+      "fitness": 0.06828560078664267,
+      "ic": -0.0371835036186834,
+      "feature_cols": [
+        "v_vma20",
+        "ret_1",
+        "ret_5",
+        "h_c",
+        "l_c"
+      ],
+      "y_target": "next_3d_ret"
+    }
+  ],
+  "CB16": [
+    {
+      "name": "gp_alpha_0_00",
+      "expression": "X2",
+      "fitness": 0.0990599197543895,
+      "ic": 0.05391211697199613,
+      "feature_cols": [
+        "ma_5",
+        "ma_10",
+        "ret_1",
+        "std_5"
+      ],
+      "y_target": "reversal_2d"
+    }
+  ]
+}

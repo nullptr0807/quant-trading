@@ -1,0 +1,243 @@
+"""
+Quantitative Trading System - Configuration Settings
+US stocks via moomoo Australia broker
+"""
+
+import os
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+# =============================================================================
+# API Keys
+# =============================================================================
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
+
+# =============================================================================
+# Stock Universe - ~200 liquid S&P 500 tickers (expanded for diversification)
+# =============================================================================
+STOCK_UNIVERSE = [
+    # Mega cap tech (35)
+    "AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "META", "GOOG", "TSLA", "AVGO", "ORCL",
+    "ADBE", "CRM", "AMD", "INTC", "CSCO", "TXN", "QCOM", "AMAT", "MU", "LRCX",
+    "KLAC", "SNPS", "CDNS", "MRVL", "ADI", "NXPI", "ON", "FTNT", "PANW", "NOW",
+    "PLTR", "CRWD", "ABNB", "DASH", "COIN",
+    # Finance (28)
+    "JPM", "BAC", "WFC", "GS", "MS", "C", "BLK", "SCHW", "AXP", "USB",
+    "PNC", "TFC", "COF", "BK", "CME", "ICE", "MCO", "SPGI", "AON",
+    "MET", "PRU", "AIG", "ALL", "TRV", "CB", "AFL", "FITB", "KEY",
+    # Healthcare (28)
+    "UNH", "JNJ", "LLY", "ABBV", "MRK", "PFE", "TMO", "ABT", "DHR", "BMY",
+    "AMGN", "GILD", "ISRG", "MDT", "SYK", "BSX", "EW", "ZTS", "VRTX", "REGN",
+    "HCA", "CI", "ELV", "CVS", "MCK", "DXCM", "IDXX", "BDX",
+    # Consumer (30)
+    "PG", "KO", "PEP", "COST", "WMT", "MCD", "NKE", "SBUX", "TGT", "LOW",
+    "HD", "TJX", "ROST", "DG", "DLTR", "YUM", "CMG", "EL", "CL",
+    "KMB", "GIS", "HSY", "MNST", "KHC", "KDP", "STZ", "TAP", "PM", "MO", "BRK-B",
+    # Energy (16)
+    "XOM", "CVX", "COP", "EOG", "SLB", "MPC", "PSX", "VLO", "OXY", "DVN",
+    "HAL", "FANG", "BKR", "WMB", "KMI", "OKE",
+    # Industrial (25)
+    "CAT", "DE", "HON", "UNP", "UPS", "FDX", "RTX", "BA", "LMT", "NOC",
+    "GD", "GE", "EMR", "ETN", "ITW", "PH", "DOV",
+    "IR", "CARR", "OTIS", "TT", "FAST", "CTAS", "WM", "RSG",
+    # Telecom/Media (8)
+    "VZ", "CMCSA", "T", "TMUS", "DIS", "NFLX", "WBD", "CHTR",
+    # Real Estate (8)
+    "PLD", "AMT", "CCI", "EQIX", "PSA", "O", "SPG", "DLR",
+    # Materials (8)
+    "LIN", "APD", "SHW", "ECL", "DD", "NEM", "FCX", "NUE",
+    # Utilities (6)
+    "NEE", "DUK", "SO", "D", "SRE", "XEL",
+    # Fintech/Payments (8)
+    "V", "MA", "PYPL", "FIS", "FISV", "GPN", "ADP", "INTU",
+    # Other (4)
+    "ACN", "PAYX", "CPRT", "MSCI",
+]
+
+# =============================================================================
+# Trading Hours (UTC) - US market 9:30-16:00 ET = 13:30-20:00 UTC (EST)
+# During EDT (Mar-Nov): 13:30-20:00 UTC
+# During EST (Nov-Mar): 14:30-21:00 UTC
+# =============================================================================
+TRADING_HOURS = {
+    "market_open_edt": "13:30",
+    "market_close_edt": "20:00",
+    "market_open_est": "14:30",
+    "market_close_est": "21:00",
+    "pre_market_open": "08:00",   # UTC, approx
+    "post_market_close": "01:00", # UTC next day, approx
+    "timezone": "US/Eastern",
+}
+
+# =============================================================================
+# Moomoo Australia Fee Structure (US stocks)
+# =============================================================================
+@dataclass(frozen=True)
+class FeeStructure:
+    commission_per_order: float = 0.0
+    platform_fee_per_order: float = 0.99
+    settlement_per_share: float = 0.003
+    settlement_max_pct: float = 0.01       # max 1% of trade amount
+    sec_fee_rate: float = 0.0000206        # sells only, applied to notional
+    sec_fee_min: float = 0.01              # minimum SEC fee
+    finra_taf_per_share: float = 0.000195  # sells only
+    finra_taf_min: float = 0.01
+    finra_taf_max: float = 9.79
+    slippage_pct: float = 0.0005           # 0.05%
+
+    def calc_fees(self, shares: float, price: float, is_sell: bool = False) -> dict:
+        """Calculate total fees for a trade."""
+        notional = abs(shares) * price
+        platform = self.platform_fee_per_order
+        settlement = min(abs(shares) * self.settlement_per_share,
+                         notional * self.settlement_max_pct)
+        sec = 0.0
+        taf = 0.0
+        if is_sell:
+            sec = max(notional * self.sec_fee_rate, self.sec_fee_min)
+            taf_raw = abs(shares) * self.finra_taf_per_share
+            taf = max(min(taf_raw, self.finra_taf_max), self.finra_taf_min)
+        slippage = notional * self.slippage_pct
+        total = platform + settlement + sec + taf + slippage
+        return {
+            "platform": round(platform, 4),
+            "settlement": round(settlement, 4),
+            "sec": round(sec, 4),
+            "taf": round(taf, 4),
+            "slippage": round(slippage, 4),
+            "total": round(total, 4),
+        }
+
+
+FEES = FeeStructure()
+
+# =============================================================================
+# Account Configurations - 10 accounts, each $1000 starting capital
+# =============================================================================
+@dataclass
+class AccountConfig:
+    name: str
+    strategy: str
+    starting_capital: float = 10000.0
+    max_positions: int = 5
+    max_position_pct: float = 0.25
+    stop_loss_pct: Optional[float] = None
+    take_profit_pct: Optional[float] = None
+    rebalance_frequency: str = "daily"
+    params: dict = field(default_factory=dict)
+
+
+ACCOUNTS = [
+    AccountConfig(
+        name="momentum_fast",
+        strategy="momentum",
+        max_positions=5,
+        stop_loss_pct=0.05,
+        params={"lookback_days": 10, "top_n": 5},
+    ),
+    AccountConfig(
+        name="momentum_slow",
+        strategy="momentum",
+        max_positions=5,
+        stop_loss_pct=0.08,
+        params={"lookback_days": 30, "top_n": 5},
+    ),
+    AccountConfig(
+        name="mean_reversion",
+        strategy="mean_reversion",
+        max_positions=5,
+        stop_loss_pct=0.05,
+        params={"lookback_days": 20, "z_threshold": -1.5},
+    ),
+    AccountConfig(
+        name="value_quality",
+        strategy="value",
+        max_positions=10,
+        max_position_pct=0.15,
+        rebalance_frequency="weekly",
+        params={"pe_max": 20, "roe_min": 0.15},
+    ),
+    AccountConfig(
+        name="volatility_breakout",
+        strategy="volatility_breakout",
+        max_positions=3,
+        stop_loss_pct=0.04,
+        take_profit_pct=0.10,
+        params={"atr_multiplier": 2.0, "lookback_days": 14},
+    ),
+    AccountConfig(
+        name="trend_following",
+        strategy="trend_following",
+        max_positions=5,
+        stop_loss_pct=0.07,
+        params={"fast_ma": 10, "slow_ma": 50},
+    ),
+    AccountConfig(
+        name="pairs_trading",
+        strategy="pairs",
+        max_positions=4,
+        stop_loss_pct=0.06,
+        params={"zscore_entry": 2.0, "zscore_exit": 0.5},
+    ),
+    AccountConfig(
+        name="dividend_growth",
+        strategy="dividend",
+        max_positions=10,
+        max_position_pct=0.15,
+        rebalance_frequency="monthly",
+        params={"min_yield": 0.02, "min_growth_years": 5},
+    ),
+    AccountConfig(
+        name="sector_rotation",
+        strategy="sector_rotation",
+        max_positions=5,
+        rebalance_frequency="weekly",
+        params={"lookback_days": 30, "top_sectors": 3},
+    ),
+    AccountConfig(
+        name="ml_ensemble",
+        strategy="ml_ensemble",
+        max_positions=5,
+        stop_loss_pct=0.05,
+        take_profit_pct=0.15,
+        params={"retrain_days": 30, "features": ["momentum", "volatility", "volume"]},
+    ),
+]
+
+# =============================================================================
+# Report Settings
+# =============================================================================
+REPORT = {
+    "output_dir": "reports",
+    "format": "html",
+    "daily_summary": True,
+    "weekly_summary": True,
+    "include_charts": True,
+    "benchmark": "SPY",
+    "metrics": [
+        "total_return", "sharpe_ratio", "max_drawdown", "win_rate",
+        "profit_factor", "avg_trade_return", "volatility", "calmar_ratio",
+    ],
+    "email_enabled": False,
+    "email_to": os.environ.get("REPORT_EMAIL", ""),
+}
+
+# =============================================================================
+# 自适应换仓配置 (Adaptive Rebalancing)
+# =============================================================================
+ADAPTIVE_REBALANCE = {
+    "enabled": True,              # 总开关：True=启用自适应, False=固定周期
+    "vol_window": 5,               # 波动率计算窗口（天）
+    "ref_window": 60,              # 参考波动率窗口（天，取中位数）
+    "min_hours": 12,               # 最短换仓周期（小时）
+    "max_hours": 96,               # 最长换仓周期（小时）
+    "silence_threshold": 0.3,      # 静默区阈值（σ_t < σ_ref * 此值时暂停交易）
+}
+
+# =============================================================================
+# Paths
+# =============================================================================
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+DATA_DIR = os.path.join(BASE_DIR, "data")

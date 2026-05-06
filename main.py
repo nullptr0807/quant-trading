@@ -1,0 +1,1864 @@
+#!/usr/bin/env python3
+"""
+美股量化交易系统 - 主调度器
+Orchestrates: data fetch -> factor compute -> signal generation -> trading -> reporting
+"""
+from dotenv import load_dotenv
+load_dotenv()
+
+import os
+import sys
+import time
+import json
+import logging
+import traceback
+from datetime import datetime, timezone, timedelta
+
+import numpy as np
+
+# Ensure project root on path
+PROJECT_ROOT = os.path.expanduser("~/quant-trading")
+sys.path.insert(0, PROJECT_ROOT)
+
+from config.settings import (
+    STOCK_UNIVERSE, FINNHUB_API_KEY, FEES, ACCOUNTS, ADAPTIVE_REBALANCE,
+    MARKETS, DEFAULT_MARKET, UNIVERSES, INITIAL_CASH, FEES_BY_MARKET,
+    BENCHMARKS_BY_MARKET, ACCOUNT_PREFIX,
+)
+from data.fetcher import DataFetcher
+from data.cn_fetcher import get_fetcher_for
+from data.store import DataStore, init_db
+from factors.alpha_factors import FactorEngine
+from factors.signal import SignalGenerator
+from trading.engine import TradingEngine
+from trading.costs import MoomooAUCosts, CNCosts
+from accounts.strategies import STRATEGIES
+from accounts.gp_strategies import GP_STRATEGIES
+from accounts.qlib_strategies import QLIB_STRATEGIES
+from factors.gp_miner import GPAlphaMiner, FEATURE_COLS
+from dataclasses import replace as _dc_replace
+
+# Factor formula descriptions for reporting (strict math)
+FACTOR_FORMULAS = {
+    "KMID": "(Close - Open) / Open",
+    "KLEN": "(High - Low) / Open",
+    "KMID2": "(Close - Open) / (High - Low)",
+    "KUP": "(High - max(Open, Close)) / Open",
+    "KUP2": "(High - max(Open, Close)) / (High - Low)",
+    "KLOW": "(min(Open, Close) - Low) / Open",
+    "KLOW2": "(min(Open, Close) - Low) / (High - Low)",
+    "KSFT": "(2*Close - High - Low) / Open",
+    "KSFT2": "(2*Close - High - Low) / (High - Low)",
+    "ROC_5": "Close(t) / Close(t-5) - 1",
+    "ROC_10": "Close(t) / Close(t-10) - 1",
+    "ROC_20": "Close(t) / Close(t-20) - 1",
+    "MA_RATIO_5": "Close(t) / SMA(Close, 5)",
+    "MA_RATIO_10": "Close(t) / SMA(Close, 10)",
+    "MA_RATIO_20": "Close(t) / SMA(Close, 20)",
+    "VMOM_5": "Volume(t) / SMA(Volume, 5)",
+    "VMOM_10": "Volume(t) / SMA(Volume, 10)",
+    "VMOM_20": "Volume(t) / SMA(Volume, 20)",
+    "VSTD_5": "Std(Volume, 5) / SMA(Volume, 5)",
+    "VSTD_10": "Std(Volume, 10) / SMA(Volume, 10)",
+    "VSTD_20": "Std(Volume, 20) / SMA(Volume, 20)",
+    "STD_5": "Std(Close, 5) / Close",
+    "STD_10": "Std(Close, 10) / Close",
+    "STD_20": "Std(Close, 20) / Close",
+    "BBPOS_5": "(Close - SMA(Close,5)) / (2 * Std(Close,5))",
+    "BBPOS_10": "(Close - SMA(Close,10)) / (2 * Std(Close,10))",
+    "BBPOS_20": "(Close - SMA(Close,20)) / (2 * Std(Close,20))",
+    "RSV": "(Close - Min(Low,9)) / (Max(High,9) - Min(Low,9))",
+    "RSI_14": "100 - 100 / (1 + SMA(Gain,14) / SMA(Loss,14))",
+    "BETA_5": "OLS_Slope(Close, 5) / SMA(Close, 5)",
+    "BETA_10": "OLS_Slope(Close, 10) / SMA(Close, 10)",
+    "BETA_20": "OLS_Slope(Close, 20) / SMA(Close, 20)",
+}
+
+# GP function to math notation mapping
+GP_FUNC_MATH = {
+    "add": "({0} + {1})",
+    "sub": "({0} - {1})",
+    "mul": "({0} * {1})",
+    "div": "({0} / {1})",  # protected: returns 0 when |{1}|<1e-10
+    "sqrt_abs": "sqrt(|{0}|)",
+    "log_abs1": "ln(|{0}| + 1)",
+    "neg": "-({0})",
+    "inv": "(1 / {0})",  # protected: returns 0 when |{0}|<1e-10
+    "max2": "max({0}, {1})",
+    "min2": "min({0}, {1})",
+}
+
+# GP variable to math notation
+GP_VAR_MATH = {
+    "o_c": "(Open-Close)/Close",
+    "h_c": "(High-Close)/Close",
+    "l_c": "(Low-Close)/Close",
+    "v_vma20": "Volume/SMA(Volume,20)",
+    "ma_5": "SMA(Close,5)/Close",
+    "ma_10": "SMA(Close,10)/Close",
+    "ma_20": "SMA(Close,20)/Close",
+    "std_5": "Std(Close,5)/Close",
+    "std_10": "Std(Close,10)/Close",
+    "std_20": "Std(Close,20)/Close",
+    "ret_1": "Close(t)/Close(t-1)-1",
+    "ret_5": "Close(t)/Close(t-5)-1",
+    "ret_10": "Close(t)/Close(t-10)-1",
+}
+
+
+def gp_expr_to_math(expr_str: str) -> str:
+    """Convert a gplearn expression string to strict mathematical notation.
+    E.g. 'max2(X11, log_abs1(X10))' -> 'max(Close(t)/Close(t-5)-1, ln(|Close(t)/Close(t-1)-1| + 1))'
+    """
+    import re
+
+    # Replace X{i} with variable names first
+    def replace_vars(s):
+        def _repl(m):
+            idx = int(m.group(1))
+            if idx < len(FEATURE_COLS):
+                var_name = FEATURE_COLS[idx]
+                return GP_VAR_MATH.get(var_name, var_name)
+            return m.group(0)
+        return re.sub(r'X(\d+)', _repl, s)
+
+    # Recursive parser for nested function calls
+    tokens = []
+    s = replace_vars(expr_str)
+
+    def parse(s):
+        s = s.strip()
+        # Check if it's a function call: fname(args...)
+        m = re.match(r'^([a-z_][a-z_0-9]*)\((.+)\)$', s)
+        if m:
+            fname = m.group(1)
+            # Parse arguments respecting parentheses
+            inner = m.group(2)
+            args = _split_args(inner)
+            parsed_args = [parse(a) for a in args]
+            fmt = GP_FUNC_MATH.get(fname)
+            if fmt:
+                return fmt.format(*parsed_args)
+            else:
+                return f"{fname}({', '.join(parsed_args)})"
+        return s
+
+    def _split_args(s):
+        """Split comma-separated args respecting nested parens."""
+        args = []
+        depth = 0
+        current = []
+        for ch in s:
+            if ch == '(':
+                depth += 1
+                current.append(ch)
+            elif ch == ')':
+                depth -= 1
+                current.append(ch)
+            elif ch == ',' and depth == 0:
+                args.append(''.join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+        if current:
+            args.append(''.join(current).strip())
+        return args
+
+    return parse(s)
+from factors.gp_signal import GPSignalGenerator
+from reports.generator import ReportGenerator
+from reports.telegram import TelegramReporter
+from core.events import emit as emit_event
+
+# ---------------------------------------------------------------------------
+# Benchmark (buy-and-hold) configuration — kept as a US default for any
+# legacy import path that still references the global. Market-aware code
+# should use BENCHMARKS_BY_MARKET[market] from config.settings instead.
+# ---------------------------------------------------------------------------
+BENCHMARKS = BENCHMARKS_BY_MARKET["US"]
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(os.path.join(LOG_DIR, "trading.log")),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("quant")
+
+# ---------------------------------------------------------------------------
+# US market hours helper (EDT: Mar-Nov, EST: Nov-Mar)
+# ---------------------------------------------------------------------------
+# ZoneInfo objects used by both is_market_hours() and is_market_hours_cn().
+# Defined at module level (above the helpers that use them) so import order
+# is irrelevant — the previous layout had _ET defined AFTER is_market_hours()
+# referenced it, which would NameError on the new ET-based path.
+try:
+    from zoneinfo import ZoneInfo
+    _CST = ZoneInfo("Asia/Shanghai")
+    _ET = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover
+    _CST = None
+    _ET = None
+
+
+def is_market_hours() -> bool:
+    """Check if current time is within extended US market hours (pre+regular+after).
+    Pre-market: 04:00-09:30 ET, Regular: 09:30-16:00 ET, After: 16:00-20:00 ET
+    => 04:00-20:00 ET, Mon-Fri.
+
+    IMPORTANT: must use ET weekday/hour, NOT UTC. The previous UTC-based
+    simplification (`weekday<5 and (hour>=8 or hour<1)`) has a fatal edge
+    case at the Sunday→Monday boundary: at 00:00 UTC Mon, ET is still
+    Sun 20:00 ET (market closed), but UTC weekday=Mon and hour=0 satisfied
+    `hour<1` → returned True. This silently let trading cycles fire on
+    Sunday evenings ET (e.g. 2026-05-04 00:03 UTC = 2026-05-03 20:03 ET),
+    creating ~30 phantom B-account trades. DST-aware via ZoneInfo.
+    """
+    if _ET is None:
+        # Fallback only when zoneinfo unavailable.
+        now = datetime.now(timezone.utc)
+        if now.weekday() >= 5:
+            return False
+        # Use a slightly conservative window that excludes the 00:00-01:00 UTC
+        # ambiguity entirely; this trades a tiny EST-tail loss for safety.
+        return 8 <= now.hour < 24
+    now_et = datetime.now(_ET)
+    if now_et.weekday() >= 5:
+        return False
+    m = now_et.hour * 60 + now_et.minute
+    return 4 * 60 <= m < 20 * 60
+
+
+def is_us_rth() -> bool:
+    """US Regular Trading Hours only: 09:30-16:00 ET, Mon-Fri.
+
+    Used by Q-accounts to skip the pre-market window (04:00-09:30 ET):
+    daily-retrained Qlib scores are based on yesterday's close, so entering
+    at pre-market (thin liquidity, wide spreads, gap-driven prices) gives
+    away 5-15bps of alpha. RTH waits for the official 09:30 open where
+    fills are tighter.
+
+    DST-aware via ZoneInfo (handles ET ↔ UTC offset shift twice a year).
+    """
+    if _ET is None:
+        # Fallback: simplified UTC bounds covering both EDT (13:30-20:00 UTC)
+        # and EST (14:30-21:00 UTC). Slightly conservative on EST side.
+        now = datetime.now(timezone.utc)
+        if now.weekday() >= 5:
+            return False
+        m = now.hour * 60 + now.minute
+        return 13 * 60 + 30 <= m < 21 * 60
+    now_et = datetime.now(_ET)
+    if now_et.weekday() >= 5:
+        return False
+    m = now_et.hour * 60 + now_et.minute
+    return 9 * 60 + 30 <= m < 16 * 60
+
+
+# CN A-share session: 09:30-11:30 + 13:00-15:00 Asia/Shanghai, Mon-Fri.
+# (_CST / _ET are defined at the top of this section.)
+
+
+def is_market_hours_cn() -> bool:
+    if _CST is None:
+        return False
+    now = datetime.now(_CST)
+    if now.weekday() >= 5:
+        return False
+    m = now.hour * 60 + now.minute
+    return (9 * 60 + 30 <= m < 11 * 60 + 30) or (13 * 60 <= m < 15 * 60)
+
+
+def is_market_hours_for(market: str) -> bool:
+    return is_market_hours() if market == "US" else is_market_hours_cn()
+
+
+# ---------------------------------------------------------------------------
+# Core system
+# ---------------------------------------------------------------------------
+class QuantSystem:
+    """Main orchestrator for the quantitative trading system."""
+
+    def __init__(self, market: str = "US"):
+        if market not in MARKETS:
+            raise ValueError(f"Unknown market: {market!r}. Allowed: {MARKETS}")
+        self.market = market
+        log.info("Initializing Quant Trading System (market=%s)...", market)
+
+        # Resolve market-specific config
+        self.universe = UNIVERSES[market]
+        self.benchmarks = BENCHMARKS_BY_MARKET[market]
+        self.initial_cash = INITIAL_CASH[market]
+
+        # Derive market-scoped strategy lists. US keeps original A01-A10/B01-B10 ids;
+        # CN gets CA01-CA10/CB01-CB10 by prefixing 'C' (per ACCOUNT_PREFIX[market]).
+        prefix = ACCOUNT_PREFIX.get(market, "")
+        if prefix:
+            self.strategies = [_dc_replace(s, id=f"{prefix}{s.id}") for s in STRATEGIES]
+            self.gp_strategies = [_dc_replace(g, id=f"{prefix}{g.id}") for g in GP_STRATEGIES]
+        else:
+            self.strategies = list(STRATEGIES)
+            self.gp_strategies = list(GP_STRATEGIES)
+        # Qlib Q-accounts: US uses Q01-Q10 (no prefix); CN mirrors as CQ01-CQ10
+        # via the same ACCOUNT_PREFIX mechanism (phase 2 — gated on CN qlib data).
+        if prefix:
+            self.qlib_strategies = [_dc_replace(q, id=f"{prefix}{q.id}") for q in QLIB_STRATEGIES]
+        else:
+            self.qlib_strategies = list(QLIB_STRATEGIES)
+
+        # Init database
+        self.db_path = os.path.join(PROJECT_ROOT, "data", "trading.db")
+        init_db(self.db_path)
+        self.store = DataStore(self.db_path)
+
+        # Data — market-aware fetcher
+        self.fetcher = get_fetcher_for(market)
+
+        # Factors
+        self.factor_engine = FactorEngine()
+        self.signal_gen = SignalGenerator(buy_top=10, sell_top=10)
+
+        # Trading — market-aware costs
+        if market == "CN":
+            self.costs = CNCosts()
+        else:
+            self.costs = MoomooAUCosts()
+        self.engine = TradingEngine(costs=self.costs, trade_callback=self._on_trade)
+
+        # Create strategy accounts (A01-A10 / CA01-CA10)
+        for strat in self.strategies:
+            self.engine.create_account(strat.id, initial_cash=self.initial_cash)
+            log.info(f"  Account {strat.id}: {strat.name} ({strat.strategy_type})")
+
+        # Create GP accounts (B01-B10 / CB01-CB10)
+        for gp_strat in self.gp_strategies:
+            self.engine.create_account(gp_strat.id, initial_cash=self.initial_cash)
+            log.info(f"  GP Account {gp_strat.id}: {gp_strat.name}")
+
+        # Create Qlib accounts (Q01-Q10) — US only in phase 1
+        for q_strat in self.qlib_strategies:
+            self.engine.create_account(q_strat.id, initial_cash=self.initial_cash)
+            log.info(f"  Qlib Account {q_strat.id}: {q_strat.name} ({q_strat.model_class})")
+
+        # Create benchmark (buy-and-hold) accounts
+        for bm in self.benchmarks:
+            self.engine.create_account(bm["id"], initial_cash=self.initial_cash)
+            log.info(f"  Benchmark {bm['id']}: {bm['name']} (hold {bm['ticker']})")
+
+        # Bootstrap account_meta rows for this market (idempotent).
+        self._ensure_account_meta_rows()
+
+        # GP factor mining — per-account
+        self.gp_miner = GPAlphaMiner()
+        self.gp_signal_gen = GPSignalGenerator()
+        self._per_account_gp_factors = {}   # {account_id: {ticker: DataFrame}}
+        self._per_account_mined = GPAlphaMiner.load_per_account_factors()  # {account_id: [factor_list]}
+        self._gp_mining_done = len(self._per_account_mined) > 0
+
+        # Reports — only US sends Telegram. CN runs silent (per spec).
+        if market == "US":
+            try:
+                self.reporter = TelegramReporter()
+            except Exception:
+                log.warning("TelegramReporter unavailable (no TELEGRAM_BOT_TOKEN), reports will be local only")
+                self.reporter = None
+        else:
+            self.reporter = None
+        self.report_gen = ReportGenerator(self.db_path)
+
+        # State
+        self._historical_data = {}
+        self._factors_dict = {}
+        self._last_data_fetch = None
+        self._last_report = None
+        self._realtime_prices = {}  # {ticker: float} latest real-time prices
+
+        # 自适应换仓状态
+        self._adaptive_enabled = ADAPTIVE_REBALANCE.get("enabled", False)
+        self._market_returns = []  # 每日市场平均收益率
+        self._sigma_ref = 0.01     # 参考波动率
+        self._last_rebalance = {}  # {account_id: datetime} 上次换仓时间
+        self._rebalance_hours_cache = {}  # {account_id: float} 当前自适应周期
+
+        # 从DB恢复状态
+        self._restore_state()
+
+        log.info("System initialized [%s] with %d+%d accounts, %d tickers (adaptive=%s)",
+                 market, len(self.strategies), len(self.gp_strategies), len(self.universe),
+                 "ON" if self._adaptive_enabled else "OFF")
+
+    # -- retired account filter ----------------------------------------------
+    def _retired_accounts(self) -> set[str]:
+        """Return set of account_ids whose status='retired' for this market.
+        Re-queried each trading cycle so retiring an account via CLI takes
+        effect on the very next cron tick — no process restart required.
+        """
+        import sqlite3
+        try:
+            conn = sqlite3.connect(self.db_path)
+            rows = conn.execute(
+                "SELECT account_id FROM account_meta "
+                "WHERE status='retired' AND market=?",
+                (self.market,),
+            ).fetchall()
+            conn.close()
+            return {r[0] for r in rows}
+        except Exception as e:
+            log.warning("Failed to load retired accounts: %s", e)
+            return set()
+
+    # -- account_meta bootstrap -----------------------------------------------
+    def _ensure_account_meta_rows(self):
+        """Idempotently insert account_meta rows for this market's accounts."""
+        import sqlite3
+        try:
+            from analysis.account_analyzer import _ensure_account_meta
+        except Exception:
+            _ensure_account_meta = None
+        conn = sqlite3.connect(self.db_path)
+        try:
+            if _ensure_account_meta:
+                _ensure_account_meta(conn)
+            now = datetime.now(timezone.utc).isoformat()
+            entries = []
+            for s in self.strategies:
+                entries.append((s.id, s.name, getattr(s, "strategy_type", ""), "A",
+                                ",".join(getattr(s, "factor_names", []) or [])))
+            for g in self.gp_strategies:
+                # Build a descriptive factors string from GP params so the
+                # dashboard strategy-factor panel is never blank.
+                parts = [f"seed={g.gp_seed}", f"pop={g.gp_population}", f"gen={g.gp_generations}"]
+                y = getattr(g, "gp_y_target", "next_1d_ret")
+                if y != "next_1d_ret":
+                    parts.append(f"y={y}")
+                feat = getattr(g, "gp_feature_subset", None)
+                if feat:
+                    parts.append(f"feat={'/'.join(feat)}")
+                gp_factors_str = f"GP({','.join(parts)})"
+                entries.append((g.id, g.name, "GP", "B", gp_factors_str))
+            for q in self.qlib_strategies:
+                qfactors = f"qlib_{q.id}_score ({q.model_class})"
+                entries.append((q.id, q.name, q.description, "Q", qfactors))
+            for bm in self.benchmarks:
+                entries.append((bm["id"], bm["name"], "benchmark", bm.get("group", "IDX"),
+                                bm.get("ticker", "")))
+            for acct_id, strat_name, desc, grp, factors in entries:
+                exists = conn.execute(
+                    "SELECT 1 FROM account_meta WHERE account_id=? AND market=?",
+                    (acct_id, self.market),
+                ).fetchone()
+                if exists:
+                    continue
+                try:
+                    conn.execute(
+                        "INSERT INTO account_meta (account_id, strategy_name, description, "
+                        "\"group\", factors, initial_cash, created_at, status, market) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        (acct_id, strat_name, desc, grp, factors,
+                         self.initial_cash, now, "active", self.market),
+                    )
+                    # Emit an inception event so the LiveStream surfaces every
+                    # new account as a green dot at birth (mirrors retire's yellow).
+                    # Best-effort: never break account bootstrap on event failure.
+                    try:
+                        import json as _json
+                        detail = {
+                            "name": strat_name,
+                            "group": grp,
+                            "factors": factors,
+                            "initial_cash": self.initial_cash,
+                            "market": self.market,
+                        }
+                        conn.execute(
+                            "INSERT INTO events (ts, category, severity, account, ticker, "
+                            "title, detail, market) VALUES (?,?,?,?,?,?,?,?)",
+                            (now, "inception", "info", acct_id, None,
+                             f"🟢 {acct_id} 已创建 ({strat_name})",
+                             _json.dumps(detail, ensure_ascii=False), self.market),
+                        )
+                    except Exception as _ev_e:
+                        log.warning("inception event emit failed for %s: %s", acct_id, _ev_e)
+                except sqlite3.IntegrityError:
+                    # account_id is the table PK in older schemas; ignore
+                    # if the same id already exists in another market.
+                    pass
+            conn.commit()
+        finally:
+            conn.close()
+
+    # -- State persistence ----------------------------------------------------
+    def _on_trade(self, account_name: str, trade: dict):
+        """Callback: persist every trade to DB."""
+        try:
+            self.store.save_trade(
+                account=account_name,
+                ticker=trade["ticker"],
+                side=trade["side"],
+                shares=trade["shares"],
+                price=trade["price"],
+                cost=trade.get("total_fees", 0),
+                slippage=trade.get("slippage_cost", 0),
+                market=self.market,
+            )
+        except Exception as e:
+            log.warning("Failed to persist trade: %s", e)
+
+        # Emit dashboard event
+        try:
+            side = trade["side"]
+            ticker = trade["ticker"]
+            shares = trade["shares"]
+            price = trade["price"]
+            reason = trade.get("reason", "signal")
+            from config.settings import CURRENCY_SYMBOL
+            sym = CURRENCY_SYMBOL.get(self.market, "$")
+            if side == "buy":
+                title = f"BUY {ticker} ×{int(shares)} @ {sym}{price:.2f}"
+                detail = {"shares": shares, "price": price, "fees": trade.get("total_fees", 0)}
+            else:
+                pnl_pct = trade.get("pnl_pct")
+                pnl_dollar = trade.get("pnl_dollar")
+                reason_label = {"stop_loss": "🛑 stop-loss", "signal": "📉 signal-exit",
+                                "take_profit": "🎯 take-profit"}.get(reason, reason)
+                pnl_str = ""
+                if pnl_pct is not None:
+                    pnl_str = f" PnL {pnl_pct*100:+.2f}%"
+                    if pnl_dollar is not None:
+                        pnl_str += f" ({sym}{pnl_dollar:+.2f})"
+                title = f"SELL {ticker} ×{int(shares)} @ {sym}{price:.2f} · {reason_label}{pnl_str}"
+                detail = {"shares": shares, "price": price, "reason": reason,
+                          "pnl_pct": pnl_pct, "pnl_dollar": pnl_dollar}
+            emit_event("trade", title, account=account_name, ticker=ticker,
+                       detail=detail, market=self.market)
+        except Exception as e:
+            log.warning("Failed to emit trade event: %s", e)
+
+    def _restore_state(self):
+        """Restore account cash, positions, and adaptive state from DB."""
+        restored = 0
+        all_accounts = (
+            [(s.id, s) for s in self.strategies]
+            + [(g.id, g) for g in self.gp_strategies]
+            + [(q.id, q) for q in self.qlib_strategies]
+            + [(bm["id"], bm) for bm in self.benchmarks]
+        )
+        for acct_id, _ in all_accounts:
+            state = self.store.load_account_state(acct_id, market=self.market)
+            if state is None:
+                continue
+            acct = self.engine.get_account(acct_id)
+            acct.cash = state["cash"]
+            acct.initial_cash = state["initial_cash"]
+
+            # Restore positions
+            positions = self.store.load_positions(acct_id, market=self.market)
+            for p in positions:
+                from trading.account import _Position
+                acct._positions[p["ticker"]] = _Position(
+                    shares=p["shares"],
+                    avg_cost=p["avg_cost"],
+                    total_cost=p["total_cost"],
+                )
+            restored += 1
+            log.info("  Restored %s: $%.2f cash, %d positions",
+                     acct_id, acct.cash, len(positions))
+
+        # Restore adaptive state
+        if self._adaptive_enabled:
+            adaptive_states = self.store.load_all_adaptive_state(market=self.market)
+            for acct_id, astate in adaptive_states.items():
+                if astate["last_rebalance"]:
+                    try:
+                        self._last_rebalance[acct_id] = datetime.fromisoformat(astate["last_rebalance"])
+                    except (ValueError, TypeError):
+                        pass
+                if astate["rebalance_hours"]:
+                    self._rebalance_hours_cache[acct_id] = astate["rebalance_hours"]
+                if astate["sigma_ref"]:
+                    self._sigma_ref = astate["sigma_ref"]
+
+            # Restore market returns
+            mkt_rets = self.store.load_market_returns()
+            if mkt_rets:
+                self._market_returns = mkt_rets
+                log.info("  Restored %d market returns, sigma_ref=%.6f",
+                         len(mkt_rets), self._sigma_ref)
+
+        if restored > 0:
+            log.info("Restored state for %d/%d accounts from DB", restored, len(all_accounts))
+
+    def _save_all_state(self):
+        """Persist all account states, positions, and adaptive state."""
+        current_prices = self._get_current_prices()
+        retired = self._retired_accounts()
+
+        all_accounts = (
+            [(s.id,) for s in self.strategies]
+            + [(g.id,) for g in self.gp_strategies]
+            + [(q.id,) for q in self.qlib_strategies]
+            + [(bm["id"],) for bm in self.benchmarks]
+        )
+        for (acct_id,) in all_accounts:
+            if acct_id in retired:
+                continue  # frozen — preserve last-known state, no equity drift
+            acct = self.engine.get_account(acct_id)
+            # Save cash
+            self.store.save_account_state(acct_id, acct.cash, acct.initial_cash,
+                                          market=self.market)
+            # Save positions
+            positions = []
+            for ticker, pos in acct._positions.items():
+                if pos.shares > 0:
+                    price = current_prices.get(ticker, pos.avg_cost)
+                    positions.append({
+                        "ticker": ticker,
+                        "shares": pos.shares,
+                        "avg_cost": pos.avg_cost,
+                        "total_cost": pos.total_cost,
+                        "current_price": price,
+                        "market_value": pos.shares * price,
+                        "unrealized_pnl": pos.shares * (price - pos.avg_cost),
+                    })
+            self.store.save_positions(acct_id, positions, market=self.market)
+
+            # Equity-curve snapshot. Strict: skip if any held ticker has no
+            # price (avoids avg_cost-fallback poisoning the curve). Without
+            # this, markets that don't send a Telegram report (CN) never
+            # write to the `accounts` table, leaving the curve flat.
+            try:
+                verified_equity = acct.get_equity(current_prices, strict=True)
+                self.store.save_snapshot(acct_id, acct.cash, verified_equity,
+                                         market=self.market)
+            except ValueError as e:
+                log.error("Skipping snapshot for %s: %s", acct_id, e)
+            except Exception as e:
+                log.warning("Snapshot save failed for %s: %s", acct_id, e)
+
+        # Save adaptive state
+        if self._adaptive_enabled:
+            for (acct_id,) in all_accounts:
+                last_rb = self._last_rebalance.get(acct_id)
+                self.store.save_adaptive_state(
+                    acct_id,
+                    last_rebalance=last_rb.isoformat() if last_rb else None,
+                    rebalance_hours=self._rebalance_hours_cache.get(acct_id),
+                    sigma_ref=self._sigma_ref,
+                    market=self.market,
+                )
+
+        log.info("Saved state for %d accounts to DB", len(all_accounts))
+
+    # -- Real-time prices ---------------------------------------------------
+    def _fetch_realtime_prices(self) -> dict[str, float]:
+        """Fetch real-time prices via the market-aware fetcher.
+
+        US fetcher uses yfinance fast_info → Finnhub fallback; CN fetcher
+        uses akshare's 1-minute bar. Both routes converge here so main.py
+        and scripts/update_prices.py write equity off the SAME price source
+        — without this they disagreed and the equity curve ping-ponged.
+        """
+        try:
+            prices = self.fetcher.get_realtime_quotes(self.universe)
+        except Exception as e:
+            log.warning("realtime quote fetch failed: %s", e)
+            return {}
+        if not prices:
+            log.warning("Failed to fetch any real-time prices, using historical close")
+        return prices
+
+    def _get_current_prices(self) -> dict[str, float]:
+        """Get best available prices: real-time > historical close."""
+        # Base: historical close prices
+        prices = {}
+        for ticker, df in self._historical_data.items():
+            if df is not None and not df.empty:
+                prices[ticker] = float(df["close"].iloc[-1])
+        # Override with real-time where available
+        prices.update(self._realtime_prices)
+        # Ensure benchmark tickers have prices
+        for bm in self.benchmarks:
+            t = bm["ticker"]
+            if t not in prices:
+                # Realtime via the market-aware fetcher (no direct yfinance).
+                try:
+                    q = self.fetcher.get_realtime_quotes([t])
+                    if q.get(t):
+                        prices[t] = float(q[t])
+                        continue
+                except Exception:
+                    pass
+                # Fallback: latest cached close
+                try:
+                    df = self.fetcher.get_historical([t], days=5)
+                    if df is not None and not df.empty:
+                        prices[t] = float(df["close"].iloc[-1])
+                except Exception:
+                    pass
+        return prices
+
+    # -- Step 1: Fetch data -------------------------------------------------
+    def fetch_data(self):
+        """Download 30-day historical data for all tickers."""
+        log.info("Fetching historical data for %d tickers...", len(self.universe))
+        raw_df = self.fetcher.get_historical(self.universe, days=30)
+
+        # Split concatenated DataFrame into per-ticker dict
+        self._historical_data = {}
+        if not raw_df.empty and "ticker" in raw_df.columns:
+            for ticker, group in raw_df.groupby("ticker"):
+                df = group.drop(columns=["ticker"]).set_index("datetime").sort_index()
+                self._historical_data[ticker] = df
+
+        log.info("Got data for %d/%d tickers", len(self._historical_data), len(self.universe))
+        self._last_data_fetch = datetime.now(timezone.utc)
+        emit_event(
+            "data",
+            f"📡 Data refresh [{self.market}]: {len(self._historical_data)}/{len(self.universe)} tickers (30d)",
+            detail={"got": len(self._historical_data), "total": len(self.universe)},
+            market=self.market,
+        )
+
+        # 更新自适应换仓的市场波动率数据
+        if self._adaptive_enabled:
+            self._update_market_returns()
+
+        # Save prices to DB
+        for ticker, df in self._historical_data.items():
+            try:
+                self.store.save_prices(ticker, df)
+            except Exception as e:
+                log.warning("Failed to save prices for %s: %s", ticker, e)
+
+    # -- Step 2: Compute factors --------------------------------------------
+    def compute_factors(self):
+        """Compute Alpha158-style factors for all tickers."""
+        log.info("Computing factors...")
+        self._factors_dict = self.factor_engine.compute_multi(self._historical_data)
+        good = sum(1 for v in self._factors_dict.values() if v is not None and not v.empty)
+        log.info("Computed factors for %d tickers", good)
+        emit_event(
+            "factor",
+            f"🧮 Alpha158 cross-section recomputed [{self.market}]: {good} tickers",
+            detail={"tickers": good, "group": "alpha158"},
+            market=self.market,
+        )
+
+        # 持久化因子值到DB
+        try:
+            self.store.save_factor_df(self._factors_dict, group="alpha158")
+        except Exception as e:
+            log.warning("Failed to save factor values: %s", e)
+
+    # -- Step 2b: Mine and compute GP factors --------------------------------
+    def mine_gp_factors(self):
+        """Run GP factor mining per account (slow, do once then cache).
+
+        Mines factors only for accounts not yet present in the per-account JSON,
+        so newly added strategies (e.g. B11+) get bootstrapped on next tick
+        without re-mining the existing ones.
+        """
+        missing = [g for g in self.gp_strategies
+                   if not self._per_account_mined.get(g.id)]
+        if not missing:
+            log.info("GP factors already mined for all %d accounts, skipping mining.",
+                     len(self._per_account_mined))
+        else:
+            log.info("Mining GP alpha factors for %d new account(s): %s (120-day history)...",
+                     len(missing), [g.id for g in missing])
+            try:
+                raw_df = self.fetcher.get_historical(self.universe, days=120)
+                mining_data = {}
+                if not raw_df.empty and "ticker" in raw_df.columns:
+                    for ticker, group in raw_df.groupby("ticker"):
+                        df = group.drop(columns=["ticker"]).set_index("datetime").sort_index()
+                        mining_data[ticker] = df
+                log.info("Got %d tickers for GP mining (120-day)", len(mining_data))
+            except Exception as e:
+                log.error("Failed to fetch mining data: %s", e)
+                mining_data = self._historical_data
+
+            # Mine only the missing accounts; preserve existing factors in self._per_account_mined
+            for gp_strat in missing:
+                log.info("Mining GP factors for %s (%s)...", gp_strat.id, gp_strat.name)
+                miner = GPAlphaMiner()
+                factors = miner.mine_factors(
+                    mining_data,
+                    n_factors=gp_strat.gp_n_factors,
+                    generations=gp_strat.gp_generations,
+                    base_seed=gp_strat.gp_seed,
+                    population_size=gp_strat.gp_population,
+                    n_runs=gp_strat.gp_n_runs,
+                    parsimony_coefficient=gp_strat.gp_parsimony,
+                    y_target=getattr(gp_strat, "gp_y_target", "next_1d_ret"),
+                    feature_subset=getattr(gp_strat, "gp_feature_subset", None),
+                    dedup_threshold=getattr(gp_strat, "gp_dedup_threshold", 0.85),
+                )
+                self._per_account_mined[gp_strat.id] = factors
+                log.info("  %s: mined %d factors", gp_strat.id, len(factors))
+
+            if self._per_account_mined:
+                GPAlphaMiner.save_per_account_factors(self._per_account_mined)
+                self._gp_mining_done = True
+                log.info("Saved per-account GP factors for %d accounts", len(self._per_account_mined))
+            else:
+                log.warning("GP mining produced no valid factors")
+                return
+
+        # Compute GP factors for current data, per account
+        self._per_account_gp_factors = {}
+        for gp_strat in self.gp_strategies:
+            mined = self._per_account_mined.get(gp_strat.id, [])
+            if not mined:
+                self._per_account_gp_factors[gp_strat.id] = {}
+                continue
+            self._per_account_gp_factors[gp_strat.id] = self.gp_miner.compute_gp_factors(
+                self._historical_data, mined
+            )
+        log.info("Computed per-account GP factors for %d accounts",
+                 sum(1 for v in self._per_account_gp_factors.values() if v))
+
+        # 持久化GP因子值到DB
+        for acct_id, gp_factors in self._per_account_gp_factors.items():
+            if gp_factors:
+                try:
+                    self.store.save_factor_df(gp_factors, group=f"gp_{acct_id}")
+                except Exception as e:
+                    log.warning("Failed to save GP factors for %s: %s", acct_id, e)
+
+    # -- Benchmark buy-and-hold -----------------------------------------------
+    def initialize_benchmarks(self):
+        """Buy-and-hold: for each benchmark, if no position, buy with all cash."""
+        current_prices = self._get_current_prices()
+        for bm in self.benchmarks:
+            acct = self.engine.get_account(bm["id"])
+            ticker = bm["ticker"]
+            price = current_prices.get(ticker)
+            if not price:
+                # Last-ditch: ask the fetcher for a fresh realtime quote.
+                try:
+                    q = self.fetcher.get_realtime_quotes([ticker])
+                    if q.get(ticker):
+                        price = float(q[ticker])
+                except Exception:
+                    pass
+            if not price or price <= 0:
+                log.warning("No price for benchmark %s (%s), skipping", bm["id"], ticker)
+                continue
+            held = acct.get_positions().get(ticker, 0)
+            if held > 0:
+                continue  # Already holding
+            # Buy as many whole shares as possible (no position limit override)
+            shares = int(acct.cash * 0.999 / price)  # leave tiny margin for fees
+            if shares <= 0:
+                continue
+            result = acct.buy(ticker, shares, price)
+            if result:
+                log.info("Benchmark %s: bought %d shares of %s @ $%.2f",
+                         bm["id"], shares, ticker, price)
+                if self.engine.trade_callback:
+                    try:
+                        self.engine.trade_callback(bm["id"], result)
+                    except Exception:
+                        pass
+
+    # -- Step 3a: Trade original accounts -----------------------------------
+    def run_gp_trading_cycle(self):
+        """Trade GP accounts (B01-B10 / CB01-CB10) using per-account GP-mined factors."""
+        # Defense-in-depth: every cycle entrypoint MUST gate on market hours.
+        # run_once() already gates, but scripts/tests sometimes call cycles
+        # directly — without this guard we get phantom off-hours trades.
+        if not is_market_hours_for(self.market):
+            log.info("[%s] Outside market hours — GP cycle skipped", self.market)
+            return
+        if not self._per_account_gp_factors:
+            log.warning("No GP factors available, skipping GP trading")
+            return
+
+        log.info("Running GP trading cycle...")
+        current_prices = self._get_current_prices()
+        retired = self._retired_accounts()
+
+        for gp_strat in self.gp_strategies:
+            if gp_strat.id in retired:
+                continue  # retired account: no trading, no rebalance event
+            try:
+                if not self._should_rebalance(gp_strat.id, gp_strat.rebalance_hours):
+                    continue
+                executed = self._trade_gp_account(gp_strat, current_prices)
+                if executed is False:
+                    # Signal generator returned no actionable candidates — do NOT
+                    # mark this cycle as a successful rebalance, so the next tick
+                    # will retry instead of waiting another full adaptive window.
+                    continue
+                self._last_rebalance[gp_strat.id] = datetime.now(timezone.utc)
+                emit_event(
+                    "rebalance",
+                    f"🔄 Rebalance {gp_strat.id} (GP, base {gp_strat.rebalance_hours}h)",
+                    account=gp_strat.id,
+                    market=self.market,
+                )
+            except Exception as e:
+                log.error("Error trading GP %s: %s", gp_strat.id, e)
+                traceback.print_exc()
+
+    def _trade_gp_account(self, gp_strat, current_prices: dict):
+        """Execute GP-based trading for one account."""
+        acct = self.engine.get_account(gp_strat.id)
+        equity = acct.get_equity(current_prices)
+
+        # Get this account's factors
+        account_factors = self._per_account_gp_factors.get(gp_strat.id, {})
+        if not account_factors:
+            return False
+
+        # Filter factors based on strategy config
+        filtered_factors = self._filter_gp_factors(gp_strat, account_factors)
+
+        # Generate signals using GP signal generator
+        signals = self.gp_signal_gen.generate_signals(
+            filtered_factors, top_n=gp_strat.top_n
+        )
+
+        buy_tickers = set(signals["buy"])
+        sell_tickers = set(signals["sell"])
+
+        # Empty-signal guard: if the signal generator could not produce ANY
+        # buy candidates this cycle (NaN-filled factor row, data gap, etc.),
+        # skip the rebalance entirely instead of liquidating every position.
+        # Without this guard, an empty buy_tickers set causes the SELL loop
+        # below to mark every held ticker as "not in buy list" and dump it,
+        # leaving the account in 100% cash until the next adaptive window
+        # — which can be 60+ hours away and freezes the equity curve.
+        if not buy_tickers:
+            log.warning("[%s] GP signals empty (no buy candidates) — skipping rebalance to preserve positions", gp_strat.id)
+            return False
+
+        # --- SELL: stop loss + not in buy list ---
+        positions = acct.get_positions()
+        for ticker, shares in positions.items():
+            if shares <= 0:
+                continue
+            price = current_prices.get(ticker)
+            if not price:
+                continue
+
+            pos_data = acct._positions.get(ticker)
+            if pos_data and pos_data.avg_cost > 0:
+                pnl_pct = (price - pos_data.avg_cost) / pos_data.avg_cost
+                if pnl_pct <= -gp_strat.stop_loss:
+                    log.info("[%s] GP Stop loss %s: %.1f%%", gp_strat.id, ticker, pnl_pct * 100)
+                    try:
+                        self.engine.execute_signal(gp_strat.id, ticker, "sell", shares, price, current_prices, reason="stop_loss")
+                    except Exception as e:
+                        log.warning("[%s] GP Sell failed %s: %s", gp_strat.id, ticker, e)
+                    continue
+
+            if ticker not in buy_tickers or ticker in sell_tickers:
+                try:
+                    self.engine.execute_signal(gp_strat.id, ticker, "sell", shares, price, current_prices)
+                    log.info("[%s] GP Sold %s x%.0f @ $%.2f", gp_strat.id, ticker, shares, price)
+                except Exception as e:
+                    log.warning("[%s] GP Sell failed %s: %s", gp_strat.id, ticker, e)
+
+        # --- BUY ---
+        equity = acct.get_equity(current_prices)
+        target_per_position = equity * gp_strat.max_position_pct
+        for ticker in signals["buy"][:gp_strat.top_n]:
+            price = current_prices.get(ticker)
+            if not price or price <= 0:
+                continue
+            held = acct.get_positions().get(ticker, 0)
+            held_value = held * price
+            if held_value >= target_per_position * 0.9:
+                continue
+            budget = min(target_per_position - held_value, acct.cash * 0.95)
+            if budget < 5:
+                continue
+            shares = int(budget / price)
+            if shares <= 0:
+                continue
+            try:
+                self.engine.execute_signal(gp_strat.id, ticker, "buy", shares, price, current_prices)
+                log.info("[%s] GP Bought %s x%d @ $%.2f", gp_strat.id, ticker, shares, price)
+            except Exception as e:
+                log.warning("[%s] GP Buy failed %s: %s", gp_strat.id, ticker, e)
+
+        return True
+
+    def _filter_gp_factors(self, gp_strat, gp_factors_dict: dict) -> dict:
+        """Filter GP factors based on strategy's factor_selection and scoring_method."""
+        mined_factors = self._per_account_mined.get(gp_strat.id, [])
+        if not mined_factors or not gp_factors_dict:
+            return gp_factors_dict
+
+        # Determine which factor columns to keep
+        sorted_by_ic = sorted(mined_factors, key=lambda f: abs(f["ic"]), reverse=True)
+        all_names = [f["name"] for f in sorted_by_ic]
+
+        if gp_strat.factor_selection == "top5":
+            keep = set(all_names[:5])
+        elif gp_strat.factor_selection == "top10":
+            keep = set(all_names[:10])
+        elif gp_strat.factor_selection == "bottom5":
+            keep = set(all_names[-5:]) if len(all_names) >= 5 else set(all_names)
+        else:  # "all"
+            keep = set(all_names)
+
+        # Apply scoring method filter
+        if gp_strat.scoring_method == "top3_only":
+            keep = keep & set(all_names[:3]) if len(all_names) >= 3 else keep
+
+        # Filter DataFrames
+        filtered = {}
+        for ticker, fdf in gp_factors_dict.items():
+            if fdf is None or fdf.empty:
+                filtered[ticker] = fdf
+                continue
+            cols = [c for c in fdf.columns if c in keep]
+            filtered[ticker] = fdf[cols] if cols else fdf
+        return filtered
+
+    # -- Step 3c: Trade Qlib Q-accounts ---------------------------------------
+    def run_qlib_trading_cycle(self):
+        """Trade Qlib Q-accounts (Q01-Q10) using daily-retrained model scores
+        stored in factor_values (factor_name='qlib_QXX_score').
+
+        Each model gets its own latest available date's scores; we rank tickers
+        and apply the same SELL-stop-loss / BUY-top-N pattern as A/B accounts.
+
+        US-only RTH guard: Qlib scores are trained at 23:00 UTC against the
+        previous trading day's close. Entering at pre-market (04:00-09:30 ET)
+        crosses thin liquidity / wide spreads / overnight gaps that erode
+        5-15bps of alpha per trade. We force Q-accounts to wait until the
+        09:30 ET open where fills are tighter. CN keeps the existing CN RTH
+        guard (`is_market_hours_cn()` already excludes pre-market for CN).
+        """
+        if not self.qlib_strategies:
+            return  # CN or other markets where Q-accounts are disabled
+        # Defense-in-depth market-hours guard (mirrors A/B cycles).
+        if not is_market_hours_for(self.market):
+            log.info("[%s] Outside market hours — Qlib cycle skipped", self.market)
+            return
+        if self.market == "US" and not is_us_rth():
+            log.info("Outside US RTH (09:30-16:00 ET) — Qlib cycle skipped (avoids pre/post-market alpha leakage)")
+            return
+        log.info("Running Qlib trading cycle...")
+        current_prices = self._get_current_prices()
+        retired = self._retired_accounts()
+
+        for q_strat in self.qlib_strategies:
+            if q_strat.id in retired:
+                continue
+            try:
+                if not self._should_rebalance(q_strat.id, q_strat.rebalance_hours):
+                    continue
+                executed = self._trade_qlib_account(q_strat, current_prices)
+                if executed is False:
+                    continue
+                self._last_rebalance[q_strat.id] = datetime.now(timezone.utc)
+                emit_event(
+                    "rebalance",
+                    f"🔄 Rebalance {q_strat.id} (qlib/{q_strat.model_class}, base {q_strat.rebalance_hours}h)",
+                    account=q_strat.id,
+                    market=self.market,
+                )
+            except Exception as e:
+                log.error("Error trading Qlib %s: %s", q_strat.id, e)
+                traceback.print_exc()
+
+    def _load_qlib_scores(self, q_id: str) -> list[tuple[str, float]]:
+        """Read latest-date qlib scores for one Q-account from factor_values.
+        Returns [(ticker, score)] sorted desc by score. Empty if no rows.
+
+        Note: factor_name uses the *base* model id (Q01-Q10) — CN accounts
+        (CQ01-CQ10) share the same model architectures but are trained on
+        CN qlib data, so we strip the market prefix to find the row.
+        """
+        import sqlite3
+        prefix = ACCOUNT_PREFIX.get(self.market, "")
+        base_id = q_id[len(prefix):] if prefix and q_id.startswith(prefix) else q_id
+        factor_name = f"qlib_{base_id}_score"
+        # IMPORTANT: factor_name is shared across markets (e.g. qlib_Q01_score
+        # is written by both US and CN retrains). To avoid CN writes shadowing
+        # US's MAX(date) (or vice versa), restrict the date lookup to tickers
+        # in the *current market's* universe before picking the latest date.
+        try:
+            conn = sqlite3.connect(self.db_path)
+            uni_list = list(self.universe)
+            if not uni_list:
+                conn.close()
+                return []
+            placeholders = ",".join("?" * len(uni_list))
+            row = conn.execute(
+                f"SELECT MAX(date) FROM factor_values "
+                f"WHERE factor_name=? AND ticker IN ({placeholders})",
+                (factor_name, *uni_list),
+            ).fetchone()
+            latest = row[0] if row else None
+            if not latest:
+                conn.close()
+                return []
+            rows = conn.execute(
+                f"SELECT ticker, value FROM factor_values "
+                f"WHERE factor_name=? AND date=? AND value IS NOT NULL "
+                f"AND ticker IN ({placeholders})",
+                (factor_name, latest, *uni_list),
+            ).fetchall()
+            conn.close()
+        except Exception as e:
+            log.warning("[%s] Failed to load qlib scores: %s", q_id, e)
+            return []
+        # Restrict to current universe and sort desc
+        uni = set(self.universe)
+        scored = [(t, float(v)) for t, v in rows if t in uni]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored
+
+    def _trade_qlib_account(self, q_strat, current_prices: dict):
+        """Execute one Q-account's trading using model scores from DB."""
+        acct = self.engine.get_account(q_strat.id)
+        scored = self._load_qlib_scores(q_strat.id)
+        if not scored:
+            log.warning("[%s] no qlib scores found in factor_values, skipping", q_strat.id)
+            return False
+
+        buy_list = [t for t, _ in scored[:q_strat.top_n]]
+        buy_set = set(buy_list)
+
+        # --- SELL: stop loss + not in target portfolio ---
+        positions = acct.get_positions()
+        for ticker, shares in positions.items():
+            if shares <= 0:
+                continue
+            price = current_prices.get(ticker)
+            if not price:
+                continue
+            pos_data = acct._positions.get(ticker)
+            if pos_data and pos_data.avg_cost > 0:
+                pnl_pct = (price - pos_data.avg_cost) / pos_data.avg_cost
+                if pnl_pct <= -q_strat.stop_loss:
+                    log.info("[%s] Qlib stop loss %s: %.1f%%", q_strat.id, ticker, pnl_pct * 100)
+                    try:
+                        self.engine.execute_signal(
+                            q_strat.id, ticker, "sell", shares, price, current_prices,
+                            reason="stop_loss",
+                        )
+                    except Exception as e:
+                        log.warning("[%s] Qlib sell failed %s: %s", q_strat.id, ticker, e)
+                    continue
+            if ticker not in buy_set:
+                try:
+                    self.engine.execute_signal(
+                        q_strat.id, ticker, "sell", shares, price, current_prices,
+                    )
+                    log.info("[%s] Qlib sold %s x%.0f @ $%.2f", q_strat.id, ticker, shares, price)
+                except Exception as e:
+                    log.warning("[%s] Qlib sell failed %s: %s", q_strat.id, ticker, e)
+
+        # --- BUY ---
+        equity = acct.get_equity(current_prices)
+        target_per_position = equity * q_strat.max_position_pct
+        for ticker in buy_list:
+            price = current_prices.get(ticker)
+            if not price or price <= 0:
+                continue
+            held = acct.get_positions().get(ticker, 0)
+            held_value = held * price
+            if held_value >= target_per_position * 0.9:
+                continue
+            budget = min(target_per_position - held_value, acct.cash * 0.95)
+            if budget < 5:
+                continue
+            shares = int(budget / price)
+            if shares <= 0:
+                continue
+            try:
+                self.engine.execute_signal(
+                    q_strat.id, ticker, "buy", shares, price, current_prices,
+                )
+                log.info("[%s] Qlib bought %s x%d @ $%.2f", q_strat.id, ticker, shares, price)
+            except Exception as e:
+                log.warning("[%s] Qlib buy failed %s: %s", q_strat.id, ticker, e)
+        return True
+
+    # -- Adaptive rebalance helpers -----------------------------------------
+    def _compute_adaptive_hours(self, base_hours: float) -> float:
+        """根据近期市场波动率计算自适应换仓周期（小时）。"""
+        cfg = ADAPTIVE_REBALANCE
+        vol_window = cfg.get("vol_window", 5)
+        min_h = cfg.get("min_hours", 12)
+        max_h = cfg.get("max_hours", 96)
+        silence_thresh = cfg.get("silence_threshold", 0.3)
+
+        if len(self._market_returns) < max(2, vol_window):
+            return base_hours
+
+        recent = self._market_returns[-vol_window:]
+        sigma_t = float(np.std(recent)) if len(recent) >= 2 else self._sigma_ref
+
+        if sigma_t < 1e-10:
+            return float("inf")
+        if sigma_t < self._sigma_ref * silence_thresh:
+            return float("inf")  # 静默区
+
+        ratio = self._sigma_ref / sigma_t
+        hours = base_hours * ratio
+        return max(min_h, min(max_h, hours))
+
+    def _should_rebalance(self, account_id: str, base_hours: float) -> bool:
+        """判断该账户是否应该换仓。非自适应模式直接返回True。"""
+        if not self._adaptive_enabled:
+            return True
+
+        now = datetime.now(timezone.utc)
+        last = self._last_rebalance.get(account_id)
+        if last is None:
+            return True  # 首次交易
+
+        adaptive_hours = self._compute_adaptive_hours(base_hours)
+        self._rebalance_hours_cache[account_id] = adaptive_hours
+
+        if adaptive_hours == float("inf"):
+            log.debug("[%s] Adaptive: silence zone, skip rebalance", account_id)
+            return False
+
+        elapsed = (now - last).total_seconds() / 3600.0
+        if elapsed >= adaptive_hours:
+            log.info("[%s] Adaptive rebalance: %.1fh elapsed >= %.1fh threshold",
+                     account_id, elapsed, adaptive_hours)
+            return True
+        return False
+
+    def _update_market_returns(self):
+        """从历史数据计算市场平均日收益率，更新sigma_ref。"""
+        all_returns = []
+        for ticker, df in self._historical_data.items():
+            if df is not None and len(df) >= 2:
+                rets = df["close"].pct_change().dropna().tolist()
+                all_returns.append(rets)
+
+        if not all_returns:
+            return
+
+        # 每天取所有股票的平均收益
+        max_len = max(len(r) for r in all_returns)
+        daily_avg = []
+        for i in range(max_len):
+            vals = [r[i] for r in all_returns if i < len(r)]
+            if vals:
+                daily_avg.append(float(np.mean(vals)))
+
+        self._market_returns = daily_avg
+
+        # sigma_ref = 60日中位数波动率（滚动5日窗口标准差的中位数）
+        if len(daily_avg) >= 10:
+            vol_window = ADAPTIVE_REBALANCE.get("vol_window", 5)
+            rolling_vols = []
+            for i in range(vol_window, len(daily_avg)):
+                window = daily_avg[i - vol_window:i]
+                rolling_vols.append(float(np.std(window)))
+            if rolling_vols:
+                self._sigma_ref = float(np.median(rolling_vols))
+                log.info("Adaptive: sigma_ref=%.6f, %d market returns",
+                         self._sigma_ref, len(daily_avg))
+
+        # 持久化市场收益率
+        if daily_avg and self._historical_data:
+            try:
+                # 从任一ticker获取日期索引
+                sample_ticker = next(iter(self._historical_data))
+                sample_df = self._historical_data[sample_ticker]
+                if sample_df is not None and len(sample_df) >= 2:
+                    dates = sample_df.index[-len(daily_avg):]
+                    pairs = [(str(d)[:10], r) for d, r in zip(dates, daily_avg[-len(dates):])]
+                    self.store.save_market_returns(pairs)
+            except Exception as e:
+                log.warning("Failed to save market returns: %s", e)
+
+    # -- Step 3: Generate signals and trade ---------------------------------
+    def run_trading_cycle(self):
+        """For each account/strategy, generate signals and execute trades."""
+        # Defense-in-depth market-hours guard (see run_gp_trading_cycle).
+        if not is_market_hours_for(self.market):
+            log.info("[%s] Outside market hours — A-cycle skipped", self.market)
+            return
+        log.info("Running trading cycle...")
+
+        current_prices = self._get_current_prices()
+        retired = self._retired_accounts()
+
+        for strat in self.strategies:
+            if strat.id in retired:
+                continue
+            try:
+                if not self._should_rebalance(strat.id, strat.rebalance_hours):
+                    continue
+                self._trade_account(strat, current_prices)
+                self._last_rebalance[strat.id] = datetime.now(timezone.utc)
+                emit_event(
+                    "rebalance",
+                    f"🔄 Rebalance {strat.id} ({strat.strategy_type}, base {strat.rebalance_hours}h)",
+                    account=strat.id,
+                    market=self.market,
+                )
+            except Exception as e:
+                log.error("Error trading %s: %s", strat.id, e)
+                traceback.print_exc()
+
+    def _trade_account(self, strat, current_prices: dict):
+        """Execute trading logic for one account."""
+        acct = self.engine.get_account(strat.id)
+        equity = acct.get_equity(current_prices)
+
+        # Generate signals
+        signals = self.signal_gen.generate_signals(
+            self._factors_dict, strat.strategy_type
+        )
+
+        # --- SELL: close positions not in buy list ---
+        buy_tickers = {t for t, _ in signals["buy"][:strat.top_n]}
+        positions = acct.get_positions()
+        for ticker, shares in positions.items():
+            if shares <= 0:
+                continue
+            price = current_prices.get(ticker)
+            if not price:
+                continue
+
+            # Stop loss check
+            pos_data = acct._positions.get(ticker)
+            if pos_data and pos_data.avg_cost > 0:
+                pnl_pct = (price - pos_data.avg_cost) / pos_data.avg_cost
+                if pnl_pct <= strat.stop_loss * -1:
+                    log.info("[%s] Stop loss %s: %.1f%%", strat.id, ticker, pnl_pct * 100)
+                    try:
+                        self.engine.execute_signal(
+                            strat.id, ticker, "sell", shares, price, current_prices,
+                            reason="stop_loss",
+                        )
+                    except Exception as e:
+                        log.warning("[%s] Sell failed %s: %s", strat.id, ticker, e)
+                    continue
+
+            # Not in target portfolio -> sell
+            if ticker not in buy_tickers:
+                try:
+                    self.engine.execute_signal(
+                        strat.id, ticker, "sell", shares, price, current_prices
+                    )
+                    log.info("[%s] Sold %s x%.0f @ $%.2f", strat.id, ticker, shares, price)
+                except Exception as e:
+                    log.warning("[%s] Sell failed %s: %s", strat.id, ticker, e)
+
+        # --- BUY: top_n signals ---
+        equity = acct.get_equity(current_prices)
+        target_per_position = equity * strat.max_position_pct
+        for ticker, score in signals["buy"][:strat.top_n]:
+            price = current_prices.get(ticker)
+            if not price or price <= 0:
+                continue
+
+            # Skip if already holding enough
+            held = acct.get_positions().get(ticker, 0)
+            held_value = held * price
+            if held_value >= target_per_position * 0.9:
+                continue
+
+            # Calculate shares to buy
+            budget = min(target_per_position - held_value, acct.cash * 0.95)
+            if budget < 5:  # minimum $5 trade
+                continue
+            shares = int(budget / price)
+            if shares <= 0:
+                continue
+
+            try:
+                self.engine.execute_signal(
+                    strat.id, ticker, "buy", shares, price, current_prices
+                )
+                log.info("[%s] Bought %s x%d @ $%.2f (score=%.3f)",
+                         strat.id, ticker, shares, price, score)
+            except Exception as e:
+                log.warning("[%s] Buy failed %s: %s", strat.id, ticker, e)
+
+    # -- Step 4: Generate and send report -----------------------------------
+    def send_hourly_report(self):
+        """Build and send the hourly Telegram report."""
+        log.info("Generating hourly report...")
+
+        current_prices = self._get_current_prices()
+
+        # Guard: if no historical/realtime price data was loaded this run,
+        # equity would fall back to avg_cost and snap to ~initial_cash,
+        # corrupting the equity curve. Refuse to snapshot in that case.
+        if not current_prices or not self._historical_data:
+            log.error(
+                "send_hourly_report aborted: no price data available "
+                "(historical=%d, realtime=%d). Run fetch_data() first.",
+                len(self._historical_data), len(self._realtime_prices),
+            )
+            return
+
+        accounts_data = []
+        retired = self._retired_accounts()
+        # Strategy accounts (A01-A10 / CA01-CA10)
+        for strat in self.strategies:
+            if strat.id in retired:
+                continue
+            acct = self.engine.get_account(strat.id)
+            equity = acct.get_equity(current_prices)
+            pnl = equity - acct.initial_cash
+            pnl_pct = (pnl / acct.initial_cash) * 100
+
+            positions_list = []
+            for ticker, shares in acct.get_positions().items():
+                if shares <= 0:
+                    continue
+                price = current_prices.get(ticker, 0)
+                pos_data = acct._positions.get(ticker)
+                cost = pos_data.avg_cost if pos_data else price
+                pos_pnl = (price - cost) * shares
+                allocation = (shares * price / equity * 100) if equity > 0 else 0
+                positions_list.append({
+                    "ticker": ticker, "shares": shares, "price": price,
+                    "avg_cost": cost, "pnl": pos_pnl, "allocation_pct": allocation,
+                })
+
+            accounts_data.append({
+                "account_id": strat.id, "strategy": strat.name,
+                "factors": strat.factor_names,
+                "cash": acct.cash, "equity": equity,
+                "pnl": pnl, "pnl_pct": pnl_pct,
+                "positions": positions_list,
+                "num_trades": len(acct.trade_log),
+                "group": "Alpha158",
+            })
+
+        # GP accounts (B01-B10 / CB01-CB10)
+        for gp_strat in self.gp_strategies:
+            if gp_strat.id in retired:
+                continue
+            acct = self.engine.get_account(gp_strat.id)
+            equity = acct.get_equity(current_prices)
+            pnl = equity - acct.initial_cash
+            pnl_pct = (pnl / acct.initial_cash) * 100
+
+            positions_list = []
+            for ticker, shares in acct.get_positions().items():
+                if shares <= 0:
+                    continue
+                price = current_prices.get(ticker, 0)
+                pos_data = acct._positions.get(ticker)
+                cost = pos_data.avg_cost if pos_data else price
+                pos_pnl = (price - cost) * shares
+                allocation = (shares * price / equity * 100) if equity > 0 else 0
+                positions_list.append({
+                    "ticker": ticker, "shares": shares, "price": price,
+                    "avg_cost": cost, "pnl": pos_pnl, "allocation_pct": allocation,
+                })
+
+            accounts_data.append({
+                "account_id": gp_strat.id, "strategy": gp_strat.name,
+                "factors": [gp_strat.factor_selection, gp_strat.scoring_method],
+                "cash": acct.cash, "equity": equity,
+                "pnl": pnl, "pnl_pct": pnl_pct,
+                "positions": positions_list,
+                "num_trades": len(acct.trade_log),
+                "group": "GP进化",
+            })
+
+        # Qlib Q-accounts (Q01-Q10 / CQ01-CQ10)
+        for q_strat in self.qlib_strategies:
+            acct = self.engine.get_account(q_strat.id)
+            equity = acct.get_equity(current_prices)
+            pnl = equity - acct.initial_cash
+            pnl_pct = (pnl / acct.initial_cash) * 100
+
+            positions_list = []
+            for ticker, shares in acct.get_positions().items():
+                if shares <= 0:
+                    continue
+                price = current_prices.get(ticker, 0)
+                pos_data = acct._positions.get(ticker)
+                cost = pos_data.avg_cost if pos_data else price
+                pos_pnl = (price - cost) * shares
+                allocation = (shares * price / equity * 100) if equity > 0 else 0
+                positions_list.append({
+                    "ticker": ticker, "shares": shares, "price": price,
+                    "avg_cost": cost, "pnl": pos_pnl, "allocation_pct": allocation,
+                })
+
+            accounts_data.append({
+                "account_id": q_strat.id, "strategy": q_strat.name,
+                "factors": [q_strat.model_class],
+                "cash": acct.cash, "equity": equity,
+                "pnl": pnl, "pnl_pct": pnl_pct,
+                "positions": positions_list,
+                "num_trades": len(acct.trade_log),
+                "group": "Qlib模型",
+            })
+
+        # Benchmark IDX accounts
+        for bm in self.benchmarks:
+            acct = self.engine.get_account(bm["id"])
+            equity = acct.get_equity(current_prices)
+            pnl = equity - acct.initial_cash
+            pnl_pct = (pnl / acct.initial_cash) * 100
+
+            positions_list = []
+            for ticker, shares in acct.get_positions().items():
+                if shares <= 0:
+                    continue
+                price = current_prices.get(ticker, 0)
+                pos_data = acct._positions.get(ticker)
+                cost = pos_data.avg_cost if pos_data else price
+                pos_pnl = (price - cost) * shares
+                allocation = (shares * price / equity * 100) if equity > 0 else 0
+                positions_list.append({
+                    "ticker": ticker, "shares": shares, "price": price,
+                    "avg_cost": cost, "pnl": pos_pnl, "allocation_pct": allocation,
+                })
+
+            accounts_data.append({
+                "account_id": bm["id"], "strategy": bm["name"],
+                "factors": [bm["ticker"]],
+                "cash": acct.cash, "equity": equity,
+                "pnl": pnl, "pnl_pct": pnl_pct,
+                "positions": positions_list,
+                "num_trades": len(acct.trade_log),
+                "group": "基准指数",
+            })
+
+        # Save equity snapshots for all accounts — verify each one first.
+        # If any held ticker has no price, skip that account's snapshot to
+        # avoid corrupting the equity curve with an avg_cost fallback.
+        for ad in accounts_data:
+            acct = self.engine.get_account(ad["account_id"])
+            try:
+                # Strict recomputation catches silent avg_cost fallbacks.
+                verified_equity = acct.get_equity(current_prices, strict=True)
+            except ValueError as e:
+                log.error(
+                    "Skipping snapshot for %s: %s",
+                    ad["account_id"], e,
+                )
+                continue
+            self.store.save_snapshot(ad["account_id"], ad["cash"], verified_equity,
+                                      market=self.market)
+
+        # Sort by PnL descending
+        accounts_data.sort(key=lambda a: a["pnl"], reverse=True)
+
+        # Build report text
+        now = datetime.now(timezone.utc)
+        # Overall distribution header — independent $10k accounts → show dispersion, not sum.
+        all_pcts = sorted(a["pnl_pct"] for a in accounts_data)
+        def _q_all(xs, q):
+            if not xs: return 0.0
+            k = (len(xs) - 1) * q
+            f = int(k); c = min(f + 1, len(xs) - 1)
+            return xs[f] if f == c else xs[f] + (xs[c] - xs[f]) * (k - f)
+        total_n = len(all_pcts)
+        if total_n:
+            med = _q_all(all_pcts, 0.5)
+            q1 = _q_all(all_pcts, 0.25)
+            q3 = _q_all(all_pcts, 0.75)
+            win_n = sum(1 for p in all_pcts if p > 0)
+            best_acc = max(accounts_data, key=lambda a: a["pnl_pct"])
+            worst_acc = min(accounts_data, key=lambda a: a["pnl_pct"])
+        lines = [
+            f"📊 量化系统报告 {now.strftime('%Y-%m-%d %H:%M UTC')}",
+            "=" * 40,
+        ]
+        # Risk regime line — ALWAYS shown so a forgotten manual override or
+        # auto-armed trailing stop never hides from view.
+        try:
+            from trading.risk_regime import status_line as _risk_status
+            lines.append(_risk_status())
+        except Exception as _e:
+            log.warning("risk_regime status_line unavailable: %s", _e)
+        if total_n:
+            lines.append(
+                f"账户收益分布 (n={total_n}): 中位{med:+.2f}%  "
+                f"IQR[{q1:+.2f}%, {q3:+.2f}%]  胜率{win_n}/{total_n}"
+            )
+            lines.append(
+                f"最佳 {best_acc['account_id']} {best_acc['pnl_pct']:+.2f}%  |  "
+                f"最差 {worst_acc['account_id']} {worst_acc['pnl_pct']:+.2f}%"
+            )
+
+        # Group by type
+        for group_name in ["Alpha158", "GP进化", "Qlib模型", "基准指数"]:
+            group = [a for a in accounts_data if a.get("group") == group_name]
+            if not group:
+                continue
+            group.sort(key=lambda a: a["pnl"], reverse=True)
+            # Distribution stats instead of meaningless aggregate PnL sum
+            # (accounts are independent $10k starts; summing them hides dispersion).
+            pcts = sorted(a["pnl_pct"] for a in group)
+            n = len(pcts)
+            def _q(xs, q):
+                if not xs: return 0.0
+                k = (len(xs) - 1) * q
+                f = int(k); c = min(f + 1, len(xs) - 1)
+                return xs[f] if f == c else xs[f] + (xs[c] - xs[f]) * (k - f)
+            median_pct = _q(pcts, 0.5)
+            best = max(group, key=lambda a: a["pnl_pct"])
+            worst = min(group, key=lambda a: a["pnl_pct"])
+            win_n = sum(1 for p in pcts if p > 0)
+            g_emoji = "🧬" if group_name == "GP进化" else "📐" if group_name == "Alpha158" else "🤖" if group_name == "Qlib模型" else "📊"
+            lines.append(
+                f"\n{g_emoji} {group_name} 组 (n={n}, 中位{median_pct:+.2f}%, "
+                f"胜率{win_n}/{n}, 最佳{best['account_id']}{best['pnl_pct']:+.2f}% / "
+                f"最差{worst['account_id']}{worst['pnl_pct']:+.2f}%)"
+            )
+            lines.append("-" * 38)
+
+            # Show GP mined factor expressions under GP group header
+            if group_name == "GP进化":
+                total_factors = sum(len(self._per_account_mined.get(gs.id, [])) for gs in self.gp_strategies)
+                lines.append(f"🔬 独立挖掘因子(每账户独立GP进化, 共{total_factors}个)")
+                lines.append("")
+
+            for i, acct_d in enumerate(group, 1):
+                emoji = "🟢" if acct_d["pnl"] >= 0 else "🔴"
+                lines.append(f"{emoji} {acct_d['strategy']} ({acct_d['account_id']})")
+                # Show factors used by this account with formulas
+                if group_name == "Alpha158":
+                    factor_list = acct_d["factors"] if acct_d["factors"] else list(FACTOR_FORMULAS.keys())[:5]
+                    for fn in factor_list:
+                        formula = FACTOR_FORMULAS.get(fn, "?")
+                        lines.append(f"  📈{fn} = {formula}")
+                elif group_name == "GP进化":
+                    sel = acct_d["factors"][0]  # factor_selection
+                    scr = acct_d["factors"][1]  # scoring_method
+                    sel_desc = {"all": "全部因子", "top5": "IC前5因子", "top10": "IC前10因子", "bottom5": "IC后5因子(反向)"}.get(sel, sel)
+                    scr_desc = {"equal_weight": "等权评分", "ic_weighted": "IC加权评分", "top3_only": "仅取IC前3因子评分"}.get(scr, scr)
+                    lines.append(f"  📈策略: {sel_desc}, {scr_desc}")
+                    # Show this account's own mined factors
+                    acct_mined = self._per_account_mined.get(acct_d["account_id"], [])
+                    if acct_mined:
+                        lines.append(f"  🧬 挖掘因子({len(acct_mined)}个):")
+                        for mf in acct_mined[:5]:  # show top 5
+                            math_expr = gp_expr_to_math(mf["expression"])
+                            lines.append(f"    {mf['name']}(IC={mf['ic']:.4f}): {math_expr}")
+                        if len(acct_mined) > 5:
+                            lines.append(f"    ...及{len(acct_mined)-5}个更多因子")
+                elif group_name == "基准指数":
+                    lines.append(f"  📈 Buy & Hold {acct_d['factors'][0]}")
+                lines.append(f"  💰${acct_d['equity']:.2f} 盈亏{acct_d['pnl']:+.2f}({acct_d['pnl_pct']:+.1f}%) 交易{acct_d['num_trades']}")
+                if acct_d["positions"]:
+                    for pos in sorted(acct_d["positions"], key=lambda p: abs(p["pnl"]), reverse=True)[:3]:
+                        pe = "📗" if pos["pnl"] >= 0 else "📕"
+                        lines.append(f"  {pe}{pos['ticker']} {pos['shares']:.0f}股 盈亏{pos['pnl']:+.2f}")
+                else:
+                    lines.append("  空仓")
+
+        report_text = "\n".join(lines)
+
+        # Generate chart
+        try:
+            chart_path = self.report_gen.generate_hourly_report(accounts_data)[1]
+        except Exception as e:
+            log.warning("Chart generation failed: %s", e)
+            chart_path = None
+
+        # Send via Telegram
+        try:
+            if self.reporter:
+                self.reporter.send_report(report_text, chart_path, force=True)
+            log.info("Report sent to Telegram")
+        except Exception as e:
+            log.error("Failed to send Telegram report: %s", e)
+
+        self._last_report = datetime.now(timezone.utc)
+
+        # 持久化所有账户状态
+        try:
+            self._save_all_state()
+        except Exception as e:
+            log.warning("Failed to save state: %s", e)
+        return report_text
+
+    # -- Main loop ----------------------------------------------------------
+    def run_once(self, send_report: bool = True):
+        """Run a single cycle: fetch -> factors -> trade -> (optional) report.
+
+        When send_report=False, skips the Telegram report + chart generation.
+        Used by the every-15-minute cron slot so we get more frequent rebalance
+        checks without spamming the chat. The top-of-hour slot still sends.
+
+        Market-hours guard: simulation must mirror real trading. Outside US
+        extended hours (04:00-20:00 ET, Mon-Fri) we refuse to trade. We still
+        refresh data + emit a report (so morning reports show overnight state),
+        but no rebalance / position changes occur.
+        """
+        in_market = is_market_hours_for(self.market)
+        if not in_market:
+            log.info("Outside %s market window — skipping trading cycle (report-only mode)", self.market)
+            # Refresh quotes so the report reflects the latest available close,
+            # but DO NOT touch positions / cash / rebalance.
+            try:
+                self.fetch_data()
+            except Exception as e:
+                log.warning("fetch_data failed in report-only mode: %s", e)
+            try:
+                self._realtime_prices = self._fetch_realtime_prices()
+            except Exception as e:
+                log.warning("realtime price fetch failed in report-only mode: %s", e)
+            if send_report:
+                return self.send_hourly_report()
+            return
+
+        self.fetch_data()
+        self.compute_factors()
+        self.mine_gp_factors()
+        # Refresh real-time quotes so equity/PnL reflects intraday prices,
+        # not stale 1d close (which only updates after market close).
+        self._realtime_prices = self._fetch_realtime_prices()
+        self.initialize_benchmarks()
+        self.run_trading_cycle()
+        self.run_gp_trading_cycle()
+        self.run_qlib_trading_cycle()
+        if send_report:
+            return self.send_hourly_report()
+        # Still persist state even when not reporting
+        try:
+            self._save_all_state()
+        except Exception as e:
+            log.warning("Failed to save state: %s", e)
+        return None
+
+    def run_loop(self):
+        """Run continuously during market hours, reporting every hour."""
+        log.info("Starting main loop...")
+        self.fetch_data()
+        self.compute_factors()
+        self.mine_gp_factors()
+
+        while True:
+            try:
+                if is_market_hours_for(self.market):
+                    # Refresh data every 5 minutes
+                    if (self._last_data_fetch is None or
+                        (datetime.now(timezone.utc) - self._last_data_fetch).seconds > 300):
+                        self.fetch_data()
+                        self.compute_factors()
+                        self.mine_gp_factors()
+
+                    # 每个cycle都刷新实时价格（盘前/盘中/盘后）
+                    self._realtime_prices = self._fetch_realtime_prices()
+
+                    # 更新持仓市价 + 写入positions_history快照
+                    self._save_all_state()
+
+                    # Trade
+                    self.initialize_benchmarks()
+                    self.run_trading_cycle()
+                    self.run_gp_trading_cycle()
+                    self.run_qlib_trading_cycle()
+
+                    # Report every hour
+                    if (self._last_report is None or
+                        (datetime.now(timezone.utc) - self._last_report).seconds > 3600):
+                        self.send_hourly_report()
+
+                    time.sleep(300)  # check every 5 minutes
+                else:
+                    log.info("Outside market hours, sleeping 30 minutes...")
+                    time.sleep(1800)
+
+            except KeyboardInterrupt:
+                log.info("Shutting down...")
+                break
+            except Exception as e:
+                log.error("Error in main loop: %s", e)
+                traceback.print_exc()
+                time.sleep(60)
+
+
+# ---------------------------------------------------------------------------
+# Entry points
+# ---------------------------------------------------------------------------
+def _run_for_market(market: str, mode: str):
+    """Instantiate a QuantSystem for `market` and dispatch to the requested mode."""
+    log.info("===== Running market: %s (%s) =====", market, mode)
+    system = QuantSystem(market=market)
+    send_report = (market == "US")
+    if mode == "once":
+        return system.run_once(send_report=send_report)
+    if mode == "cycle_no_report":
+        return system.run_once(send_report=False)
+    if mode == "loop":
+        # In loop mode each call runs its own forever-loop; we only support
+        # single-market loop via this helper. main() handles multi-market.
+        return system.run_loop()
+    if mode == "test":
+        log.info("=== SMOKE TEST [%s] ===", market)
+        from config import settings as _settings
+        if market == "US":
+            original = _settings.STOCK_UNIVERSE
+            _settings.STOCK_UNIVERSE = ["AAPL", "MSFT", "NVDA", "GOOGL", "TSLA"]
+            try:
+                report = system.run_once()
+            finally:
+                _settings.STOCK_UNIVERSE = original
+            if report:
+                print("\n" + report)
+        else:
+            system.run_once(send_report=False)
+        return None
+    raise ValueError(f"Unknown mode: {mode}")
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Multi-Market Quant Trading System")
+    parser.add_argument("--once", action="store_true", help="Run single cycle then exit")
+    parser.add_argument("--cycle-no-report", action="store_true",
+                        help="Run trading cycle but skip Telegram report (for intra-hour cron)")
+    parser.add_argument("--loop", action="store_true", help="Run continuous loop (US only)")
+    parser.add_argument("--test", action="store_true", help="Quick smoke test")
+    parser.add_argument("--market", choices=MARKETS + ["ALL"], default="ALL",
+                        help="Limit to one market (default: ALL = iterate every market in MARKETS)")
+    args = parser.parse_args()
+
+    if args.once:
+        mode = "once"
+    elif args.cycle_no_report:
+        mode = "cycle_no_report"
+    elif args.loop:
+        mode = "loop"
+    elif args.test:
+        mode = "test"
+    else:
+        parser.print_help()
+        return
+
+    markets = MARKETS if args.market == "ALL" else [args.market]
+
+    if mode == "loop":
+        # run_loop is blocking — only meaningful for one market.
+        market = markets[0]
+        if len(markets) > 1:
+            log.warning("--loop only supports one market at a time; using %s", market)
+        _run_for_market(market, mode)
+        return
+
+    for market in markets:
+        try:
+            _run_for_market(market, mode)
+        except Exception as e:
+            log.exception("Market %s failed: %s", market, e)
+            continue
+
+
+if __name__ == "__main__":
+    main()
