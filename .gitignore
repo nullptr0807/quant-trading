@@ -33,7 +33,15 @@ credentials.json
 *.sqlite3
 
 # --- Data files ---
-data/
+# NOTE: data/ contains Python modules (fetcher.py, store.py, cn_fetcher.py)
+# that MUST be tracked. Only ignore the actual data artifacts inside.
+data/*.db
+data/*.db.bak.*
+data/*.db-wal
+data/*.db-shm
+data/qlib_checkpoints/
+data/__pycache__/
+data/cn_universe.json
 *.parquet
 *.csv
 *.feather
