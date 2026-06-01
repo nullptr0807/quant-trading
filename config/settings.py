@@ -353,6 +353,20 @@ REPORT = {
 # =============================================================================
 # 自适应换仓配置 (Adaptive Rebalancing)
 # =============================================================================
+# =============================================================================
+# Churn controls (applies to Alpha158 / GP / Qlib trading loops)
+#   - stop_cooldown_hours: after stop_loss sell, suppress same-ticker re-buys
+#   - hold_band_mult:      hysteresis. buy band = top_n; hold band = top_n*mult
+#   - min_hold_days:       non-stop-loss sells require position age >= N days
+# Each can be set to 0 to disable individually. enabled=False kills all three.
+# =============================================================================
+CHURN_CONTROLS = {
+    "enabled": True,
+    "stop_cooldown_hours": 24,
+    "hold_band_mult": 3,
+    "min_hold_days": 2,
+}
+
 ADAPTIVE_REBALANCE = {
     "enabled": True,              # 总开关：True=启用自适应, False=固定周期
     "vol_window": 5,               # 波动率计算窗口（天）

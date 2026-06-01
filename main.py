@@ -23,8 +23,9 @@ sys.path.insert(0, PROJECT_ROOT)
 from config.settings import (
     STOCK_UNIVERSE, FINNHUB_API_KEY, FEES, ACCOUNTS, ADAPTIVE_REBALANCE,
     MARKETS, DEFAULT_MARKET, UNIVERSES, INITIAL_CASH, FEES_BY_MARKET,
-    BENCHMARKS_BY_MARKET, ACCOUNT_PREFIX,
+    BENCHMARKS_BY_MARKET, ACCOUNT_PREFIX, CHURN_CONTROLS,
 )
+from trading.churn_controls import get_stop_cooldown_set, get_min_hold_set
 from data.fetcher import DataFetcher
 from data.cn_fetcher import get_fetcher_for
 from data.store import DataStore, init_db
@@ -323,7 +324,11 @@ class QuantSystem:
 
         # Factors
         self.factor_engine = FactorEngine()
-        self.signal_gen = SignalGenerator(buy_top=10, sell_top=10)
+        # decorrelate=False (V2 PCA whitening tested in replay 4/24–5/22, full A-group
+        # avg PnL: V1 +8.4% vs V2-with-decorrelate -0.5%. Whitening on small (3-5)
+        # high-corr factor sets amplifies noise PCs. Keep V2 plumbing for future experiments
+        # but ship with it off.)
+        self.signal_gen = SignalGenerator(buy_top=30, sell_top=10, decorrelate=False)
 
         # Trading — market-aware costs
         if market == "CN":
@@ -455,6 +460,19 @@ class QuantSystem:
                     (acct_id, self.market),
                 ).fetchone()
                 if exists:
+                    # Sync code-of-record fields so dashboard never drifts from
+                    # accounts/strategies.py (factors/name/description/group).
+                    # initial_cash, created_at, status, retired_at, retire_reason
+                    # are operational state and intentionally preserved.
+                    try:
+                        conn.execute(
+                            "UPDATE account_meta SET strategy_name=?, description=?, "
+                            "\"group\"=?, factors=? "
+                            "WHERE account_id=? AND market=?",
+                            (strat_name, desc, grp, factors, acct_id, self.market),
+                        )
+                    except Exception:
+                        pass
                     continue
                 try:
                     conn.execute(
@@ -940,8 +958,23 @@ class QuantSystem:
             log.warning("[%s] GP signals empty (no buy candidates) — skipping rebalance to preserve positions", gp_strat.id)
             return False
 
+        # --- Churn controls (P0, 2026-06-01) ---
+        cc = CHURN_CONTROLS if CHURN_CONTROLS.get("enabled", True) else {}
+        HOLD_MULT = cc.get("hold_band_mult", 1) or 1
+        # GP signal_gen.generate_signals returns ordered list under signals["buy"];
+        # the leading top_n is the BUY band, the leading top_n*HOLD_MULT is the HOLD band.
+        hold_tickers = set(signals["buy"][:gp_strat.top_n * HOLD_MULT])
+        cooldown_set = get_stop_cooldown_set(
+            self.db_path, gp_strat.id, self.market, cc.get("stop_cooldown_hours", 0),
+        )
+
         # --- SELL: stop loss + not in buy list ---
         positions = acct.get_positions()
+        held_set = {t for t, s in positions.items() if s > 0}
+        min_hold_lock = get_min_hold_set(
+            self.db_path, gp_strat.id, self.market,
+            cc.get("min_hold_days", 0), held_tickers=held_set,
+        )
         for ticker, shares in positions.items():
             if shares <= 0:
                 continue
@@ -960,7 +993,11 @@ class QuantSystem:
                         log.warning("[%s] GP Sell failed %s: %s", gp_strat.id, ticker, e)
                     continue
 
-            if ticker not in buy_tickers or ticker in sell_tickers:
+            if ticker not in hold_tickers or ticker in sell_tickers:
+                if ticker in min_hold_lock:
+                    log.info("[%s] GP min_hold skip sell %s (held < %dd)",
+                             gp_strat.id, ticker, cc.get("min_hold_days", 0))
+                    continue
                 try:
                     self.engine.execute_signal(gp_strat.id, ticker, "sell", shares, price, current_prices)
                     log.info("[%s] GP Sold %s x%.0f @ $%.2f", gp_strat.id, ticker, shares, price)
@@ -971,6 +1008,10 @@ class QuantSystem:
         equity = acct.get_equity(current_prices)
         target_per_position = equity * gp_strat.max_position_pct
         for ticker in signals["buy"][:gp_strat.top_n]:
+            if ticker in cooldown_set:
+                log.info("[%s] GP cooldown skip %s (stop_loss within %dh)",
+                         gp_strat.id, ticker, cc.get("stop_cooldown_hours", 0))
+                continue
             price = current_prices.get(ticker)
             if not price or price <= 0:
                 continue
@@ -1132,8 +1173,21 @@ class QuantSystem:
         buy_list = [t for t, _ in scored[:q_strat.top_n]]
         buy_set = set(buy_list)
 
+        # --- Churn controls (P0, 2026-06-01) ---
+        cc = CHURN_CONTROLS if CHURN_CONTROLS.get("enabled", True) else {}
+        HOLD_MULT = cc.get("hold_band_mult", 1) or 1
+        hold_set = {t for t, _ in scored[:q_strat.top_n * HOLD_MULT]}
+        cooldown_set = get_stop_cooldown_set(
+            self.db_path, q_strat.id, self.market, cc.get("stop_cooldown_hours", 0),
+        )
+
         # --- SELL: stop loss + not in target portfolio ---
         positions = acct.get_positions()
+        held_set = {t for t, s in positions.items() if s > 0}
+        min_hold_lock = get_min_hold_set(
+            self.db_path, q_strat.id, self.market,
+            cc.get("min_hold_days", 0), held_tickers=held_set,
+        )
         for ticker, shares in positions.items():
             if shares <= 0:
                 continue
@@ -1153,7 +1207,11 @@ class QuantSystem:
                     except Exception as e:
                         log.warning("[%s] Qlib sell failed %s: %s", q_strat.id, ticker, e)
                     continue
-            if ticker not in buy_set:
+            if ticker not in hold_set:
+                if ticker in min_hold_lock:
+                    log.info("[%s] Qlib min_hold skip sell %s (held < %dd)",
+                             q_strat.id, ticker, cc.get("min_hold_days", 0))
+                    continue
                 try:
                     self.engine.execute_signal(
                         q_strat.id, ticker, "sell", shares, price, current_prices,
@@ -1166,6 +1224,10 @@ class QuantSystem:
         equity = acct.get_equity(current_prices)
         target_per_position = equity * q_strat.max_position_pct
         for ticker in buy_list:
+            if ticker in cooldown_set:
+                log.info("[%s] Qlib cooldown skip %s (stop_loss within %dh)",
+                         q_strat.id, ticker, cc.get("stop_cooldown_hours", 0))
+                continue
             price = current_prices.get(ticker)
             if not price or price <= 0:
                 continue
@@ -1322,9 +1384,22 @@ class QuantSystem:
             self._factors_dict, strat.strategy_type
         )
 
-        # --- SELL: close positions not in buy list ---
+        # --- Churn controls (P0, 2026-06-01): hysteresis + cooldown + min_hold ---
+        # See trading/churn_controls.py and CHURN_CONTROLS in config/settings.py.
+        # Defaults: hold_band_mult=3, stop_cooldown_hours=24, min_hold_days=2.
+        # All three default-on; each individually disable-able via settings.
+        cc = CHURN_CONTROLS if CHURN_CONTROLS.get("enabled", True) else {}
+        HOLD_MULT = cc.get("hold_band_mult", 1) or 1
         buy_tickers = {t for t, _ in signals["buy"][:strat.top_n]}
+        hold_tickers = {t for t, _ in signals["buy"][:strat.top_n * HOLD_MULT]}
+
+        # --- SELL: close positions not in hold band ---
         positions = acct.get_positions()
+        held_set = {t for t, s in positions.items() if s > 0}
+        min_hold_lock = get_min_hold_set(
+            self.db_path, strat.id, self.market,
+            cc.get("min_hold_days", 0), held_tickers=held_set,
+        )
         for ticker, shares in positions.items():
             if shares <= 0:
                 continue
@@ -1332,7 +1407,7 @@ class QuantSystem:
             if not price:
                 continue
 
-            # Stop loss check
+            # Stop loss check (always runs first, never suppressed by min_hold)
             pos_data = acct._positions.get(ticker)
             if pos_data and pos_data.avg_cost > 0:
                 pnl_pct = (price - pos_data.avg_cost) / pos_data.avg_cost
@@ -1347,8 +1422,12 @@ class QuantSystem:
                         log.warning("[%s] Sell failed %s: %s", strat.id, ticker, e)
                     continue
 
-            # Not in target portfolio -> sell
-            if ticker not in buy_tickers:
+            # Not in target portfolio (hold band) -> sell, unless still in min-hold lock
+            if ticker not in hold_tickers:
+                if ticker in min_hold_lock:
+                    log.info("[%s] min_hold skip sell %s (held < %dd)",
+                             strat.id, ticker, cc.get("min_hold_days", 0))
+                    continue
                 try:
                     self.engine.execute_signal(
                         strat.id, ticker, "sell", shares, price, current_prices
@@ -1360,7 +1439,17 @@ class QuantSystem:
         # --- BUY: top_n signals ---
         equity = acct.get_equity(current_prices)
         target_per_position = equity * strat.max_position_pct
+
+        cooldown_set = get_stop_cooldown_set(
+            self.db_path, strat.id, self.market, cc.get("stop_cooldown_hours", 0),
+        )
+        STOP_COOLDOWN_HOURS = cc.get("stop_cooldown_hours", 0)
+
         for ticker, score in signals["buy"][:strat.top_n]:
+            if ticker in cooldown_set:
+                log.info("[%s] cooldown skip %s (stop_loss within %dh)",
+                         strat.id, ticker, STOP_COOLDOWN_HOURS)
+                continue
             price = current_prices.get(ticker)
             if not price or price <= 0:
                 continue
