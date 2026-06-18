@@ -12,6 +12,7 @@ import json
 import math
 import sqlite3
 import sys
+from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -251,6 +252,208 @@ def previous_and_last_cash_for_day(
     return prev, last
 
 
+def _trade_cash_model(market: str):
+    return CNCosts() if market == "CN" else MoomooAUCosts()
+
+
+def _replay_series(
+    conn: sqlite3.Connection,
+    account: str,
+    market: str,
+    initial_cash: float,
+    account_rows: list[sqlite3.Row],
+) -> list[tuple[sqlite3.Row, float, dict[str, dict[str, float]], list[dict[str, Any]]]]:
+    """Incrementally replay trades to every account snapshot timestamp."""
+    costs = _trade_cash_model(market)
+    trades = conn.execute(
+        """
+        SELECT id,timestamp,ticker,side,shares,price
+        FROM trades WHERE account=? AND market=? ORDER BY timestamp,id
+        """,
+        (account, market),
+    ).fetchall()
+    cash = float(initial_cash)
+    positions: dict[str, dict[str, float]] = {}
+    out = []
+    ti = 0
+    oversells: list[dict[str, Any]] = []
+
+    def apply_trade(r: sqlite3.Row):
+        nonlocal cash
+        side = str(r["side"]).lower()
+        ticker = str(r["ticker"])
+        shares = float(r["shares"])
+        price = float(r["price"])
+        fees = costs.calculate(side, shares, price) if side in ("buy", "sell") else None
+        p = positions.setdefault(ticker, {"shares": 0.0, "total_cost": 0.0})
+        if side == "buy":
+            outlay = float(fees["amount"]) + float(fees["total_fees"])  # type: ignore[index]
+            cash -= outlay
+            p["shares"] += shares
+            p["total_cost"] += outlay
+        elif side == "sell":
+            proceeds = float(fees["amount"]) - float(fees["total_fees"])  # type: ignore[index]
+            cash += proceeds
+            before = p["shares"]
+            if before + 1e-9 < shares:
+                oversells.append({
+                    "trade_id": r["id"], "timestamp": r["timestamp"],
+                    "ticker": ticker, "sell_shares": shares, "held_before": before,
+                })
+                p["shares"] = before - shares
+                return
+            avg = p["total_cost"] / before if before else 0.0
+            p["shares"] -= shares
+            p["total_cost"] -= avg * shares
+            if abs(p["shares"]) < 1e-9:
+                p["shares"] = 0.0
+                p["total_cost"] = 0.0
+
+    for row in account_rows:
+        ts = str(row["timestamp"])
+        while ti < len(trades) and str(trades[ti]["timestamp"]) <= ts:
+            apply_trade(trades[ti])
+            ti += 1
+        snap_pos = {
+            t: dict(p) for t, p in positions.items()
+            if abs(p.get("shares", 0.0)) > 1e-9
+        }
+        out.append((row, cash, snap_pos, list(oversells)))
+    return out
+
+
+def _load_price_history(
+    conn: sqlite3.Connection,
+    tickers: set[str],
+    start_ts: str,
+    end_ts: str,
+) -> dict[str, list[tuple[float, float]]]:
+    if not tickers:
+        return {}
+    placeholders = ",".join("?" for _ in tickers)
+    start_dt = parse_ts(start_ts) or datetime.now(timezone.utc)
+    start_buf = (start_dt - timedelta(days=7)).isoformat()
+    rows = conn.execute(
+        f"""
+        SELECT ticker, datetime, interval, close
+        FROM prices
+        WHERE ticker IN ({placeholders}) AND interval IN ('1h','1d')
+          AND datetime >= ? AND datetime <= ?
+        ORDER BY ticker, datetime, CASE interval WHEN '1d' THEN 0 ELSE 1 END
+        """,
+        [*sorted(tickers), start_buf, end_ts],
+    ).fetchall()
+    out: dict[str, list[tuple[float, float]]] = {}
+    for r in rows:
+        dt = parse_ts(str(r["datetime"]))
+        if dt is None:
+            continue
+        out.setdefault(r["ticker"], []).append((dt.timestamp(), float(r["close"])))
+    return out
+
+
+def _price_at(history: dict[str, list[tuple[float, float]]], ticker: str, ts: str) -> float | None:
+    rows = history.get(ticker) or []
+    if not rows:
+        return None
+    dt = parse_ts(ts)
+    if dt is None:
+        return None
+    keys = [x[0] for x in rows]
+    idx = bisect_right(keys, dt.timestamp()) - 1
+    if idx < 0:
+        return None
+    return rows[idx][1]
+
+
+def history_curve_audit(
+    conn: sqlite3.Connection,
+    account: str,
+    market: str,
+    initial_cash: float,
+    status: str,
+    audit_start: str,
+    audit_end: str,
+    args: argparse.Namespace,
+) -> list[Issue]:
+    """Compare recent accounts history rows to replayed cash+positions+prices."""
+    if args.history_days <= 0:
+        return []
+    if status == "retired" and not args.history_include_retired:
+        return []
+    rows = conn.execute(
+        """
+        SELECT id,name,cash,equity,timestamp FROM accounts
+        WHERE name=? AND market=? AND timestamp>=? AND timestamp<?
+        ORDER BY timestamp,id
+        """,
+        (account, market, audit_start, audit_end),
+    ).fetchall()
+    if not rows:
+        return []
+    if len(rows) > args.history_max_points:
+        step = len(rows) / float(args.history_max_points)
+        rows = [rows[int(i * step)] for i in range(args.history_max_points)]
+    trades = conn.execute(
+        "SELECT DISTINCT ticker FROM trades WHERE account=? AND market=? AND timestamp<=?",
+        (account, market, audit_end),
+    ).fetchall()
+    tickers = {r["ticker"] for r in trades}
+    price_hist = _load_price_history(conn, tickers, audit_start, audit_end)
+    mismatches: list[dict[str, Any]] = []
+    missing_price_rows = 0
+    checked = 0
+    for row, cash, pos, oversells in _replay_series(conn, account, market, initial_cash, rows):
+        if oversells:
+            continue
+        eq = cash
+        missing = []
+        for ticker, ppos in pos.items():
+            px = _price_at(price_hist, ticker, str(row["timestamp"]))
+            if px is None:
+                missing.append(ticker)
+                continue
+            eq += float(ppos["shares"]) * px
+        if missing:
+            missing_price_rows += 1
+            continue
+        checked += 1
+        diff = float(row["equity"] or 0.0) - eq
+        threshold = max(float(args.history_equity_tolerance), float(initial_cash) * float(args.history_equity_tolerance_pct))
+        if abs(diff) > threshold:
+            mismatches.append({
+                "id": row["id"],
+                "timestamp": row["timestamp"],
+                "stored_equity": float(row["equity"] or 0.0),
+                "replayed_equity": round(eq, 4),
+                "diff": round(diff, 4),
+            })
+            if len(mismatches) >= args.history_report_limit:
+                break
+    issues: list[Issue] = []
+    if mismatches:
+        issues.append(Issue(
+            "critical", account, "history_curve",
+            f"{len(mismatches)} recent accounts history row(s) disagree with replayed equity",
+            {
+                "audit_start": audit_start,
+                "audit_end": audit_end,
+                "checked_rows": checked,
+                "tolerance_abs": args.history_equity_tolerance,
+                "tolerance_pct": args.history_equity_tolerance_pct,
+                "sample_mismatches": mismatches,
+            },
+        ))
+
+    if missing_price_rows:
+        issues.append(Issue(
+            "warning", account, "history_curve_prices",
+            f"{missing_price_rows} sampled history row(s) could not be audited due to missing historical prices",
+            {"audit_start": audit_start, "audit_end": audit_end},
+        ))
+    return issues
+
+
 def check_account(
     conn: sqlite3.Connection,
     meta: sqlite3.Row,
@@ -273,7 +476,21 @@ def check_account(
         (account, market),
     ).fetchone()
     if not state:
-        issues.append(Issue("critical", account, "account_state", "missing account_state row"))
+        activity = conn.execute(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM trades WHERE account=? AND market=?) AS trades,
+              (SELECT COUNT(*) FROM accounts WHERE name=? AND market=?) AS snapshots,
+              (SELECT COUNT(*) FROM positions WHERE account=? AND market=?) AS positions
+            """,
+            (account, market, account, market, account, market),
+        ).fetchone()
+        detail = {"trades": activity["trades"], "snapshots": activity["snapshots"], "positions": activity["positions"]} if activity else {}
+        sev = "warning" if detail and not any(detail.values()) else "critical"
+        msg = "missing account_state row"
+        if sev == "warning":
+            msg += " (no trades/snapshots/positions; likely uninitialized legacy account)"
+        issues.append(Issue(sev, account, "account_state", msg, detail))
         state_cash = None
     else:
         state_cash = float(state["cash"])
@@ -351,6 +568,13 @@ def check_account(
             )
     elif status != "retired":
         issues.append(Issue("warning", account, "equity_snapshot", "missing latest accounts snapshot"))
+
+    if args.history_days > 0:
+        audit_end_dt = datetime.fromisoformat(day_end.replace('Z', '+00:00'))
+        audit_start = (audit_end_dt - timedelta(days=args.history_days)).isoformat()
+        issues.extend(history_curve_audit(
+            conn, account, market, initial_cash, status, audit_start, day_end, args
+        ))
 
     # Daily cash-flow check based on snapshots. This is a smoke test; all-time
     # replay above is authoritative.
@@ -509,6 +733,15 @@ def main() -> int:
     ap.add_argument("--cost-tolerance", type=float, default=100.0)
     ap.add_argument("--stale-price-hours", type=float, default=36.0)
     ap.add_argument("--event-ratio-warn", type=float, default=0.8, help="Below this ratio missing trade events are critical instead of warning")
+    ap.add_argument("--history-days", type=float, default=0.0,
+                    help="Audit recent accounts history rows against replayed equity; 0 disables")
+    ap.add_argument("--history-equity-tolerance", type=float, default=250.0)
+    ap.add_argument("--history-equity-tolerance-pct", type=float, default=0.03,
+                    help="History curve tolerance as a fraction of initial cash; combined with absolute tolerance via max()")
+    ap.add_argument("--history-max-points", type=int, default=120,
+                    help="Max account history rows sampled per account per run")
+    ap.add_argument("--history-report-limit", type=int, default=8)
+    ap.add_argument("--history-include-retired", action="store_true")
     ap.add_argument("--quiet-ok", action="store_true", help="Print nothing when all checks pass")
     ap.add_argument("--fail-on-critical", action="store_true")
     args = ap.parse_args()
