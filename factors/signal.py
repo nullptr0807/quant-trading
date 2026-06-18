@@ -19,14 +19,18 @@ STRATEGY_FACTORS = {
 class SignalGenerator:
     """Rank-based composite scoring to produce buy/sell signals."""
 
-    def __init__(self, buy_top: int = 10, sell_top: int = 10):
+    def __init__(self, buy_top: int = 10, sell_top: int = 10, decorrelate: bool = False):
         """
         Args:
             buy_top: number of top-ranked tickers to flag as buy.
             sell_top: number of bottom-ranked tickers to flag as sell.
+            decorrelate: compatibility flag for experimental whitening plumbing.
+                Production keeps it False; SignalGenerator does not currently
+                apply whitening because replay showed it destroyed alpha.
         """
         self.buy_top = buy_top
         self.sell_top = sell_top
+        self.decorrelate = decorrelate
 
     def generate_signals(
         self, factors_dict: dict, strategy_type: str = "momentum"

@@ -35,7 +35,8 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from accounts.strategies import STRATEGIES  # noqa: E402
-from accounts.gp_strategies import GP_STRATEGIES  # noqa: E402
+from accounts.gp_strategies import active_gp_strategies_for_market  # noqa: E402
+from config.settings import ACCOUNT_PREFIX  # noqa: E402
 from trading.costs import MoomooAUCosts  # noqa: E402
 from core.events import emit as emit_event  # noqa: E402
 from data.cn_fetcher import get_fetcher_for  # noqa: E402
@@ -54,8 +55,10 @@ DB_PATH = os.path.join(
 STOP_LOSS_BY_ACCT: dict[str, float] = {}
 for _s in STRATEGIES:
     STOP_LOSS_BY_ACCT[_s.id] = _s.stop_loss
-for _g in GP_STRATEGIES:
+for _g in active_gp_strategies_for_market("US"):
     STOP_LOSS_BY_ACCT[_g.id] = _g.stop_loss
+for _g in active_gp_strategies_for_market("CN"):
+    STOP_LOSS_BY_ACCT[f"{ACCOUNT_PREFIX.get('CN', '')}{_g.id}"] = _g.stop_loss
 
 COSTS = MoomooAUCosts()
 
@@ -172,10 +175,15 @@ def _is_cn_market_hours_now() -> bool:
 
 
 def _is_market_hours_now() -> bool:
-    """Back-compat: stop-loss gate. Any market open → allow the tick through.
-    Per-account market filtering is applied separately when writing snapshots.
-    """
+    """Back-compat aggregate market-hours check."""
     return _is_us_market_hours_now() or _is_cn_market_hours_now()
+
+
+def _is_market_open_for(market: str) -> bool:
+    """Return whether a specific account market is currently tradeable."""
+    if market == "CN":
+        return _is_cn_market_hours_now()
+    return _is_us_market_hours_now()
 
 
 def check_stop_losses(
@@ -206,6 +214,12 @@ def check_stop_losses(
             "SELECT account_id FROM account_meta WHERE status='retired'"
         ).fetchall()
     }
+    market_by_acct = {
+        r["account_id"]: r["market"]
+        for r in cur.execute(
+            "SELECT account_id, market FROM account_meta"
+        ).fetchall()
+    }
 
     pos_rows = cur.execute(
         "SELECT account, ticker, shares, avg_cost FROM positions"
@@ -214,6 +228,9 @@ def check_stop_losses(
     for r in pos_rows:
         acct, ticker, shares, avg_cost = r["account"], r["ticker"], r["shares"], r["avg_cost"]
         if acct in retired_accts:
+            continue
+        acct_market = market_by_acct.get(acct, "US")
+        if not _is_market_open_for(acct_market):
             continue
         if shares <= 0 or avg_cost <= 0:
             continue
@@ -275,28 +292,29 @@ def check_stop_losses(
 
         # Update cash
         cash_row = cur.execute(
-            "SELECT cash FROM account_state WHERE account=?", (acct,)
+            "SELECT cash FROM account_state WHERE account=? AND market=?", (acct, acct_market)
         ).fetchone()
         if cash_row is None:
             LOG.warning("Skip stop-loss %s/%s: no account_state row", acct, ticker)
             continue
         new_cash = cash_row["cash"] + proceeds
         cur.execute(
-            "UPDATE account_state SET cash=?, updated_at=? WHERE account=?",
-            (new_cash, now_iso, acct),
+            "UPDATE account_state SET cash=?, updated_at=? WHERE account=? AND market=?",
+            (new_cash, now_iso, acct, acct_market),
         )
 
         # Remove position
         cur.execute(
-            "DELETE FROM positions WHERE account=? AND ticker=?", (acct, ticker),
+            "DELETE FROM positions WHERE account=? AND ticker=? AND market=?",
+            (acct, ticker, acct_market),
         )
 
         # Record trade
         cur.execute(
-            "INSERT INTO trades (account, ticker, side, shares, price, cost, slippage, timestamp) "
-            "VALUES (?, ?, 'sell', ?, ?, ?, ?, ?)",
+            "INSERT INTO trades (account, ticker, side, shares, price, cost, slippage, timestamp, market) "
+            "VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, ?)",
             (acct, ticker, shares, px, fees["total_fees"],
-             (px - exec_price) * shares, now_iso),
+             (px - exec_price) * shares, now_iso, acct_market),
         )
 
         executed.append({
@@ -411,9 +429,21 @@ def update_equity_snapshots(db_path: str = DB_PATH) -> dict:
             continue
 
         positions = pos_by_acct.get(acct, [])
+        missing_prices = [p["ticker"] for p in positions if p["ticker"] not in prices]
+        if missing_prices:
+            # Do not silently mark held positions at avg_cost. That writes
+            # equity ≈ initial_cash for winning/losing accounts and creates
+            # fake V-dips / sawtooth curves (CB13 was the smoking gun). Skip
+            # this account until a real quote arrives; the last good snapshot
+            # remains the visible value.
+            LOG.warning(
+                "Skip snapshot for %s: missing realtime prices for %d/%d held tickers: %s",
+                acct, len(missing_prices), len(positions), ",".join(missing_prices[:8]),
+            )
+            continue
         equity = cash
         for p in positions:
-            px = prices.get(p["ticker"]) or p["avg_cost"]
+            px = prices[p["ticker"]]
             equity += p["shares"] * px
             cur.execute(
                 "UPDATE positions SET current_price=?, updated_at=? "

@@ -26,6 +26,13 @@ class GPStrategyConfig:
     gp_feature_subset: Optional[Tuple[str, ...]] = None
     # Correlation threshold for dedup (lower = keep more diverse near-siblings)
     gp_dedup_threshold: float = 0.85
+    # Account-family metadata. B = legacy gplearn GP; F = FactorMiner-style GP.
+    family: str = "B"
+    mining_backend: str = "gplearn"
+    enabled_markets: Tuple[str, ...] = ("US", "CN")
+    # FactorMiner-style global family correlation / replacement controls.
+    gp_global_corr_threshold: float = 0.6
+    gp_replacement_ic_mult: float = 1.3
 
 
 GP_STRATEGIES: List[GPStrategyConfig] = [
@@ -144,4 +151,79 @@ GP_STRATEGIES: List[GPStrategyConfig] = [
         gp_feature_subset=("ma_5", "ma_10", "ret_1", "std_5"),
         gp_dedup_threshold=0.6,
     ),
+    # ---- F11-F16: FactorMiner-style GP 隔离账户族 ----
+    # Mirrors B11-B16 personalities but mines with expanded terminals,
+    # experience memory, global F-family correlation checks, and replacement logs.
+    GPStrategyConfig(
+        id="F11", name="记忆短打", description="FactorMiner记忆版：短动量1日收益",
+        top_n=5, rebalance_hours=4, stop_loss=0.025, max_position_pct=0.20,
+        factor_selection="all", scoring_method="ic_weighted",
+        gp_seed=2111, gp_population=350, gp_generations=18, gp_n_runs=4, gp_parsimony=0.006, gp_n_factors=12,
+        gp_y_target="next_1d_ret",
+        gp_feature_subset=("ret_1", "ret_5", "ret_10", "gap_1", "range_pos", "pv_corr_20"),
+        gp_dedup_threshold=0.6,
+        family="F", mining_backend="factor_miner_gp", enabled_markets=("US", "CN"),
+        gp_global_corr_threshold=0.6,
+    ),
+    GPStrategyConfig(
+        id="F12", name="记忆趋势", description="FactorMiner记忆版：周度趋势/形态5日收益",
+        top_n=6, rebalance_hours=24, stop_loss=0.04, max_position_pct=0.20,
+        factor_selection="all", scoring_method="ic_weighted",
+        gp_seed=2212, gp_population=400, gp_generations=20, gp_n_runs=4, gp_parsimony=0.006, gp_n_factors=12,
+        gp_y_target="next_5d_ret",
+        gp_feature_subset=("ma_5", "ma_10", "ma_20", "o_c", "h_c", "l_c", "range_pos", "upper_pos", "lower_shadow", "slope_20", "trend_r2_20", "trend_resi_20"),
+        gp_dedup_threshold=0.6,
+        family="F", mining_backend="factor_miner_gp", enabled_markets=("US", "CN"),
+        gp_global_corr_threshold=0.6,
+    ),
+    GPStrategyConfig(
+        id="F13", name="记忆夏普", description="FactorMiner记忆版：波动/流动性5日Sharpe",
+        top_n=4, rebalance_hours=12, stop_loss=0.03, max_position_pct=0.25,
+        factor_selection="all", scoring_method="ic_weighted",
+        gp_seed=2313, gp_population=350, gp_generations=20, gp_n_runs=4, gp_parsimony=0.006, gp_n_factors=10,
+        gp_y_target="next_5d_sharpe",
+        gp_feature_subset=("std_5", "std_10", "std_20", "vol_of_vol_20", "v_vma20", "dvol_vma20", "ret_1_dvol", "absret_1_dvol", "skew_20", "kurt_20"),
+        gp_dedup_threshold=0.6,
+        family="F", mining_backend="factor_miner_gp", enabled_markets=("US", "CN"),
+        gp_global_corr_threshold=0.6,
+    ),
+    GPStrategyConfig(
+        id="F14", name="记忆防御", description="FactorMiner记忆版：抗跌/回撤防御信号",
+        top_n=5, rebalance_hours=24, stop_loss=0.025, max_position_pct=0.20,
+        factor_selection="all", scoring_method="ic_weighted",
+        gp_seed=2414, gp_population=350, gp_generations=20, gp_n_runs=4, gp_parsimony=0.006, gp_n_factors=10,
+        gp_y_target="next_5d_minret_neg",
+        gp_feature_subset=("std_5", "std_20", "ma_20", "l_c", "range_pos", "lower_shadow", "v_vma20", "dvol_vma20", "trend_r2_20", "trend_resi_20"),
+        gp_dedup_threshold=0.6,
+        family="F", mining_backend="factor_miner_gp", enabled_markets=("US", "CN"),
+        gp_global_corr_threshold=0.6,
+    ),
+    GPStrategyConfig(
+        id="F15", name="记忆量价", description="FactorMiner记忆版：量价交互3日收益",
+        top_n=5, rebalance_hours=8, stop_loss=0.03, max_position_pct=0.22,
+        factor_selection="all", scoring_method="ic_weighted",
+        gp_seed=2515, gp_population=350, gp_generations=18, gp_n_runs=4, gp_parsimony=0.006, gp_n_factors=12,
+        gp_y_target="next_3d_ret",
+        gp_feature_subset=("v_vma20", "dvol_vma20", "ret_1", "ret_5", "h_c", "l_c", "range_pos", "pv_corr_20", "ret_1_dvol", "absret_1_dvol"),
+        gp_dedup_threshold=0.6,
+        family="F", mining_backend="factor_miner_gp", enabled_markets=("US", "CN"),
+        gp_global_corr_threshold=0.6,
+    ),
+    GPStrategyConfig(
+        id="F16", name="记忆反转", description="FactorMiner记忆版：短反转/残差信号",
+        top_n=4, rebalance_hours=12, stop_loss=0.025, max_position_pct=0.22,
+        factor_selection="all", scoring_method="ic_weighted",
+        gp_seed=2616, gp_population=350, gp_generations=20, gp_n_runs=4, gp_parsimony=0.006, gp_n_factors=10,
+        gp_y_target="reversal_2d",
+        gp_feature_subset=("ma_5", "ma_10", "ret_1", "ret_5", "std_5", "gap_1", "range_pos", "slope_20", "trend_resi_20"),
+        gp_dedup_threshold=0.6,
+        family="F", mining_backend="factor_miner_gp", enabled_markets=("US", "CN"),
+        gp_global_corr_threshold=0.6,
+    ),
 ]
+
+
+def active_gp_strategies_for_market(market: str) -> List[GPStrategyConfig]:
+    """Return GP strategies enabled for a market before market-prefixing ids."""
+    m = market.upper()
+    return [g for g in GP_STRATEGIES if m in tuple(x.upper() for x in g.enabled_markets)]

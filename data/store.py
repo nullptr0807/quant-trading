@@ -328,6 +328,60 @@ class DataStore:
         conn.commit()
         conn.close()
 
+    def save_account_full_state(
+        self,
+        account: str,
+        cash: float,
+        initial_cash: float,
+        positions: list[dict],
+        *,
+        equity: float | None = None,
+        timestamp: str | None = None,
+        market: str = "US",
+    ):
+        """Atomically persist account cash + positions, optionally equity snapshot.
+
+        This is the safe post-trade state writer. Cash and positions must not be
+        saved by separate code paths: if a held ticker is missing a quote, we may
+        skip the equity snapshot, but cash and holdings still have to advance
+        together so the next realtime updater does not combine new cash with old
+        positions.
+        """
+        ts = timestamp or datetime.now(timezone.utc).isoformat()
+        conn = self._conn()
+        try:
+            conn.execute("BEGIN")
+            conn.execute(
+                "INSERT OR REPLACE INTO account_state (account, cash, initial_cash, updated_at, market) "
+                "VALUES (?,?,?,?,?)",
+                (account, cash, initial_cash, ts, market),
+            )
+            conn.execute("DELETE FROM positions WHERE account=? AND market=?", (account, market))
+            for p in positions:
+                conn.execute(
+                    "INSERT INTO positions (account,ticker,shares,avg_cost,total_cost,current_price,updated_at,market) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (account, p["ticker"], p["shares"], p["avg_cost"],
+                     p.get("total_cost", 0), p.get("current_price"), ts, market),
+                )
+                conn.execute(
+                    "INSERT INTO positions_history (account,ticker,shares,avg_cost,market_price,market_value,unrealized_pnl,timestamp,market) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (account, p["ticker"], p["shares"], p["avg_cost"],
+                     p.get("current_price"), p.get("market_value"), p.get("unrealized_pnl"), ts, market),
+                )
+            if equity is not None:
+                conn.execute(
+                    "INSERT INTO accounts (name,cash,equity,timestamp,market) VALUES (?,?,?,?,?)",
+                    (account, cash, equity, ts, market),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def load_account_state(self, account: str, market: str = "US") -> dict | None:
         """Load saved account state. Returns {cash, initial_cash} or None."""
         conn = self._conn()

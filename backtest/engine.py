@@ -25,7 +25,7 @@ from factors.gp_miner import GPAlphaMiner
 from trading.engine import TradingEngine
 from trading.costs import MoomooAUCosts
 from accounts.strategies import STRATEGIES
-from accounts.gp_strategies import GP_STRATEGIES
+from accounts.gp_strategies import active_gp_strategies_for_market
 from config.settings import ADAPTIVE_REBALANCE
 
 log = logging.getLogger("backtest")
@@ -186,7 +186,7 @@ class BacktestEngine:
             results.append(result)
 
         # Run B accounts
-        for gp_strat in GP_STRATEGIES:
+        for gp_strat in active_gp_strategies_for_market("US"):
             result = self._backtest_gp_account(gp_strat, all_data, sim_dates, costs)
             results.append(result)
 

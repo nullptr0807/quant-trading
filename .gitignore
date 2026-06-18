@@ -36,7 +36,7 @@ credentials.json
 # NOTE: data/ contains Python modules (fetcher.py, store.py, cn_fetcher.py)
 # that MUST be tracked. Only ignore the actual data artifacts inside.
 data/*.db
-data/*.db.bak.*
+data/*.db.bak*
 data/*.db-wal
 data/*.db-shm
 data/qlib_checkpoints/
@@ -90,3 +90,6 @@ home/
 analysis/output/
 research/output/
 backtest/results/
+factors/factor_miner_gp/*.json
+factors/factor_miner_gp/*.json.*
+factors/factor_miner_gp/mining_logs/

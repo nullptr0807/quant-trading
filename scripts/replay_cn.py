@@ -54,7 +54,7 @@ from factors.signal import SignalGenerator
 from factors.gp_signal import GPSignalGenerator
 from factors.gp_miner import GPAlphaMiner
 from accounts.strategies import STRATEGIES
-from accounts.gp_strategies import GP_STRATEGIES
+from accounts.gp_strategies import active_gp_strategies_for_market
 from dataclasses import replace as _dc_replace
 
 logging.basicConfig(level=logging.INFO,
@@ -147,7 +147,7 @@ class CNReplay:
 
         # Strategies — prefix C
         self.strategies = [_dc_replace(s, id=f"C{s.id}") for s in STRATEGIES]
-        self.gp_strategies = [_dc_replace(g, id=f"C{g.id}") for g in GP_STRATEGIES]
+        self.gp_strategies = [_dc_replace(g, id=f"C{g.id}") for g in active_gp_strategies_for_market(MARKET)]
 
         # Map US-mined factors to CN account ids: B01 → CB01
         raw_mined = GPAlphaMiner.load_per_account_factors()

@@ -34,9 +34,10 @@ from factors.signal import SignalGenerator
 from trading.engine import TradingEngine
 from trading.costs import MoomooAUCosts, CNCosts
 from accounts.strategies import STRATEGIES
-from accounts.gp_strategies import GP_STRATEGIES
+from accounts.gp_strategies import active_gp_strategies_for_market
 from accounts.qlib_strategies import QLIB_STRATEGIES
 from factors.gp_miner import GPAlphaMiner, FEATURE_COLS
+from factors.factor_miner_gp import FactorMinerGPBackend
 from dataclasses import replace as _dc_replace
 
 # Factor formula descriptions for reporting (strict math)
@@ -303,10 +304,10 @@ class QuantSystem:
         prefix = ACCOUNT_PREFIX.get(market, "")
         if prefix:
             self.strategies = [_dc_replace(s, id=f"{prefix}{s.id}") for s in STRATEGIES]
-            self.gp_strategies = [_dc_replace(g, id=f"{prefix}{g.id}") for g in GP_STRATEGIES]
+            self.gp_strategies = [_dc_replace(g, id=f"{prefix}{g.id}") for g in active_gp_strategies_for_market(market)]
         else:
             self.strategies = list(STRATEGIES)
-            self.gp_strategies = list(GP_STRATEGIES)
+            self.gp_strategies = list(active_gp_strategies_for_market(market))
         # Qlib Q-accounts: US uses Q01-Q10 (no prefix); CN mirrors as CQ01-CQ10
         # via the same ACCOUNT_PREFIX mechanism (phase 2 — gated on CN qlib data).
         if prefix:
@@ -362,9 +363,12 @@ class QuantSystem:
 
         # GP factor mining — per-account
         self.gp_miner = GPAlphaMiner()
+        self.factor_miner_gp = FactorMinerGPBackend()
         self.gp_signal_gen = GPSignalGenerator()
         self._per_account_gp_factors = {}   # {account_id: {ticker: DataFrame}}
-        self._per_account_mined = GPAlphaMiner.load_per_account_factors()  # {account_id: [factor_list]}
+        self._legacy_gp_mined = GPAlphaMiner.load_per_account_factors()  # B-family {account_id: [factor_list]}
+        self._factor_miner_mined = FactorMinerGPBackend.load_factors()   # F-family {account_id: [factor_list]}
+        self._per_account_mined = {**self._legacy_gp_mined, **self._factor_miner_mined}
         self._gp_mining_done = len(self._per_account_mined) > 0
 
         # Reports — only US sends Telegram. CN runs silent (per spec).
@@ -446,8 +450,10 @@ class QuantSystem:
                 feat = getattr(g, "gp_feature_subset", None)
                 if feat:
                     parts.append(f"feat={'/'.join(feat)}")
-                gp_factors_str = f"GP({','.join(parts)})"
-                entries.append((g.id, g.name, "GP", "B", gp_factors_str))
+                backend = getattr(g, "mining_backend", "gplearn")
+                prefix = "FMGP" if backend == "factor_miner_gp" else "GP"
+                gp_factors_str = f"{prefix}({','.join(parts)})"
+                entries.append((g.id, g.name, g.description, getattr(g, "family", "B"), gp_factors_str))
             for q in self.qlib_strategies:
                 qfactors = f"qlib_{q.id}_score ({q.model_class})"
                 entries.append((q.id, q.name, q.description, "Q", qfactors))
@@ -627,37 +633,52 @@ class QuantSystem:
             if acct_id in retired:
                 continue  # frozen — preserve last-known state, no equity drift
             acct = self.engine.get_account(acct_id)
-            # Save cash
-            self.store.save_account_state(acct_id, acct.cash, acct.initial_cash,
-                                          market=self.market)
-            # Save positions
+
+            # Build the position payload from the in-memory account FIRST, then
+            # persist cash+positions atomically. If one held ticker is missing a
+            # quote, skip only the equity snapshot; never save new cash while
+            # leaving old positions behind (B11 2026-06-15/17 cliff bug).
+            held_tickers = [t for t, p in acct._positions.items() if p.shares > 0]
+            missing_prices = [t for t in held_tickers if t not in current_prices]
             positions = []
             for ticker, pos in acct._positions.items():
-                if pos.shares > 0:
-                    price = current_prices.get(ticker, pos.avg_cost)
-                    positions.append({
-                        "ticker": ticker,
-                        "shares": pos.shares,
-                        "avg_cost": pos.avg_cost,
-                        "total_cost": pos.total_cost,
-                        "current_price": price,
-                        "market_value": pos.shares * price,
-                        "unrealized_pnl": pos.shares * (price - pos.avg_cost),
-                    })
-            self.store.save_positions(acct_id, positions, market=self.market)
+                if pos.shares <= 0:
+                    continue
+                price = current_prices.get(ticker)
+                item = {
+                    "ticker": ticker,
+                    "shares": pos.shares,
+                    "avg_cost": pos.avg_cost,
+                    "total_cost": pos.total_cost,
+                    "current_price": price,
+                }
+                if price is not None:
+                    item["market_value"] = pos.shares * price
+                    item["unrealized_pnl"] = pos.shares * (price - pos.avg_cost)
+                positions.append(item)
 
-            # Equity-curve snapshot. Strict: skip if any held ticker has no
-            # price (avoids avg_cost-fallback poisoning the curve). Without
-            # this, markets that don't send a Telegram report (CN) never
-            # write to the `accounts` table, leaving the curve flat.
+            verified_equity = None
+            if missing_prices:
+                log.error(
+                    "Saving cash+positions for %s but skipping equity snapshot: "
+                    "missing prices for %d/%d held tickers: %s",
+                    acct_id, len(missing_prices), len(held_tickers), ",".join(missing_prices[:8]),
+                )
+            else:
+                try:
+                    verified_equity = acct.get_equity(current_prices, strict=True)
+                except ValueError as e:
+                    log.error("Skipping snapshot for %s: %s", acct_id, e)
+                except Exception as e:
+                    log.warning("Snapshot equity compute failed for %s: %s", acct_id, e)
+
             try:
-                verified_equity = acct.get_equity(current_prices, strict=True)
-                self.store.save_snapshot(acct_id, acct.cash, verified_equity,
-                                         market=self.market)
-            except ValueError as e:
-                log.error("Skipping snapshot for %s: %s", acct_id, e)
+                self.store.save_account_full_state(
+                    acct_id, acct.cash, acct.initial_cash, positions,
+                    equity=verified_equity, market=self.market,
+                )
             except Exception as e:
-                log.warning("Snapshot save failed for %s: %s", acct_id, e)
+                log.warning("Full-state save failed for %s: %s", acct_id, e)
 
         # Save adaptive state
         if self._adaptive_enabled:
@@ -775,6 +796,109 @@ class QuantSystem:
             log.warning("Failed to save factor values: %s", e)
 
     # -- Step 2b: Mine and compute GP factors --------------------------------
+    def _gp_compute_history_days(self) -> int:
+        """History length for applying mined GP/F-family expressions.
+
+        This does not change the paper/article premise: factors are still mined
+        on past data, then evaluated deterministically. It only makes the live
+        application window long enough for FactorMiner terminals such as
+        vol_of_vol_20, skew_20, kurt_20, trend_r2_20, and pv_corr_20 to exist.
+        The previous 30 calendar days yielded ~21 trading bars, so F13's nested
+        20-day risk features were all-NaN at runtime despite being mineable on
+        the 120-day training window.
+        """
+        needs_expanded = any(
+            getattr(g, "mining_backend", "gplearn") == "factor_miner_gp"
+            for g in self.gp_strategies
+        )
+        return 90 if needs_expanded else 30
+
+    def _load_gp_compute_history(self) -> dict:
+        days = self._gp_compute_history_days()
+        if days <= 30:
+            return self._historical_data
+        try:
+            log.info("Fetching %d-day history for GP/F-family factor application...", days)
+            raw_df = self.fetcher.get_historical(self.universe, days=days)
+            hist = {}
+            if raw_df is not None and not raw_df.empty and "ticker" in raw_df.columns:
+                for ticker, group in raw_df.groupby("ticker"):
+                    hist[ticker] = group.drop(columns=["ticker"]).set_index("datetime").sort_index()
+            if hist:
+                log.info("Got %d tickers for GP/F-family factor application (%dd)", len(hist), days)
+                return hist
+        except Exception as e:
+            log.warning("Failed to load extended GP history (%dd): %s", days, e)
+        return self._historical_data
+
+    @staticmethod
+    def _is_active_mined_factor(factor: dict) -> bool:
+        """True only for tradeable mined expressions.
+
+        F-family failure markers are persisted intentionally so an account with
+        no admissible factor is not re-mined every hour. They are audit state,
+        not alpha expressions, and must be ignored by compute/trading paths.
+        """
+        return bool(factor.get("expression")) and factor.get("active", True) is not False
+
+    @classmethod
+    def _active_mined_count(cls, factors: list[dict] | None) -> int:
+        return sum(1 for f in (factors or []) if cls._is_active_mined_factor(f))
+
+    @staticmethod
+    def _factor_miner_failure_marker(gp_strat, reason: str, retry_after_hours: int = 24) -> dict:
+        now = datetime.now(timezone.utc)
+        return {
+            "name": f"fm_{gp_strat.id}_NO_ADMISSIBLE_FACTOR",
+            "active": False,
+            "status": "mining_failed",
+            "reason": reason,
+            "backend": "factor_miner_gp",
+            "family": "F",
+            "source_account": gp_strat.id,
+            "feature_cols": list(getattr(gp_strat, "gp_feature_subset", None) or []),
+            "y_target": getattr(gp_strat, "gp_y_target", "next_1d_ret"),
+            "strict_red_sea_threshold": getattr(gp_strat, "gp_global_corr_threshold", None),
+            "created_at": now.isoformat(),
+            "retry_after": (now + timedelta(hours=retry_after_hours)).isoformat(),
+        }
+
+    @staticmethod
+    def _factor_miner_retry_due(factors: list[dict] | None) -> bool:
+        markers = [f for f in (factors or []) if f.get("status") == "mining_failed"]
+        if not markers:
+            return False
+        retry_after = max((m.get("retry_after") or "") for m in markers)
+        if not retry_after:
+            return False
+        try:
+            return datetime.now(timezone.utc) >= datetime.fromisoformat(retry_after)
+        except Exception:
+            return False
+
+    def _missing_gp_strategies(self):
+        """Return accounts that need a mining attempt.
+
+        For FactorMiner F/CF accounts, a present key with an empty list or
+        failure marker means the attempt was completed and logged. This preserves
+        the memory/red-sea premise and prevents expensive hourly re-mining of
+        known-failed accounts. Legacy B/CB keeps the old behavior: empty factor
+        lists are treated as missing and can be retried.
+        """
+        missing = []
+        for g in self.gp_strategies:
+            factors = self._per_account_mined.get(g.id)
+            if g.id not in self._per_account_mined:
+                missing.append(g)
+                continue
+            if getattr(g, "mining_backend", "gplearn") == "factor_miner_gp":
+                if self._factor_miner_retry_due(factors):
+                    missing.append(g)
+                continue
+            if not self._active_mined_count(factors):
+                missing.append(g)
+        return missing
+
     def mine_gp_factors(self):
         """Run GP factor mining per account (slow, do once then cache).
 
@@ -782,10 +906,9 @@ class QuantSystem:
         so newly added strategies (e.g. B11+) get bootstrapped on next tick
         without re-mining the existing ones.
         """
-        missing = [g for g in self.gp_strategies
-                   if not self._per_account_mined.get(g.id)]
+        missing = self._missing_gp_strategies()
         if not missing:
-            log.info("GP factors already mined for all %d accounts, skipping mining.",
+            log.info("GP factors already mined or explicitly failed for all %d accounts, skipping mining.",
                      len(self._per_account_mined))
         else:
             log.info("Mining GP alpha factors for %d new account(s): %s (120-day history)...",
@@ -802,42 +925,75 @@ class QuantSystem:
                 log.error("Failed to fetch mining data: %s", e)
                 mining_data = self._historical_data
 
-            # Mine only the missing accounts; preserve existing factors in self._per_account_mined
+            # Mine only the missing accounts; preserve existing factors in each
+            # family store. B uses legacy gplearn; F uses FactorMiner-style GP.
             for gp_strat in missing:
                 log.info("Mining GP factors for %s (%s)...", gp_strat.id, gp_strat.name)
-                miner = GPAlphaMiner()
-                factors = miner.mine_factors(
-                    mining_data,
-                    n_factors=gp_strat.gp_n_factors,
-                    generations=gp_strat.gp_generations,
-                    base_seed=gp_strat.gp_seed,
-                    population_size=gp_strat.gp_population,
-                    n_runs=gp_strat.gp_n_runs,
-                    parsimony_coefficient=gp_strat.gp_parsimony,
-                    y_target=getattr(gp_strat, "gp_y_target", "next_1d_ret"),
-                    feature_subset=getattr(gp_strat, "gp_feature_subset", None),
-                    dedup_threshold=getattr(gp_strat, "gp_dedup_threshold", 0.85),
-                )
+                if getattr(gp_strat, "mining_backend", "gplearn") == "factor_miner_gp":
+                    miner = FactorMinerGPBackend(
+                        global_corr_threshold=getattr(gp_strat, "gp_global_corr_threshold", 0.6),
+                        replacement_ic_mult=getattr(gp_strat, "gp_replacement_ic_mult", 1.3),
+                    )
+                    family_ids = {g.id for g in self.gp_strategies if getattr(g, "family", "B") == "F"}
+                    factors = miner.mine_factors(
+                        account_id=gp_strat.id,
+                        historical_data=mining_data,
+                        all_mined={**self._factor_miner_mined, **{k: v for k, v in self._per_account_mined.items() if k in family_ids}},
+                        family_account_ids=family_ids,
+                        n_factors=gp_strat.gp_n_factors,
+                        generations=gp_strat.gp_generations,
+                        base_seed=gp_strat.gp_seed,
+                        population_size=gp_strat.gp_population,
+                        n_runs=gp_strat.gp_n_runs,
+                        parsimony_coefficient=gp_strat.gp_parsimony,
+                        y_target=getattr(gp_strat, "gp_y_target", "next_1d_ret"),
+                        feature_subset=getattr(gp_strat, "gp_feature_subset", None),
+                        dedup_threshold=getattr(gp_strat, "gp_dedup_threshold", 0.6),
+                    )
+                    self._factor_miner_mined[gp_strat.id] = factors
+                else:
+                    miner = GPAlphaMiner()
+                    factors = miner.mine_factors(
+                        mining_data,
+                        n_factors=gp_strat.gp_n_factors,
+                        generations=gp_strat.gp_generations,
+                        base_seed=gp_strat.gp_seed,
+                        population_size=gp_strat.gp_population,
+                        n_runs=gp_strat.gp_n_runs,
+                        parsimony_coefficient=gp_strat.gp_parsimony,
+                        y_target=getattr(gp_strat, "gp_y_target", "next_1d_ret"),
+                        feature_subset=getattr(gp_strat, "gp_feature_subset", None),
+                        dedup_threshold=getattr(gp_strat, "gp_dedup_threshold", 0.85),
+                    )
+                    self._legacy_gp_mined[gp_strat.id] = factors
+                if not factors and getattr(gp_strat, "mining_backend", "gplearn") == "factor_miner_gp":
+                    factors = [self._factor_miner_failure_marker(gp_strat, "all_candidates_rejected_or_no_valid_candidates")]
+                    self._factor_miner_mined[gp_strat.id] = factors
                 self._per_account_mined[gp_strat.id] = factors
-                log.info("  %s: mined %d factors", gp_strat.id, len(factors))
+                log.info("  %s: mined %d active factors", gp_strat.id, self._active_mined_count(factors))
 
             if self._per_account_mined:
-                GPAlphaMiner.save_per_account_factors(self._per_account_mined)
+                GPAlphaMiner.save_per_account_factors(self._legacy_gp_mined)
+                FactorMinerGPBackend.save_factors(self._factor_miner_mined)
                 self._gp_mining_done = True
-                log.info("Saved per-account GP factors for %d accounts", len(self._per_account_mined))
+                log.info("Saved per-account GP factors: legacy=%d factorminer=%d",
+                         len(self._legacy_gp_mined), len(self._factor_miner_mined))
             else:
                 log.warning("GP mining produced no valid factors")
                 return
 
-        # Compute GP factors for current data, per account
+        # Compute GP factors for current data, per account. FactorMiner-style
+        # terminals include nested 20-day windows, so use an application window
+        # longer than the normal 30d A/Q refresh without changing mining logic.
+        gp_history = self._load_gp_compute_history()
         self._per_account_gp_factors = {}
         for gp_strat in self.gp_strategies:
-            mined = self._per_account_mined.get(gp_strat.id, [])
+            mined = [f for f in self._per_account_mined.get(gp_strat.id, []) if self._is_active_mined_factor(f)]
             if not mined:
                 self._per_account_gp_factors[gp_strat.id] = {}
                 continue
             self._per_account_gp_factors[gp_strat.id] = self.gp_miner.compute_gp_factors(
-                self._historical_data, mined
+                gp_history, mined
             )
         log.info("Computed per-account GP factors for %d accounts",
                  sum(1 for v in self._per_account_gp_factors.values() if v))
@@ -846,7 +1002,9 @@ class QuantSystem:
         for acct_id, gp_factors in self._per_account_gp_factors.items():
             if gp_factors:
                 try:
-                    self.store.save_factor_df(gp_factors, group=f"gp_{acct_id}")
+                    acct_cfg = next((g for g in self.gp_strategies if g.id == acct_id), None)
+                    group_prefix = "fmgp" if acct_cfg and getattr(acct_cfg, "family", "B") == "F" else "gp"
+                    self.store.save_factor_df(gp_factors, group=f"{group_prefix}_{acct_id}")
                 except Exception as e:
                     log.warning("Failed to save GP factors for %s: %s", acct_id, e)
 
@@ -948,14 +1106,28 @@ class QuantSystem:
         sell_tickers = set(signals["sell"])
 
         # Empty-signal guard: if the signal generator could not produce ANY
-        # buy candidates this cycle (NaN-filled factor row, data gap, etc.),
-        # skip the rebalance entirely instead of liquidating every position.
-        # Without this guard, an empty buy_tickers set causes the SELL loop
-        # below to mark every held ticker as "not in buy list" and dump it,
-        # leaving the account in 100% cash until the next adaptive window
-        # — which can be 60+ hours away and freezes the equity curve.
+        # buy candidates this cycle (NaN-filled factor row, insufficient rolling
+        # history, data gap, etc.), skip the rebalance entirely instead of
+        # liquidating every position. Log coverage so we can distinguish
+        # "technical not computable" from "valid strategy chose no trade".
         if not buy_tickers:
-            log.warning("[%s] GP signals empty (no buy candidates) — skipping rebalance to preserve positions", gp_strat.id)
+            usable = 0
+            nonempty = 0
+            for fdf in filtered_factors.values():
+                if fdf is None or fdf.empty:
+                    continue
+                if fdf.notna().any().any():
+                    nonempty += 1
+                for i in range(len(fdf) - 1, max(-1, len(fdf) - 6), -1):
+                    if len(fdf.iloc[i].dropna()) > 0:
+                        usable += 1
+                        break
+            active_factor_count = self._active_mined_count(self._per_account_mined.get(gp_strat.id, []))
+            log.warning(
+                "[%s] GP signals empty — skipping rebalance to preserve positions "
+                "(active_factors=%d, factor_frames=%d, nonempty_frames=%d, usable_last5=%d, top_n=%d)",
+                gp_strat.id, active_factor_count, len(filtered_factors), nonempty, usable, gp_strat.top_n,
+            )
             return False
 
         # --- Churn controls (P0, 2026-06-01) ---
@@ -1038,6 +1210,9 @@ class QuantSystem:
         mined_factors = self._per_account_mined.get(gp_strat.id, [])
         if not mined_factors or not gp_factors_dict:
             return gp_factors_dict
+        mined_factors = [f for f in mined_factors if self._is_active_mined_factor(f)]
+        if not mined_factors:
+            return {}
 
         # Determine which factor columns to keep
         sorted_by_ic = sorted(mined_factors, key=lambda f: abs(f["ic"]), reverse=True)
@@ -1056,14 +1231,17 @@ class QuantSystem:
         if gp_strat.scoring_method == "top3_only":
             keep = keep & set(all_names[:3]) if len(all_names) >= 3 else keep
 
-        # Filter DataFrames
+        # Filter DataFrames. If none of this account's active factor columns are
+        # present, return an empty DataFrame for that ticker instead of the
+        # original unfiltered frame; otherwise a missing/failed account can trade
+        # stale or wrong columns and appear healthy.
         filtered = {}
         for ticker, fdf in gp_factors_dict.items():
             if fdf is None or fdf.empty:
                 filtered[ticker] = fdf
                 continue
             cols = [c for c in fdf.columns if c in keep]
-            filtered[ticker] = fdf[cols] if cols else fdf
+            filtered[ticker] = fdf[cols] if cols else fdf.iloc[:, 0:0]
         return filtered
 
     # -- Step 3c: Trade Qlib Q-accounts ---------------------------------------
@@ -1560,7 +1738,7 @@ class QuantSystem:
                 "pnl": pnl, "pnl_pct": pnl_pct,
                 "positions": positions_list,
                 "num_trades": len(acct.trade_log),
-                "group": "GP进化",
+                "group": "FactorMiner GP" if getattr(gp_strat, "family", "B") == "F" else "GP进化",
             })
 
         # Qlib Q-accounts (Q01-Q10 / CQ01-CQ10)
@@ -1684,7 +1862,7 @@ class QuantSystem:
             )
 
         # Group by type
-        for group_name in ["Alpha158", "GP进化", "Qlib模型", "基准指数"]:
+        for group_name in ["Alpha158", "GP进化", "FactorMiner GP", "Qlib模型", "基准指数"]:
             group = [a for a in accounts_data if a.get("group") == group_name]
             if not group:
                 continue
@@ -1702,7 +1880,7 @@ class QuantSystem:
             best = max(group, key=lambda a: a["pnl_pct"])
             worst = min(group, key=lambda a: a["pnl_pct"])
             win_n = sum(1 for p in pcts if p > 0)
-            g_emoji = "🧬" if group_name == "GP进化" else "📐" if group_name == "Alpha158" else "🤖" if group_name == "Qlib模型" else "📊"
+            g_emoji = "🧬" if group_name == "GP进化" else "🧪" if group_name == "FactorMiner GP" else "📐" if group_name == "Alpha158" else "🤖" if group_name == "Qlib模型" else "📊"
             lines.append(
                 f"\n{g_emoji} {group_name} 组 (n={n}, 中位{median_pct:+.2f}%, "
                 f"胜率{win_n}/{n}, 最佳{best['account_id']}{best['pnl_pct']:+.2f}% / "
@@ -1710,10 +1888,16 @@ class QuantSystem:
             )
             lines.append("-" * 38)
 
-            # Show GP mined factor expressions under GP group header
-            if group_name == "GP进化":
-                total_factors = sum(len(self._per_account_mined.get(gs.id, [])) for gs in self.gp_strategies)
-                lines.append(f"🔬 独立挖掘因子(每账户独立GP进化, 共{total_factors}个)")
+            # Show GP mined factor expressions under GP group headers
+            if group_name in {"GP进化", "FactorMiner GP"}:
+                family = "F" if group_name == "FactorMiner GP" else "B"
+                total_factors = sum(
+                    len(self._per_account_mined.get(gs.id, []))
+                    for gs in self.gp_strategies
+                    if getattr(gs, "family", "B") == family
+                )
+                label = "FactorMiner记忆GP" if family == "F" else "每账户独立GP进化"
+                lines.append(f"🔬 独立挖掘因子({label}, 共{total_factors}个)")
                 lines.append("")
 
             for i, acct_d in enumerate(group, 1):
@@ -1725,7 +1909,7 @@ class QuantSystem:
                     for fn in factor_list:
                         formula = FACTOR_FORMULAS.get(fn, "?")
                         lines.append(f"  📈{fn} = {formula}")
-                elif group_name == "GP进化":
+                elif group_name in {"GP进化", "FactorMiner GP"}:
                     sel = acct_d["factors"][0]  # factor_selection
                     scr = acct_d["factors"][1]  # scoring_method
                     sel_desc = {"all": "全部因子", "top5": "IC前5因子", "top10": "IC前10因子", "bottom5": "IC后5因子(反向)"}.get(sel, sel)

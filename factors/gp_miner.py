@@ -53,12 +53,23 @@ gp_min = make_function(function=_min2, name="min2", arity=2)
 
 GP_FUNCTION_SET = ["add", "sub", "mul", gp_div, gp_sqrt, gp_log, gp_neg, gp_inv, gp_max, gp_min]
 
-# Feature column names (terminal set)
+# Feature column names (legacy B-family terminal set). Keep this stable so old
+# mined expressions continue to map X0..X12 exactly as before.
 FEATURE_COLS = [
     "o_c", "h_c", "l_c", "v_vma20",
     "ma_5", "ma_10", "ma_20",
     "std_5", "std_10", "std_20",
     "ret_1", "ret_5", "ret_10",
+]
+
+# Expanded terminal set for F-family / FactorMiner-style mining. These are
+# computed by _compute_features but are opt-in via gp_feature_subset so legacy
+# B-family accounts are not silently changed.
+FACTORMINER_FEATURE_COLS = FEATURE_COLS + [
+    "range_pos", "upper_pos", "lower_shadow", "upper_shadow", "gap_1",
+    "dvol_vma20", "ret_1_dvol", "absret_1_dvol", "vol_of_vol_20",
+    "skew_20", "kurt_20", "pv_corr_20",
+    "slope_20", "trend_r2_20", "trend_resi_20",
 ]
 
 # Expression evaluator for gplearn symbolic expressions
@@ -159,23 +170,91 @@ def _parse_expr(tokens: list[str], pos: int, X: np.ndarray):
 
 
 def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute normalized features from OHLCV DataFrame."""
-    c = df["close"]
+    """Compute normalized features from OHLCV DataFrame.
+
+    The first 13 columns are the legacy B-family terminal set. Additional
+    columns are FactorMiner-style terminals and are only used when explicitly
+    referenced by gp_feature_subset.
+    """
+    c = df["close"].astype(float)
+    o = df["open"].astype(float)
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+    v = df["volume"].astype(float)
+    eps = 1e-10
+
     feat = pd.DataFrame(index=df.index)
-    feat["o_c"] = df["open"] / c
-    feat["h_c"] = df["high"] / c
-    feat["l_c"] = df["low"] / c
-    v_ma20 = df["volume"].rolling(20).mean()
-    feat["v_vma20"] = df["volume"] / v_ma20.replace(0, np.nan)
-    feat["ma_5"] = c.rolling(5).mean() / c
-    feat["ma_10"] = c.rolling(10).mean() / c
-    feat["ma_20"] = c.rolling(20).mean() / c
-    feat["std_5"] = c.rolling(5).std() / c
-    feat["std_10"] = c.rolling(10).std() / c
-    feat["std_20"] = c.rolling(20).std() / c
+    feat["o_c"] = o / c.replace(0, np.nan)
+    feat["h_c"] = h / c.replace(0, np.nan)
+    feat["l_c"] = l / c.replace(0, np.nan)
+    v_ma20 = v.rolling(20).mean()
+    feat["v_vma20"] = v / v_ma20.replace(0, np.nan)
+    feat["ma_5"] = c.rolling(5).mean() / c.replace(0, np.nan)
+    feat["ma_10"] = c.rolling(10).mean() / c.replace(0, np.nan)
+    feat["ma_20"] = c.rolling(20).mean() / c.replace(0, np.nan)
+    feat["std_5"] = c.rolling(5).std() / c.replace(0, np.nan)
+    feat["std_10"] = c.rolling(10).std() / c.replace(0, np.nan)
+    feat["std_20"] = c.rolling(20).std() / c.replace(0, np.nan)
     feat["ret_1"] = c.pct_change(1)
     feat["ret_5"] = c.pct_change(5)
     feat["ret_10"] = c.pct_change(10)
+
+    # FactorMiner-style expanded features.
+    rng = (h - l).replace(0, np.nan)
+    prev_close = c.shift(1)
+    dollar_vol = (c * v).replace(0, np.nan)
+    dollar_vol_ma20 = dollar_vol.rolling(20).mean()
+    ret_1 = feat["ret_1"]
+
+    feat["range_pos"] = (c - l) / rng
+    feat["upper_pos"] = (h - c) / rng
+    feat["lower_shadow"] = (np.minimum(o, c) - l) / rng
+    feat["upper_shadow"] = (h - np.maximum(o, c)) / rng
+    feat["gap_1"] = o / prev_close.replace(0, np.nan) - 1.0
+    feat["dvol_vma20"] = dollar_vol / dollar_vol_ma20.replace(0, np.nan)
+    feat["ret_1_dvol"] = ret_1 / (dollar_vol / 1e9 + eps)
+    feat["absret_1_dvol"] = ret_1.abs() / (dollar_vol / 1e9 + eps)
+    feat["vol_of_vol_20"] = feat["v_vma20"].rolling(20).std()
+    feat["skew_20"] = ret_1.rolling(20).skew()
+    feat["kurt_20"] = ret_1.rolling(20).kurt()
+    feat["pv_corr_20"] = c.pct_change().rolling(20).corr(v.pct_change())
+
+    x = np.arange(20, dtype=float)
+    x_centered = x - x.mean()
+    denom = float((x_centered ** 2).sum())
+
+    def _slope(arr):
+        arr = np.asarray(arr, dtype=float)
+        if np.isnan(arr).any() or denom == 0:
+            return np.nan
+        y = arr - arr.mean()
+        return float((x_centered * y).sum() / denom / (arr[-1] if abs(arr[-1]) > eps else 1.0))
+
+    def _r2(arr):
+        arr = np.asarray(arr, dtype=float)
+        if np.isnan(arr).any():
+            return np.nan
+        y = arr - arr.mean()
+        ss_tot = float((y ** 2).sum())
+        if ss_tot <= eps:
+            return 0.0
+        slope = float((x_centered * y).sum() / denom)
+        y_hat = slope * x_centered
+        ss_res = float(((y - y_hat) ** 2).sum())
+        return max(0.0, 1.0 - ss_res / ss_tot)
+
+    def _resi(arr):
+        arr = np.asarray(arr, dtype=float)
+        if np.isnan(arr).any():
+            return np.nan
+        y = arr - arr.mean()
+        slope = float((x_centered * y).sum() / denom)
+        y_hat_last = arr.mean() + slope * x_centered[-1]
+        return float((arr[-1] - y_hat_last) / (arr[-1] if abs(arr[-1]) > eps else 1.0))
+
+    feat["slope_20"] = c.rolling(20).apply(_slope, raw=True)
+    feat["trend_r2_20"] = c.rolling(20).apply(_r2, raw=True)
+    feat["trend_resi_20"] = c.rolling(20).apply(_resi, raw=True)
     return feat
 
 
@@ -198,14 +277,21 @@ def _build_y_target(close: pd.Series, target: str) -> pd.Series:
     if target == "next_5d_ret":
         return (close.shift(-5) / close - 1.0)
     if target == "next_5d_sharpe":
-        # forward 5d daily-return Sharpe (no annualization needed; rank IC is scale-invariant)
-        fwd_mean = r1.shift(-5).rolling(5).mean().shift(-4)
-        fwd_std = r1.shift(-5).rolling(5).std().shift(-4)
-        return fwd_mean / fwd_std.replace(0, np.nan)
+        # Forward 5d daily-return Sharpe aligned to today: uses returns
+        # from t+1..t+5 only. Do NOT use rolling+double-shift; that drifts
+        # to t+5..t+9 and changes the target horizon.
+        fwd = pd.concat([r1.shift(-i) for i in range(1, 6)], axis=1)
+        full_window = fwd.count(axis=1) == 5
+        fwd_mean = fwd.mean(axis=1)
+        fwd_std = fwd.std(axis=1)
+        out = fwd_mean / fwd_std.replace(0, np.nan)
+        return out.where(full_window)
     if target == "next_5d_minret_neg":
-        # worst single-day return over next 5 days, sign-flipped so "high" = resilient
-        fwd_min = r1.shift(-5).rolling(5).min().shift(-4)
-        return -fwd_min
+        # Worst single-day return over immediate next 5 days, sign-flipped so
+        # "high" = resilient.
+        fwd = pd.concat([r1.shift(-i) for i in range(1, 6)], axis=1)
+        full_window = fwd.count(axis=1) == 5
+        return (-fwd.min(axis=1)).where(full_window)
     if target == "reversal_2d":
         return -((close.shift(-2) / close) - 1.0)
     # fallback
@@ -227,7 +313,7 @@ def _prepare_dataset(
     for ticker, df in historical_data.items():
         feat = _compute_features(df)
         target = _build_y_target(df["close"], y_target)
-        combined = feat.assign(target=target).dropna()
+        combined = feat.assign(target=target).dropna(subset=list(cols) + ["target"])
         if len(combined) < 5:
             continue
         all_X.append(combined[cols].values)
@@ -346,24 +432,29 @@ class GPAlphaMiner:
         result = {}
         for ticker, df in historical_data.items():
             feat = _compute_features(df)
-            valid_idx = feat.dropna().index
-            if len(valid_idx) < 1:
+            if feat.empty:
                 result[ticker] = pd.DataFrame(index=df.index)
                 continue
 
-            factor_cols = {}
+            factor_frames = []
             for f_info in mined_factors:
                 # Per-factor feature subset (B11+); fall back to all 13 (B01-B10 legacy)
                 cols = f_info.get("feature_cols") or FEATURE_COLS
                 try:
+                    valid_idx = feat.dropna(subset=cols).index
+                    if len(valid_idx) < 1:
+                        continue
                     X_tick = feat.loc[valid_idx, cols].values
                     col = _eval_expression(f_info["expression"], X_tick)
-                    factor_cols[f_info["name"]] = col
+                    factor_frames.append(pd.Series(col, index=valid_idx, name=f_info["name"]))
                 except Exception:
-                    factor_cols[f_info["name"]] = np.full(len(valid_idx), np.nan)
+                    continue
 
-            fdf = pd.DataFrame(factor_cols, index=valid_idx)
-            result[ticker] = fdf.reindex(df.index)
+            if factor_frames:
+                fdf = pd.concat(factor_frames, axis=1)
+                result[ticker] = fdf.reindex(df.index)
+            else:
+                result[ticker] = pd.DataFrame(index=df.index)
         return result
 
     @staticmethod
