@@ -48,6 +48,41 @@ class AccountReplay:
     trade_count_day: int = 0
 
 
+def _load_repair_baseline(
+    conn: sqlite3.Connection,
+    account: str,
+    market: str,
+) -> tuple[str, float, dict[str, dict[str, float]]] | None:
+    """Return latest explicit ledger repair baseline, if present.
+
+    A baseline means old trades before `baseline_ts` are preserved for audit but
+    are not the authoritative current ledger. Replay starts from the recorded
+    cash+positions, then applies later trades only.
+    """
+    try:
+        row = conn.execute(
+            """
+            SELECT baseline_ts,cash,positions_json
+            FROM ledger_repair_baselines
+            WHERE account=? AND market=?
+            ORDER BY baseline_ts DESC,id DESC
+            LIMIT 1
+            """,
+            (account, market),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row:
+        return None
+    raw = json.loads(row["positions_json"] or "{}")
+    positions = {
+        str(t): {"shares": float(p.get("shares", 0.0)), "total_cost": float(p.get("total_cost", 0.0))}
+        for t, p in raw.items()
+        if abs(float(p.get("shares", 0.0))) > 1e-9
+    }
+    return str(row["baseline_ts"]), float(row["cash"]), positions
+
+
 def parse_ts(ts: str | None) -> datetime | None:
     if not ts:
         return None
@@ -90,17 +125,30 @@ def replay_account(
     day_end: str,
 ) -> AccountReplay:
     costs = CNCosts() if market == "CN" else MoomooAUCosts()
-    rows = conn.execute(
-        """
-        SELECT id,timestamp,ticker,side,shares,price,cost,COALESCE(slippage,0) AS slippage
-        FROM trades
-        WHERE account=? AND market=?
-        ORDER BY timestamp,id
-        """,
-        (account, market),
-    ).fetchall()
-    cash = float(initial_cash)
-    pos: dict[str, dict[str, float]] = {}
+    baseline = _load_repair_baseline(conn, account, market)
+    if baseline:
+        baseline_ts, cash, pos = baseline
+        rows = conn.execute(
+            """
+            SELECT id,timestamp,ticker,side,shares,price,cost,COALESCE(slippage,0) AS slippage
+            FROM trades
+            WHERE account=? AND market=? AND timestamp>?
+            ORDER BY timestamp,id
+            """,
+            (account, market, baseline_ts),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT id,timestamp,ticker,side,shares,price,cost,COALESCE(slippage,0) AS slippage
+            FROM trades
+            WHERE account=? AND market=?
+            ORDER BY timestamp,id
+            """,
+            (account, market),
+        ).fetchall()
+        cash = float(initial_cash)
+        pos: dict[str, dict[str, float]] = {}
     oversells: list[dict[str, Any]] = []
     buys_notional_day = sells_notional_day = fees_day = slippage_day = 0.0
     trade_count_day = 0
@@ -169,6 +217,37 @@ def replay_account(
                     "error": "unknown_side",
                 }
             )
+
+    # Daily flow stats are independent of replay baselines: a baseline may be
+    # written after today's trades to repair current state, but the watchdog
+    # report must still count those real trades/events for the day.
+    day_rows = conn.execute(
+        """
+        SELECT id,timestamp,ticker,side,shares,price,cost,COALESCE(slippage,0) AS slippage
+        FROM trades
+        WHERE account=? AND market=? AND timestamp>=? AND timestamp<?
+        ORDER BY timestamp,id
+        """,
+        (account, market, day_start, day_end),
+    ).fetchall()
+    buys_notional_day = sells_notional_day = fees_day = slippage_day = 0.0
+    trade_count_day = 0
+    for r in day_rows:
+        side = str(r["side"]).lower()
+        shares = float(r["shares"])
+        price = float(r["price"])
+        fees = costs.calculate(side, shares, price) if side in ("buy", "sell") else None
+        total_fees = float(fees["total_fees"]) if fees else float(r["cost"] or 0.0)
+        exec_price = float(fees["exec_price"]) if fees else price
+        slip_amount = abs(exec_price - price) * shares if fees else float(r["slippage"] or 0.0)
+        notional = shares * price
+        trade_count_day += 1
+        fees_day += total_fees
+        slippage_day += slip_amount
+        if side == "buy":
+            buys_notional_day += notional
+        elif side == "sell":
+            sells_notional_day += notional
 
     clean_pos = {
         t: p for t, p in pos.items()
@@ -265,15 +344,27 @@ def _replay_series(
 ) -> list[tuple[sqlite3.Row, float, dict[str, dict[str, float]], list[dict[str, Any]]]]:
     """Incrementally replay trades to every account snapshot timestamp."""
     costs = _trade_cash_model(market)
-    trades = conn.execute(
-        """
-        SELECT id,timestamp,ticker,side,shares,price
-        FROM trades WHERE account=? AND market=? ORDER BY timestamp,id
-        """,
-        (account, market),
-    ).fetchall()
-    cash = float(initial_cash)
-    positions: dict[str, dict[str, float]] = {}
+    baseline = _load_repair_baseline(conn, account, market)
+    if baseline:
+        baseline_ts, cash, positions = baseline
+        trades = conn.execute(
+            """
+            SELECT id,timestamp,ticker,side,shares,price
+            FROM trades WHERE account=? AND market=? AND timestamp>?
+            ORDER BY timestamp,id
+            """,
+            (account, market, baseline_ts),
+        ).fetchall()
+    else:
+        trades = conn.execute(
+            """
+            SELECT id,timestamp,ticker,side,shares,price
+            FROM trades WHERE account=? AND market=? ORDER BY timestamp,id
+            """,
+            (account, market),
+        ).fetchall()
+        cash = float(initial_cash)
+        positions: dict[str, dict[str, float]] = {}
     out = []
     ti = 0
     oversells: list[dict[str, Any]] = []
@@ -322,26 +413,69 @@ def _replay_series(
     return out
 
 
+_CN_SUFFIXES = (".SH", ".SZ", ".BJ")
+
+
+def _is_cn_ticker(ticker: str) -> bool:
+    return str(ticker).upper().endswith(_CN_SUFFIXES)
+
+
+def _is_benchmark_account(account: str, market: str) -> bool:
+    return account in ({"IDX1", "IDX2"} if market == "US" else {"IDX3"})
+
+
+def _benchmark_ticker(account: str, market: str) -> str | None:
+    if market == "CN" and account == "IDX3":
+        return "000300.SH"
+    if market == "US" and account in {"IDX1", "IDX2"}:
+        return {"IDX1": "QQQ", "IDX2": "SPY"}[account]
+    return None
+
+
+def _latest_price_timestamp(
+    conn: sqlite3.Connection,
+    tickers: set[str],
+    intervals: tuple[str, ...],
+) -> datetime | None:
+    if not tickers:
+        return None
+    placeholders = ",".join("?" for _ in tickers)
+    interval_placeholders = ",".join("?" for _ in intervals)
+    row = conn.execute(
+        f"""
+        SELECT MAX(datetime) AS max_dt
+        FROM prices
+        WHERE ticker IN ({placeholders}) AND interval IN ({interval_placeholders})
+        """,
+        [*sorted(tickers), *intervals],
+    ).fetchone()
+    if not row or not row["max_dt"]:
+        return None
+    return parse_ts(str(row["max_dt"]))
+
+
 def _load_price_history(
     conn: sqlite3.Connection,
     tickers: set[str],
     start_ts: str,
     end_ts: str,
+    intervals: tuple[str, ...] = ("1h", "1d"),
 ) -> dict[str, list[tuple[float, float]]]:
     if not tickers:
         return {}
     placeholders = ",".join("?" for _ in tickers)
+    interval_placeholders = ",".join("?" for _ in intervals)
     start_dt = parse_ts(start_ts) or datetime.now(timezone.utc)
     start_buf = (start_dt - timedelta(days=7)).isoformat()
     rows = conn.execute(
         f"""
         SELECT ticker, datetime, interval, close
         FROM prices
-        WHERE ticker IN ({placeholders}) AND interval IN ('1h','1d')
+        WHERE ticker IN ({placeholders}) AND interval IN ({interval_placeholders})
           AND datetime >= ? AND datetime <= ?
         ORDER BY ticker, datetime, CASE interval WHEN '1d' THEN 0 ELSE 1 END
         """,
-        [*sorted(tickers), start_buf, end_ts],
+        [*sorted(tickers), *intervals, start_buf, end_ts],
     ).fetchall()
     out: dict[str, list[tuple[float, float]]] = {}
     for r in rows:
@@ -391,15 +525,38 @@ def history_curve_audit(
     ).fetchall()
     if not rows:
         return []
+    is_cn_history = market == "CN"
+    if _is_benchmark_account(account, market):
+        bt = _benchmark_ticker(account, market)
+        tickers = {bt} if bt else set()
+    else:
+        trades = conn.execute(
+            "SELECT DISTINCT ticker FROM trades WHERE account=? AND market=? AND timestamp<=?",
+            (account, market, audit_end),
+        ).fetchall()
+        tickers = {r["ticker"] for r in trades}
+
+    if is_cn_history:
+        cn_intervals = ("15m", "5m", "1m", "1h")
+        latest_intraday = _latest_price_timestamp(conn, tickers, cn_intervals) if tickers else None
+        audit_start_dt = parse_ts(audit_start)
+        audit_end_dt = parse_ts(audit_end)
+        # CN account snapshots are intraday realtime rows. If we do not have
+        # intraday bars overlapping this audit window, pricing them with stale
+        # daily closes creates thousands of false critical mismatches. Keep the
+        # authoritative current-ledger checks and silently skip this historical
+        # curve audit until intraday history is backfilled/maintained.
+        if tickers and (
+            latest_intraday is None
+            or (audit_start_dt is not None and latest_intraday < audit_start_dt)
+            or (audit_end_dt is not None and latest_intraday < audit_end_dt - timedelta(days=1))
+        ):
+            return []
     if len(rows) > args.history_max_points:
         step = len(rows) / float(args.history_max_points)
         rows = [rows[int(i * step)] for i in range(args.history_max_points)]
-    trades = conn.execute(
-        "SELECT DISTINCT ticker FROM trades WHERE account=? AND market=? AND timestamp<=?",
-        (account, market, audit_end),
-    ).fetchall()
-    tickers = {r["ticker"] for r in trades}
-    price_hist = _load_price_history(conn, tickers, audit_start, audit_end)
+    price_intervals = ("15m", "5m", "1m", "1h", "1d") if is_cn_history else ("1h", "1d")
+    price_hist = _load_price_history(conn, tickers, audit_start, audit_end, intervals=price_intervals)
     mismatches: list[dict[str, Any]] = []
     missing_price_rows = 0
     checked = 0

@@ -37,8 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from accounts.strategies import STRATEGIES  # noqa: E402
 from accounts.gp_strategies import active_gp_strategies_for_market  # noqa: E402
 from config.settings import ACCOUNT_PREFIX  # noqa: E402
-from trading.costs import MoomooAUCosts  # noqa: E402
-from core.events import emit as emit_event  # noqa: E402
+from trading.costs import CNCosts, MoomooAUCosts  # noqa: E402
 from data.cn_fetcher import get_fetcher_for  # noqa: E402
 
 LOG = logging.getLogger("update_prices")
@@ -60,7 +59,15 @@ for _g in active_gp_strategies_for_market("US"):
 for _g in active_gp_strategies_for_market("CN"):
     STOP_LOSS_BY_ACCT[f"{ACCOUNT_PREFIX.get('CN', '')}{_g.id}"] = _g.stop_loss
 
-COSTS = MoomooAUCosts()
+_COST_MODELS = {"US": MoomooAUCosts(), "CN": CNCosts()}
+
+
+def _costs_for_market(market: str):
+    return _COST_MODELS.get(market, _COST_MODELS["US"])
+
+
+def _currency_symbol(market: str) -> str:
+    return "¥" if market == "CN" else "$"
 
 
 def _notify_stop_losses(executed: list[dict]) -> None:
@@ -186,6 +193,53 @@ def _is_market_open_for(market: str) -> bool:
     return _is_us_market_hours_now()
 
 
+def _insert_trade_event(
+    cur: sqlite3.Cursor,
+    *,
+    now_iso: str,
+    market: str,
+    account: str,
+    ticker: str,
+    shares: float,
+    price: float,
+    avg_cost: float,
+    pnl_pct: float,
+    pnl_dollar: float,
+    stop_loss: float,
+    reason: str,
+) -> None:
+    """Insert the dashboard trade event in the SAME SQLite transaction.
+
+    Do not call core.events.emit() here: it opens a second SQLite connection
+    while update_prices is already holding a write transaction, which causes
+    `database is locked` and drops the audit event even though the trade row is
+    committed. Keeping the event write on this cursor makes trades/events
+    atomic for the stop-loss path.
+    """
+    sym = _currency_symbol(market)
+    reason_label = {"stop_loss": "🛑 stop-loss", "trailing_stop": "📉 trailing-stop"}.get(reason, reason)
+    title = (
+        f"SELL {ticker} ×{int(shares)} @ {sym}{price:.2f} · "
+        f"{reason_label} PnL {pnl_pct*100:+.2f}% ({sym}{pnl_dollar:+.2f})"
+    )
+    detail = {
+        "shares": shares,
+        "price": price,
+        "reason": reason,
+        "pnl_pct": pnl_pct,
+        "pnl_dollar": pnl_dollar,
+        "avg_cost": avg_cost,
+        "stop_loss_threshold": stop_loss,
+        "source": "update_prices.stop_loss",
+    }
+    import json
+    cur.execute(
+        "INSERT INTO events (ts, category, severity, account, ticker, title, detail, market) "
+        "VALUES (?, 'trade', 'info', ?, ?, ?, ?, ?)",
+        (now_iso, account, ticker, title, json.dumps(detail, ensure_ascii=False), market),
+    )
+
+
 def check_stop_losses(
     conn: sqlite3.Connection,
     prices: dict[str, float],
@@ -286,8 +340,9 @@ def check_stop_losses(
             continue
 
         # Trigger stop loss
-        exec_price = COSTS.slippage(px, "sell")
-        fees = COSTS.calculate("sell", shares, px)
+        costs = _costs_for_market(acct_market)
+        exec_price = costs.slippage(px, "sell")
+        fees = costs.calculate("sell", shares, px)
         proceeds = shares * exec_price - fees["total_fees"]
 
         # Update cash
@@ -317,6 +372,22 @@ def check_stop_losses(
              (px - exec_price) * shares, now_iso, acct_market),
         )
 
+        pnl_dollar = (proceeds - (avg_cost * shares))
+        _insert_trade_event(
+            cur,
+            now_iso=now_iso,
+            market=acct_market,
+            account=acct,
+            ticker=ticker,
+            shares=shares,
+            price=px,
+            avg_cost=avg_cost,
+            pnl_pct=pnl_pct,
+            pnl_dollar=pnl_dollar,
+            stop_loss=stop_loss,
+            reason=triggered_reason,
+        )
+
         executed.append({
             "account": acct, "ticker": ticker, "shares": shares,
             "price": px, "avg_cost": avg_cost, "pnl_pct": pnl_pct * 100,
@@ -324,29 +395,11 @@ def check_stop_losses(
             "detail": triggered_msg,
         })
         LOG.warning(
-            "%s [%s] %s: %.0f sh @ $%.2f (cost $%.2f, %s)",
-            triggered_reason.upper(), acct, ticker, shares, px, avg_cost,
+            "%s [%s/%s] %s: %.0f sh @ %s%.2f (cost %s%.2f, %s)",
+            triggered_reason.upper(), acct_market, acct, ticker, shares,
+            _currency_symbol(acct_market), px, _currency_symbol(acct_market), avg_cost,
             triggered_msg,
         )
-
-        # Emit dashboard event so the live stream shows it (matches main.py format)
-        try:
-            pnl_dollar = (px - avg_cost) * shares - fees["total_fees"]
-            title = (
-                f"SELL {ticker} \u00d7{int(shares)} @ ${px:.2f} \u00b7 "
-                f"\U0001F6D1 stop-loss PnL {pnl_pct*100:+.2f}% (${pnl_dollar:+.2f})"
-            )
-            emit_event(
-                "trade", title,
-                account=acct, ticker=ticker,
-                detail={
-                    "shares": shares, "price": px, "reason": "stop_loss",
-                    "pnl_pct": pnl_pct, "pnl_dollar": pnl_dollar,
-                    "avg_cost": avg_cost, "stop_loss_threshold": stop_loss,
-                },
-            )
-        except Exception as _e:
-            LOG.warning("emit stop-loss event failed: %s", _e)
 
     return executed
 
@@ -447,8 +500,8 @@ def update_equity_snapshots(db_path: str = DB_PATH) -> dict:
             equity += p["shares"] * px
             cur.execute(
                 "UPDATE positions SET current_price=?, updated_at=? "
-                "WHERE account=? AND ticker=?",
-                (px, now_iso, acct, p["ticker"]),
+                "WHERE account=? AND ticker=? AND market=?",
+                (px, now_iso, acct, p["ticker"], market),
             )
         cur.execute(
             "INSERT INTO accounts (name, cash, equity, timestamp, market) "
