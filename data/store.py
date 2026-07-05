@@ -11,9 +11,13 @@ DB_PATH = os.path.expanduser("~/quant-trading/data/trading.db")
 
 
 def _connect(db_path: str | None = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path or DB_PATH)
+    # Dashboard backtests and live price/update jobs can legitimately touch the
+    # shared cache at the same time.  SQLite's default 5s timeout (and some
+    # callers' 1s PRAGMA busy_timeout) is too brittle for bulk price writes.
+    conn = sqlite3.connect(db_path or DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 

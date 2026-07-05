@@ -22,19 +22,45 @@ logging.basicConfig(
 log = logging.getLogger("backfill")
 
 
+def _held_tickers_for_market(market: str) -> list[str]:
+    """Return currently held tickers for a market.
+
+    The live portfolio can contain legacy/non-universe symbols (e.g. ARM after
+    the Russell-1000 universe rotated it out). Daily backfill must still refresh
+    those tickers or the ledger watchdog cannot price historical snapshots.
+    """
+    import sqlite3
+    try:
+        from data.store import DB_PATH
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            "SELECT DISTINCT ticker FROM positions WHERE market=? ORDER BY ticker",
+            (market,),
+        ).fetchall()
+        conn.close()
+        return [r[0] for r in rows]
+    except Exception as e:
+        log.warning("Could not load held tickers for %s: %s", market, e)
+        return []
+
+
+def _dedupe(seq):
+    return list(dict.fromkeys(seq))
+
+
 def backfill(interval: str, days: int, batch_size: int = 50, market: str = "US"):
     if market == "CN":
         from config.settings import CN_UNIVERSE, BENCHMARKS_BY_MARKET
         from data.cn_fetcher import CNDataFetcher
         bench_tickers = [bm["ticker"] for bm in BENCHMARKS_BY_MARKET["CN"]]
-        tickers = list(CN_UNIVERSE) + bench_tickers
+        tickers = _dedupe(list(CN_UNIVERSE) + _held_tickers_for_market("CN") + bench_tickers)
         fetcher = CNDataFetcher()
         # akshare/sina rate limits — smaller batches help
         batch_size = min(batch_size, 30)
     else:
         from config.settings import STOCK_UNIVERSE
         from data.fetcher import DataFetcher
-        tickers = list(STOCK_UNIVERSE) + ["QQQ", "SPY"]
+        tickers = _dedupe(list(STOCK_UNIVERSE) + _held_tickers_for_market("US") + ["QQQ", "SPY"])
         fetcher = DataFetcher()
 
     log.info("Backfilling [%s] %d tickers, interval=%s, days=%d",
