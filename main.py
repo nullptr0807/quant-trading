@@ -13,6 +13,7 @@ import json
 import logging
 import traceback
 from datetime import datetime, timezone, timedelta
+from collections import defaultdict
 
 import numpy as np
 
@@ -395,6 +396,7 @@ class QuantSystem:
         self._sigma_ref = 0.01     # 参考波动率
         self._last_rebalance = {}  # {account_id: datetime} 上次换仓时间
         self._rebalance_hours_cache = {}  # {account_id: float} 当前自适应周期
+        self._lot_skip_seen: dict[str, set[tuple[str, str, float, float]]] = defaultdict(set)
 
         # 从DB恢复状态
         self._restore_state()
@@ -423,7 +425,58 @@ class QuantSystem:
             log.warning("Failed to load retired accounts: %s", e)
             return set()
 
-    # -- account_meta bootstrap -----------------------------------------------
+    def _record_lot_skip(
+        self,
+        account: str,
+        ticker: str,
+        *,
+        strategy_kind: str,
+        budget: float,
+        price: float,
+        target_per_position: float,
+        held_value: float,
+        rank: int | None = None,
+        score: float | None = None,
+    ) -> None:
+        """Persist an account-level event when a CN signal is skipped by lot sizing.
+
+        Dedupe within the running process by (account, ticker, reason, rounded
+        price/budget) so repeated candidate passes don't flood the dashboard.
+        """
+        detail = self.engine.buy_skip_detail_for_budget(budget, price)
+        if not detail:
+            return
+        key = (ticker, detail.get("reason", "unknown"), round(float(budget), 2), round(float(price), 4))
+        seen = self._lot_skip_seen[account]
+        if key in seen:
+            return
+        seen.add(key)
+        detail.update({
+            "strategy_kind": strategy_kind,
+            "target_per_position": target_per_position,
+            "held_value": held_value,
+            "rank": rank,
+            "score": score,
+            "source": "lot_sizing",
+        })
+        if detail.get("reason") == "board_lot_unaffordable":
+            title = (
+                f"⏭️ Skip {ticker}: 1手买不起/超仓位 "
+                f"(budget ¥{budget:.0f}, 1手≈¥{detail.get('min_lot_notional', 0):.0f})"
+            )
+        else:
+            title = f"⏭️ Skip {ticker}: buy sizing failed ({detail.get('reason')})"
+        emit_event(
+            "system",
+            title,
+            severity="info",
+            account=account,
+            ticker=ticker,
+            detail=detail,
+            market=self.market,
+        )
+
+    # -- account meta bootstrap ------------------------------------------------
     def _ensure_account_meta_rows(self):
         """Idempotently insert account_meta rows for this market's accounts."""
         import sqlite3
@@ -1099,7 +1152,7 @@ class QuantSystem:
 
         # Generate signals using GP signal generator
         signals = self.gp_signal_gen.generate_signals(
-            filtered_factors, top_n=gp_strat.top_n
+            filtered_factors, top_n=gp_strat.top_n, buy_candidates=max(gp_strat.top_n * 5, 30)
         )
 
         buy_tickers = set(signals["buy"])
@@ -1179,7 +1232,14 @@ class QuantSystem:
         # --- BUY ---
         equity = acct.get_equity(current_prices)
         target_per_position = equity * gp_strat.max_position_pct
-        for ticker in signals["buy"][:gp_strat.top_n]:
+        active_count = sum(1 for s in acct.get_positions().values() if s > 0)
+        # Iterate the full ranked list, not just top_n. With CN 100-share lots,
+        # a high-ranked expensive stock may be unbuyable under the position cap;
+        # skip it and let the next executable signal fill the target slot.
+        for rank, ticker in enumerate(signals["buy"], start=1):
+            held = acct.get_positions().get(ticker, 0)
+            if active_count >= gp_strat.top_n and held <= 0:
+                continue
             if ticker in cooldown_set:
                 log.info("[%s] GP cooldown skip %s (stop_loss within %dh)",
                          gp_strat.id, ticker, cc.get("stop_cooldown_hours", 0))
@@ -1187,19 +1247,30 @@ class QuantSystem:
             price = current_prices.get(ticker)
             if not price or price <= 0:
                 continue
-            held = acct.get_positions().get(ticker, 0)
             held_value = held * price
             if held_value >= target_per_position * 0.9:
                 continue
             budget = min(target_per_position - held_value, acct.cash * 0.95)
             if budget < 5:
                 continue
-            shares = int(budget / price)
+            shares = self.engine.buy_shares_for_budget(budget, price)
             if shares <= 0:
+                if self.market == "CN":
+                    lot_size = getattr(self.costs, "lot_size", 1)
+                    log.info("[%s] GP lot skip %s: budget=¥%.2f price=¥%.2f lot=%s",
+                             gp_strat.id, ticker, budget, price, lot_size)
+                    self._record_lot_skip(
+                        gp_strat.id, ticker, strategy_kind="GP", budget=budget,
+                        price=price, target_per_position=target_per_position,
+                        held_value=held_value, rank=rank,
+                    )
                 continue
             try:
-                self.engine.execute_signal(gp_strat.id, ticker, "buy", shares, price, current_prices)
-                log.info("[%s] GP Bought %s x%d @ $%.2f", gp_strat.id, ticker, shares, price)
+                result = self.engine.execute_signal(gp_strat.id, ticker, "buy", shares, price, current_prices)
+                if result:
+                    if held <= 0:
+                        active_count += 1
+                    log.info("[%s] GP Bought %s x%d @ $%.2f", gp_strat.id, ticker, result["shares"], price)
             except Exception as e:
                 log.warning("[%s] GP Buy failed %s: %s", gp_strat.id, ticker, e)
 
@@ -1401,7 +1472,14 @@ class QuantSystem:
         # --- BUY ---
         equity = acct.get_equity(current_prices)
         target_per_position = equity * q_strat.max_position_pct
-        for ticker in buy_list:
+        active_count = sum(1 for s in acct.get_positions().values() if s > 0)
+        # Iterate full score ranking so expensive/unbuyable CN board lots do not
+        # leave target slots empty; they are skipped and lower-ranked executable
+        # candidates can fill the portfolio.
+        for rank, (ticker, _score) in enumerate(scored, start=1):
+            held = acct.get_positions().get(ticker, 0)
+            if active_count >= q_strat.top_n and held <= 0:
+                continue
             if ticker in cooldown_set:
                 log.info("[%s] Qlib cooldown skip %s (stop_loss within %dh)",
                          q_strat.id, ticker, cc.get("stop_cooldown_hours", 0))
@@ -1409,21 +1487,32 @@ class QuantSystem:
             price = current_prices.get(ticker)
             if not price or price <= 0:
                 continue
-            held = acct.get_positions().get(ticker, 0)
             held_value = held * price
             if held_value >= target_per_position * 0.9:
                 continue
             budget = min(target_per_position - held_value, acct.cash * 0.95)
             if budget < 5:
                 continue
-            shares = int(budget / price)
+            shares = self.engine.buy_shares_for_budget(budget, price)
             if shares <= 0:
+                if self.market == "CN":
+                    lot_size = getattr(self.costs, "lot_size", 1)
+                    log.info("[%s] Qlib lot skip %s: budget=¥%.2f price=¥%.2f lot=%s",
+                             q_strat.id, ticker, budget, price, lot_size)
+                    self._record_lot_skip(
+                        q_strat.id, ticker, strategy_kind="Qlib", budget=budget,
+                        price=price, target_per_position=target_per_position,
+                        held_value=held_value, rank=rank, score=_score,
+                    )
                 continue
             try:
-                self.engine.execute_signal(
+                result = self.engine.execute_signal(
                     q_strat.id, ticker, "buy", shares, price, current_prices,
                 )
-                log.info("[%s] Qlib bought %s x%d @ $%.2f", q_strat.id, ticker, shares, price)
+                if result:
+                    if held <= 0:
+                        active_count += 1
+                    log.info("[%s] Qlib bought %s x%d @ $%.2f", q_strat.id, ticker, result["shares"], price)
             except Exception as e:
                 log.warning("[%s] Qlib buy failed %s: %s", q_strat.id, ticker, e)
         return True
@@ -1614,7 +1703,7 @@ class QuantSystem:
                 except Exception as e:
                     log.warning("[%s] Sell failed %s: %s", strat.id, ticker, e)
 
-        # --- BUY: top_n signals ---
+        # --- BUY: ranked signals, with executable-candidate fill ---
         equity = acct.get_equity(current_prices)
         target_per_position = equity * strat.max_position_pct
 
@@ -1622,8 +1711,15 @@ class QuantSystem:
             self.db_path, strat.id, self.market, cc.get("stop_cooldown_hours", 0),
         )
         STOP_COOLDOWN_HOURS = cc.get("stop_cooldown_hours", 0)
+        active_count = sum(1 for s in acct.get_positions().values() if s > 0)
 
-        for ticker, score in signals["buy"][:strat.top_n]:
+        # Iterate the full ranked signal list. For CN, a top-ranked stock can be
+        # too expensive to buy one 100-share lot within the position cap; skip it
+        # and let lower-ranked executable candidates fill up to top_n holdings.
+        for rank, (ticker, score) in enumerate(signals["buy"], start=1):
+            held = acct.get_positions().get(ticker, 0)
+            if active_count >= strat.top_n and held <= 0:
+                continue
             if ticker in cooldown_set:
                 log.info("[%s] cooldown skip %s (stop_loss within %dh)",
                          strat.id, ticker, STOP_COOLDOWN_HOURS)
@@ -1633,25 +1729,36 @@ class QuantSystem:
                 continue
 
             # Skip if already holding enough
-            held = acct.get_positions().get(ticker, 0)
             held_value = held * price
             if held_value >= target_per_position * 0.9:
                 continue
 
-            # Calculate shares to buy
+            # Calculate executable shares to buy
             budget = min(target_per_position - held_value, acct.cash * 0.95)
             if budget < 5:  # minimum $5 trade
                 continue
-            shares = int(budget / price)
+            shares = self.engine.buy_shares_for_budget(budget, price)
             if shares <= 0:
+                if self.market == "CN":
+                    lot_size = getattr(self.costs, "lot_size", 1)
+                    log.info("[%s] lot skip %s: budget=¥%.2f price=¥%.2f lot=%s",
+                             strat.id, ticker, budget, price, lot_size)
+                    self._record_lot_skip(
+                        strat.id, ticker, strategy_kind="Alpha158", budget=budget,
+                        price=price, target_per_position=target_per_position,
+                        held_value=held_value, rank=rank, score=score,
+                    )
                 continue
 
             try:
-                self.engine.execute_signal(
+                result = self.engine.execute_signal(
                     strat.id, ticker, "buy", shares, price, current_prices
                 )
-                log.info("[%s] Bought %s x%d @ $%.2f (score=%.3f)",
-                         strat.id, ticker, shares, price, score)
+                if result:
+                    if held <= 0:
+                        active_count += 1
+                    log.info("[%s] Bought %s x%d @ $%.2f (score=%.3f)",
+                             strat.id, ticker, result["shares"], price, score)
             except Exception as e:
                 log.warning("[%s] Buy failed %s: %s", strat.id, ticker, e)
 

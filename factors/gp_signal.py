@@ -14,6 +14,7 @@ class GPSignalGenerator:
         self,
         gp_factors_dict: dict[str, pd.DataFrame],
         top_n: int = 5,
+        buy_candidates: int | None = None,
     ) -> dict:
         """
         Generate buy/sell signals from GP factors.
@@ -21,6 +22,9 @@ class GPSignalGenerator:
         Args:
             gp_factors_dict: {ticker: DataFrame of GP factor values}
             top_n: number of tickers for buy and sell lists
+            buy_candidates: optional larger buy-list length. Use this when
+                execution constraints (e.g. CN 100-share board lots) may make a
+                top-ranked ticker unbuyable and the caller wants fallback names.
 
         Returns:
             dict with 'buy' and 'sell' lists of ticker strings
@@ -59,7 +63,11 @@ class GPSignalGenerator:
             return {"buy": [], "sell": []}
 
         n = min(top_n, max(1, len(composite) // 2))
-        buy_list = composite.head(n).index.tolist()
+        # Candidate-fallback list for lot/affordability constraints, but do not
+        # let buy candidates overlap the sell tail on small universes.
+        max_non_sell = max(n, len(composite) - n)
+        buy_n = min(buy_candidates or n, max_non_sell)
+        buy_list = composite.head(buy_n).index.tolist()
         sell_list = composite.tail(n).index.tolist()
 
         return {"buy": buy_list, "sell": sell_list}

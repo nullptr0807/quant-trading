@@ -39,6 +39,40 @@ class TradingEngine:
             return whole
         return (whole // lot) * lot
 
+    def buy_shares_for_budget(self, budget: float, price: float) -> int:
+        """Return executable buy quantity for a cash budget and pre-slip price.
+
+        For CN this returns 100-share board lots. If the budget cannot buy one
+        lot, return 0 so callers can skip this signal and try the next ranked
+        candidate instead of creating an impossible odd-lot or oversizing.
+        """
+        if budget <= 0 or price <= 0:
+            return 0
+        exec_price = self.costs.slippage(price, "buy")
+        return self._round_buy_shares(budget / exec_price)
+
+    def buy_skip_detail_for_budget(self, budget: float, price: float) -> dict | None:
+        """Explain why a buy budget cannot produce an executable order.
+
+        Returns None when at least one executable share/lot can be bought. Used
+        by trading loops to persist account-level skip events for CN board-lot
+        constraints without guessing from log lines.
+        """
+        if budget <= 0 or price <= 0:
+            return {"reason": "invalid_budget_or_price", "budget": budget, "price": price}
+        if self.buy_shares_for_budget(budget, price) > 0:
+            return None
+        lot = self._lot_size()
+        exec_price = self.costs.slippage(price, "buy")
+        return {
+            "reason": "board_lot_unaffordable" if lot > 1 else "insufficient_budget",
+            "budget": budget,
+            "price": price,
+            "exec_price": exec_price,
+            "lot_size": lot,
+            "min_lot_notional": exec_price * lot,
+        }
+
     def create_account(self, name: str, initial_cash: float = 1000.0) -> VirtualAccount:
         acct = VirtualAccount(initial_cash=initial_cash, costs=self.costs)
         self.accounts[name] = acct

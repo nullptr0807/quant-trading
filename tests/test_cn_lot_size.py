@@ -53,6 +53,43 @@ def test_us_buy_still_allows_single_share_orders():
     assert trade["shares"] == 17
 
 
+def test_cn_budget_too_small_for_one_board_lot_returns_zero_buy_shares():
+    engine = _cn_engine()
+
+    assert engine.buy_shares_for_budget(20_000, 840.0) == 0
+
+
+def test_cn_buy_budget_rounds_to_affordable_board_lots():
+    engine = _cn_engine()
+
+    assert engine.buy_shares_for_budget(20_000, 37.0) == 500
+
+
+def test_us_buy_budget_still_allows_single_share_sizing():
+    engine = TradingEngine(costs=MoomooAUCosts())
+
+    assert engine.buy_shares_for_budget(20_000, 840.0) == 23
+
+
+def test_cn_unbuyable_budget_exposes_skip_detail():
+    engine = _cn_engine()
+
+    detail = engine.buy_skip_detail_for_budget(20_000, 840.0)
+
+    assert detail is not None
+    assert detail["reason"] == "board_lot_unaffordable"
+    assert detail["lot_size"] == 100
+    assert detail["min_lot_notional"] > 84_000
+    assert detail["budget"] == 20_000
+    assert detail["price"] == 840.0
+
+
+def test_cn_affordable_budget_has_no_skip_detail():
+    engine = _cn_engine()
+
+    assert engine.buy_skip_detail_for_budget(20_000, 37.0) is None
+
+
 def test_cn_full_sell_can_clear_legacy_odd_lot_position():
     engine = _cn_engine()
     acct: VirtualAccount = engine.create_account("CA01", initial_cash=100_000)
