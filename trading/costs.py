@@ -13,6 +13,8 @@ class CNCosts:
     so equity impact mirrors the US path.
     """
 
+    lot_size: int = 100  # A-shares trade in board lots of 100 shares for buys.
+
     def __init__(self, fees=None):
         if fees is None:
             from config.settings import CN_FEES

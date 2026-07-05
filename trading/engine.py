@@ -1,6 +1,7 @@
 """Trading engine: manages accounts, executes signals, enforces risk limits."""
 
 from __future__ import annotations
+import math
 from .account import VirtualAccount
 from .costs import MoomooAUCosts
 
@@ -20,6 +21,23 @@ class TradingEngine:
         self.costs = costs or MoomooAUCosts()
         self.accounts: dict[str, VirtualAccount] = {}
         self.trade_callback = trade_callback
+
+    def _lot_size(self) -> int:
+        """Minimum board lot for new buy orders.
+
+        US paper trades remain whole-share. CN uses CNCosts.lot_size=100 so new
+        buys cannot create impossible A-share odd lots. Sells are not rounded
+        here: full exits must be able to clear legacy odd-lot positions already
+        present in the live DB.
+        """
+        return int(getattr(self.costs, "lot_size", 1) or 1)
+
+    def _round_buy_shares(self, shares: float) -> int:
+        lot = self._lot_size()
+        whole = math.floor(float(shares))
+        if lot <= 1:
+            return whole
+        return (whole // lot) * lot
 
     def create_account(self, name: str, initial_cash: float = 1000.0) -> VirtualAccount:
         acct = VirtualAccount(initial_cash=initial_cash, costs=self.costs)
@@ -42,6 +60,9 @@ class TradingEngine:
         current_prices = prices or {}
 
         if side == "buy":
+            shares = self._round_buy_shares(shares)
+            if shares <= 0:
+                return None
             # Check max position concentration
             equity = acct.get_equity(current_prices)
             if equity <= 0:
@@ -57,7 +78,7 @@ class TradingEngine:
                 max_value = self.max_position_pct * equity - existing_value
                 if max_value <= 0:
                     return None
-                shares = int(max_value / exec_price)
+                shares = self._round_buy_shares(max_value / exec_price)
                 if shares <= 0:
                     return None
             result = acct.buy(ticker, shares, price)
