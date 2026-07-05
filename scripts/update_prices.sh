@@ -22,6 +22,14 @@ PYTHON=/home/gexin/quant-trading/venv/bin/python
 # overlap a main.py cycle (which races on positions/cash and can roll back
 # our stop-loss writes). Wait up to 8s; if a long cycle is still running,
 # skip this tick rather than block.
+#
+# Hard wall-clock guard: realtime quote providers (especially akshare/Sina for
+# CN) can occasionally hang inside a worker thread. Without an OS-level timeout
+# the Python process can hold /tmp/quant_run_cycle.lock indefinitely and freeze
+# both price updates and trading cycles. `timeout` kills the child and releases
+# the flock; the next cron tick can retry.
+TIMEOUT_SECONDS=${QUANT_UPDATE_TIMEOUT_SECONDS:-110}
 exec /usr/bin/flock -w 8 /tmp/quant_run_cycle.lock \
+    /usr/bin/timeout --kill-after=15s "${TIMEOUT_SECONDS}s" \
     "$PYTHON" -m scripts.update_prices \
     >> /home/gexin/quant-trading/logs/update_prices.log 2>&1

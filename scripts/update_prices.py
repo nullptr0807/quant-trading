@@ -153,6 +153,15 @@ def fetch_quotes(tickers: list[str]) -> dict[str, float]:
     return prices
 
 
+def _force_price_update() -> bool:
+    """Manual repair mode: refresh prices/snapshots outside market hours.
+
+    This must NOT make the stop-loss path think the market is tradeable; forced
+    refresh is for stale snapshot repair only, not for weekend/off-hours sells.
+    """
+    return os.environ.get("QUANT_FORCE_PRICE_UPDATE") == "1"
+
+
 def _is_us_market_hours_now() -> bool:
     """US extended hours: Mon-Fri 04:00-20:00 ET. Mirrors main.is_market_hours()."""
     now = datetime.now(timezone.utc)
@@ -410,9 +419,41 @@ def update_equity_snapshots(db_path: str = DB_PATH) -> dict:
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    held = [r[0] for r in cur.execute("SELECT DISTINCT ticker FROM positions").fetchall()]
+    us_open = _is_us_market_hours_now()
+    cn_open = _is_cn_market_hours_now()
+    force_update = _force_price_update()
+    fetch_us = us_open or force_update
+    fetch_cn = cn_open or force_update
+    LOG.info(
+        "market-hours gate: US_open=%s CN_open=%s force_update=%s",
+        us_open, cn_open, force_update,
+    )
+
+    # Fetch quotes only for markets whose snapshots/trades can be written on
+    # this tick. The old path fetched every held US+CN ticker before checking
+    # market hours; during CN-only windows it still spent time on US, and during
+    # US-only windows a hung CN quote provider could block US snapshots. Keep
+    # the quote universe aligned with the markets that are actually open.
+    # QUANT_FORCE_PRICE_UPDATE=1 is a repair-only override for stale snapshots;
+    # it refreshes prices without allowing off-hours stop-loss sells.
+    held = [
+        r[0]
+        for r in cur.execute(
+            """
+            SELECT DISTINCT p.ticker
+            FROM positions p
+            LEFT JOIN account_meta m ON m.account_id = p.account
+            WHERE COALESCE(m.status, 'active') != 'retired'
+              AND (
+                    (COALESCE(m.market, p.market, 'US') = 'US' AND ?)
+                 OR (COALESCE(m.market, p.market, 'US') = 'CN' AND ?)
+              )
+            """,
+            (1 if fetch_us else 0, 1 if fetch_cn else 0),
+        ).fetchall()
+    ]
     if not held:
-        LOG.info("No positions found — nothing to update.")
+        LOG.info("No open-market active positions found — nothing to update.")
         return {"accounts_updated": 0, "tickers": 0}
 
     t0 = time.time()
@@ -459,9 +500,6 @@ def update_equity_snapshots(db_path: str = DB_PATH) -> dict:
         market_by_acct[r["account_id"]] = r["market"]
         if r["status"] == "retired":
             retired_accts.add(r["account_id"])
-    us_open = _is_us_market_hours_now()
-    cn_open = _is_cn_market_hours_now()
-    LOG.info("market-hours gate: US_open=%s CN_open=%s", us_open, cn_open)
     skipped_by_market: dict[str, int] = {}
     skipped_retired = 0
     # include accounts with no positions (all-cash) so snapshot keeps refreshing
@@ -474,10 +512,10 @@ def update_equity_snapshots(db_path: str = DB_PATH) -> dict:
         # static equity when the market is closed (price unchanged) fills
         # the equity curve with hundreds of identical points per hour and
         # visually squashes earlier, real trading days.
-        if market == "US" and not us_open:
+        if market == "US" and not fetch_us:
             skipped_by_market["US"] = skipped_by_market.get("US", 0) + 1
             continue
-        if market == "CN" and not cn_open:
+        if market == "CN" and not fetch_cn:
             skipped_by_market["CN"] = skipped_by_market.get("CN", 0) + 1
             continue
 

@@ -13,7 +13,7 @@ akshare quirk: column headers are Chinese; we rename to lowercase OHLCV.
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -229,10 +229,33 @@ class CNDataFetcher:
         out: dict[str, float] = {}
         # SINA quote endpoint tolerates parallelism: 16 workers brings 65
         # tickers from ~29s to ~7s, comfortably under a 1-minute cron tick.
-        with ThreadPoolExecutor(max_workers=16) as ex_pool:
-            for tk, px in ex_pool.map(_one, tickers):
+        # Never let one stuck akshare/Sina request stall the whole updater.
+        # ThreadPoolExecutor.map waits for every future in input order and the
+        # executor context waits for all workers on exit; a single hung HTTP
+        # call previously held /tmp/quant_run_cycle.lock for days. Use
+        # as_completed with a bounded total budget and shutdown without waiting
+        # so partial quote coverage can still refresh unaffected accounts.
+        timeout_s = 45.0
+        ex_pool = ThreadPoolExecutor(max_workers=16)
+        futures = {ex_pool.submit(_one, tk): tk for tk in tickers}
+        try:
+            for fut in as_completed(futures, timeout=timeout_s):
+                tk = futures[fut]
+                try:
+                    _, px = fut.result(timeout=0)
+                except Exception as e:
+                    log.debug("CN realtime fetch %s failed: %s", tk, e)
+                    continue
                 if px is not None:
                     out[tk] = px
+        except FuturesTimeoutError:
+            pending = sum(1 for fut in futures if not fut.done())
+            log.warning(
+                "CN realtime fetch timed out after %.0fs: %d/%d still pending",
+                timeout_s, pending, len(tickers),
+            )
+        finally:
+            ex_pool.shutdown(wait=False, cancel_futures=True)
         if out:
             log.info("Fetched CN realtime via akshare for %d/%d tickers",
                      len(out), len(tickers))
