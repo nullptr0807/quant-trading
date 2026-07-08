@@ -194,16 +194,24 @@ def check_model_factor_freshness(con: sqlite3.Connection) -> list[dict]:
             lag = _lag_days(latest_px, max_date)
             if not max_date:
                 issues.append({"severity": "critical", "check": "qlib_factor", "account": acct, "detail": "missing persisted score"})
-            elif lag is not None and lag > 3:
-                issues.append({
-                    "severity": "critical" if lag > 7 else "warning",
-                    "check": "qlib_factor",
-                    "account": acct,
-                    "factor_date": max_date,
-                    "latest_price_date": latest_px,
-                    "lag_days": lag,
-                    "tickers": row["tickers"],
-                })
+            else:
+                # Mirror main.py::_load_qlib_scores live-trading stale gate:
+                # US Q scores may lag latest 1d prices by at most 2 calendar
+                # days; CN allows 3 for exchange-calendar/provider lag.  Health
+                # must warn before or exactly when live Q accounts would no-op.
+                max_lag = 3 if market == "CN" else 2
+                if lag is not None and lag > max_lag:
+                    issues.append({
+                        "severity": "critical" if lag > max_lag + 4 else "warning",
+                        "check": "qlib_factor",
+                        "account": acct,
+                        "market": market,
+                        "factor_date": max_date,
+                        "latest_price_date": latest_px,
+                        "lag_days": lag,
+                        "max_lag_days": max_lag,
+                        "tickers": row["tickers"],
+                    })
             continue
 
         mined = fmgp.get(acct) if grp == "F" else legacy.get(acct)

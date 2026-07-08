@@ -122,3 +122,71 @@ def test_health_check_accepts_group_pk(tmp_path):
     )
 
     assert check_schema(con) == []
+
+
+def test_health_check_qlib_threshold_matches_live_us_gate(tmp_path):
+    from scripts.health_check import check_model_factor_freshness
+
+    con = sqlite3.connect(tmp_path / "health.db")
+    con.row_factory = sqlite3.Row
+    con.executescript(
+        """
+        CREATE TABLE account_meta (account_id TEXT, market TEXT, "group" TEXT, status TEXT);
+        CREATE TABLE account_state (account TEXT, market TEXT);
+        CREATE TABLE positions (account TEXT, market TEXT);
+        CREATE TABLE trades (account TEXT, market TEXT);
+        CREATE TABLE accounts (name TEXT, market TEXT);
+        CREATE TABLE prices (ticker TEXT, datetime TEXT, interval TEXT);
+        CREATE TABLE factor_values (
+            ticker TEXT NOT NULL,
+            date TEXT NOT NULL,
+            factor_name TEXT NOT NULL,
+            value REAL,
+            factor_group TEXT NOT NULL DEFAULT 'alpha158',
+            PRIMARY KEY (ticker, date, factor_name, factor_group)
+        );
+        """
+    )
+    con.execute("INSERT INTO account_meta VALUES ('Q01','US','Q','active')")
+    con.execute("INSERT INTO account_state VALUES ('Q01','US')")
+    con.execute("INSERT INTO prices VALUES ('AAPL','2026-07-07','1d')")
+    con.execute("INSERT INTO factor_values VALUES ('AAPL','2026-07-04','qlib_Q01_score',1.0,'qlib')")
+
+    issues = check_model_factor_freshness(con)
+
+    assert issues
+    assert issues[0]["check"] == "qlib_factor"
+    assert issues[0]["market"] == "US"
+    assert issues[0]["lag_days"] == 3
+    assert issues[0]["max_lag_days"] == 2
+
+
+def test_health_check_qlib_threshold_allows_cn_three_day_lag(tmp_path):
+    from scripts.health_check import check_model_factor_freshness
+
+    con = sqlite3.connect(tmp_path / "health_cn.db")
+    con.row_factory = sqlite3.Row
+    con.executescript(
+        """
+        CREATE TABLE account_meta (account_id TEXT, market TEXT, "group" TEXT, status TEXT);
+        CREATE TABLE account_state (account TEXT, market TEXT);
+        CREATE TABLE positions (account TEXT, market TEXT);
+        CREATE TABLE trades (account TEXT, market TEXT);
+        CREATE TABLE accounts (name TEXT, market TEXT);
+        CREATE TABLE prices (ticker TEXT, datetime TEXT, interval TEXT);
+        CREATE TABLE factor_values (
+            ticker TEXT NOT NULL,
+            date TEXT NOT NULL,
+            factor_name TEXT NOT NULL,
+            value REAL,
+            factor_group TEXT NOT NULL DEFAULT 'alpha158',
+            PRIMARY KEY (ticker, date, factor_name, factor_group)
+        );
+        """
+    )
+    con.execute("INSERT INTO account_meta VALUES ('CQ01','CN','Q','active')")
+    con.execute("INSERT INTO account_state VALUES ('CQ01','CN')")
+    con.execute("INSERT INTO prices VALUES ('000001.SZ','2026-07-07','1d')")
+    con.execute("INSERT INTO factor_values VALUES ('000001.SZ','2026-07-04','qlib_Q01_score',1.0,'qlib')")
+
+    assert check_model_factor_freshness(con) == []
