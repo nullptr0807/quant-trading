@@ -174,6 +174,12 @@ class DataFetcher:
         # Intraday intervals: include pre/post-market bars so dashboard +
         # benchmark curves cover 04:00-20:00 ET, not just RTH.
         prepost = interval in ("1m", "2m", "5m", "15m", "30m", "60m", "1h", "90m")
+        # yfinance logs per-symbol "possibly delisted" messages at ERROR level
+        # through its own logger even when the batch succeeds for >99% of names.
+        # Silence that third-party noise here; we log structured coverage below.
+        yf_logger = logging.getLogger("yfinance")
+        old_yf_level = yf_logger.level
+        yf_logger.setLevel(logging.CRITICAL)
         try:
             raw = yf.download(
                 tickers, start=start, end=end, interval=interval,
@@ -183,6 +189,8 @@ class DataFetcher:
         except Exception as e:
             log.error("yf.download batch failed: %s", e)
             return pd.DataFrame(columns=["datetime", "ticker", "open", "high", "low", "close", "volume"])
+        finally:
+            yf_logger.setLevel(old_yf_level)
 
         frames = []
         if len(tickers) == 1:

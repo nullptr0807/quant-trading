@@ -60,9 +60,11 @@ def run_export(market: str) -> int:
 
 def run_one_model(model_id: str, market: str,
                   train_days: int, valid_days: int, predict_days: int,
-                  log_dir: Path) -> dict:
+                  log_dir: Path,
+                  model_timeout_seconds: int | None = None) -> dict:
     """Run one model in a subprocess. Stream stdout to log file."""
-    log.info("[%s] training... (subprocess)", model_id)
+    log.info("[%s] training... (subprocess, timeout=%s)",
+             model_id, model_timeout_seconds or "none")
     t0 = time.time()
     log_file = log_dir / f"{model_id}.log"
 
@@ -74,24 +76,45 @@ def run_one_model(model_id: str, market: str,
         "--valid-days", str(valid_days),
         "--predict-days", str(predict_days),
     ]
+    returncode = 0
+    timed_out = False
     with log_file.open("w") as lf:
         lf.write(f"# {datetime.now(timezone.utc).isoformat()}\n")
         lf.write(f"# cmd: {' '.join(cmd)}\n")
+        lf.write(f"# timeout_seconds: {model_timeout_seconds or 'none'}\n")
         lf.flush()
-        r = subprocess.run(cmd, cwd=PROJECT_ROOT, stdout=lf, stderr=subprocess.STDOUT)
+        try:
+            r = subprocess.run(
+                cmd,
+                cwd=PROJECT_ROOT,
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                timeout=model_timeout_seconds,
+            )
+            returncode = r.returncode
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            returncode = 124
+            lf.write(
+                f"\n# TIMEOUT after {model_timeout_seconds}s at "
+                f"{datetime.now(timezone.utc).isoformat()}\n"
+            )
+            lf.flush()
     elapsed = time.time() - t0
 
     summary = {
         "model_id": model_id,
         "elapsed_s": round(elapsed, 1),
-        "exit_code": r.returncode,
+        "exit_code": returncode,
+        "timed_out": timed_out,
         "log_file": str(log_file),
     }
-    if r.returncode != 0:
+    if returncode != 0:
         # Tail log for inline error visibility
         tail = log_file.read_text().splitlines()[-15:]
-        log.error("[%s] FAILED in %.1fs (exit=%d). Tail:\n  %s",
-                  model_id, elapsed, r.returncode, "\n  ".join(tail))
+        log.error("[%s] FAILED in %.1fs (exit=%d%s). Tail:\n  %s",
+                  model_id, elapsed, returncode,
+                  ", timeout" if timed_out else "", "\n  ".join(tail))
     else:
         log.info("[%s] OK in %.1fs", model_id, elapsed)
     return summary
@@ -105,6 +128,9 @@ def main():
     p.add_argument("--train-days", type=int, default=360)
     p.add_argument("--valid-days", type=int, default=60)
     p.add_argument("--predict-days", type=int, default=5)
+    p.add_argument("--model-timeout-seconds", type=int,
+                   default=int(os.environ.get("QLIB_MODEL_TIMEOUT_SECONDS", "10800")),
+                   help="per-model subprocess timeout; default 10800s (3h)")
     p.add_argument("--skip-export", action="store_true",
                    help="reuse existing ~/.qlib/qlib_data/<market>_data dir")
     args = p.parse_args()
@@ -139,6 +165,7 @@ def main():
             mid, args.market,
             args.train_days, args.valid_days, args.predict_days,
             log_dir,
+            args.model_timeout_seconds,
         )
         summaries.append(s)
 

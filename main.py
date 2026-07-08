@@ -752,12 +752,27 @@ class QuantSystem:
         """Fetch real-time prices via the market-aware fetcher.
 
         US fetcher uses yfinance fast_info → Finnhub fallback; CN fetcher
-        uses akshare's 1-minute bar. Both routes converge here so main.py
-        and scripts/update_prices.py write equity off the SAME price source
-        — without this they disagreed and the equity curve ping-ponged.
+        uses akshare/Sina. Both routes converge here so main.py and
+        scripts/update_prices.py write equity off the SAME price source.
+
+        Important: live portfolios can contain legacy/non-universe holdings
+        after universe rotation (e.g. ARM after Russell-1000 refresh).  Fetch
+        universe + active held tickers + benchmarks, otherwise the trading
+        cycle can successfully trade from universe prices but skip equity
+        snapshots for accounts holding legacy symbols.
         """
+        tickers = set(self.universe)
+        retired = self._retired_accounts()
+        for acct_id, acct in self.engine.accounts.items():
+            if acct_id in retired:
+                continue
+            for ticker, pos in acct._positions.items():
+                if pos.shares > 0:
+                    tickers.add(ticker)
+        for bm in self.benchmarks:
+            tickers.add(bm["ticker"])
         try:
-            prices = self.fetcher.get_realtime_quotes(self.universe)
+            prices = self.fetcher.get_realtime_quotes(sorted(tickers))
         except Exception as e:
             log.warning("realtime quote fetch failed: %s", e)
             return {}
@@ -796,10 +811,22 @@ class QuantSystem:
         return prices
 
     # -- Step 1: Fetch data -------------------------------------------------
+    def _alpha_history_days(self) -> int:
+        """History length for live Alpha158 factor computation.
+
+        Alpha158 includes 20-trading-day rolling factors (ROC_20,
+        MA_RATIO_20, STD_20, BBPOS_20, BETA_20, etc.). The old 30 calendar-day
+        window can shrink to ~19-21 trading bars after weekends/holidays/data
+        gaps, so 20d factors silently became NaN and stopped updating. Use 90
+        calendar days for a stable warm-up while keeping the live cycle cheap.
+        """
+        return 90
+
     def fetch_data(self):
-        """Download 30-day historical data for all tickers."""
-        log.info("Fetching historical data for %d tickers...", len(self.universe))
-        raw_df = self.fetcher.get_historical(self.universe, days=30)
+        """Download historical data with enough warm-up for Alpha158 factors."""
+        days = self._alpha_history_days()
+        log.info("Fetching %d-day historical data for %d tickers...", days, len(self.universe))
+        raw_df = self.fetcher.get_historical(self.universe, days=days)
 
         # Split concatenated DataFrame into per-ticker dict
         self._historical_data = {}
@@ -812,8 +839,8 @@ class QuantSystem:
         self._last_data_fetch = datetime.now(timezone.utc)
         emit_event(
             "data",
-            f"📡 Data refresh [{self.market}]: {len(self._historical_data)}/{len(self.universe)} tickers (30d)",
-            detail={"got": len(self._historical_data), "total": len(self.universe)},
+            f"📡 Data refresh [{self.market}]: {len(self._historical_data)}/{len(self.universe)} tickers ({days}d)",
+            detail={"got": len(self._historical_data), "total": len(self.universe), "days": days},
             market=self.market,
         )
 
@@ -870,6 +897,29 @@ class QuantSystem:
         days = self._gp_compute_history_days()
         if days <= 30:
             return self._historical_data
+
+        # fetch_data() now uses the same 90d warm-up required by FactorMiner's
+        # nested 20d terminals, so the GP/F application path should normally
+        # reuse it.  Avoid a second 1000-ticker yfinance pull inside the same
+        # cycle; that duplicate fetch was a major reason cycles overran before
+        # factor writes could be observed clearly.
+        min_rows = max(1, int(days * 0.45))
+        if self._historical_data:
+            lengths = [len(df) for df in self._historical_data.values() if df is not None]
+            # A few stale/delisted/legacy symbols can have shorter histories; do
+            # not let them force a second 1000-ticker download. If the universe
+            # as a whole has a 90d-ish window, GP/F should reuse it and simply
+            # skip/NaN sparse tickers during factor construction.
+            good = sum(1 for n in lengths if n >= min_rows)
+            if lengths and good >= max(1, int(len(self.universe) * 0.90)):
+                log.info(
+                    "Reusing %d-day fetch_data history for GP/F-family factor application "
+                    "(%d/%d tickers >= %d rows; min=%d median=%d)",
+                    days, good, len(self.universe), min_rows, min(lengths),
+                    sorted(lengths)[len(lengths) // 2],
+                )
+                return self._historical_data
+
         try:
             log.info("Fetching %d-day history for GP/F-family factor application...", days)
             raw_df = self.fetcher.get_historical(self.universe, days=days)
@@ -1395,6 +1445,50 @@ class QuantSystem:
             if not latest:
                 conn.close()
                 return []
+
+            # Safety gate: never trade Q accounts on stale ML scores.  The date
+            # check is relative to the latest available 1d price date for this
+            # market (not wall-clock today) so weekends/holidays do not create
+            # false positives.  If retrain/export stops advancing while prices
+            # keep advancing, the account no-ops instead of silently reusing old
+            # weights.  US gets a tighter window; CN allows an extra day for
+            # exchange-calendar / data-provider lag.
+            price_row = conn.execute(
+                f"SELECT MAX(substr(datetime,1,10)) FROM prices "
+                f"WHERE interval='1d' AND ticker IN ({placeholders})",
+                tuple(uni_list),
+            ).fetchone()
+            latest_price_date = price_row[0] if price_row else None
+            if latest_price_date:
+                from datetime import date as _date
+                score_date = _date.fromisoformat(str(latest)[:10])
+                px_date = _date.fromisoformat(str(latest_price_date)[:10])
+                lag_days = (px_date - score_date).days
+                max_lag = 3 if self.market == "CN" else 2
+                if lag_days > max_lag:
+                    conn.close()
+                    msg = (
+                        f"[{q_id}] stale qlib scores: factor_name={factor_name} "
+                        f"score_date={latest} latest_price_date={latest_price_date} "
+                        f"lag_days={lag_days} max_lag={max_lag}; skipping Qlib trading"
+                    )
+                    log.error(msg)
+                    emit_event(
+                        "factor",
+                        f"⚠️ Stale Qlib score skipped: {q_id}",
+                        severity="error",
+                        account=q_id,
+                        detail={
+                            "factor_name": factor_name,
+                            "score_date": latest,
+                            "latest_price_date": latest_price_date,
+                            "lag_days": lag_days,
+                            "max_lag": max_lag,
+                        },
+                        market=self.market,
+                    )
+                    return []
+
             rows = conn.execute(
                 f"SELECT ticker, value FROM factor_values "
                 f"WHERE factor_name=? AND date=? AND value IS NOT NULL "

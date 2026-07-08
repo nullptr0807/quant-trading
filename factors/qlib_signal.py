@@ -7,9 +7,11 @@ to do one model's worth of work and exit. The orchestrator never holds more
 than one trained model in RAM.
 
 Output: predictions written to `factor_values` table:
-    group = f"qlib_{model_id}"
-    factor_name = "score"
-    one row per (ticker, date) — typically the latest trading day.
+    factor_group = "qlib"
+    factor_name = f"qlib_{model_id}_score"   # e.g. qlib_Q08_score
+    PRIMARY KEY includes (ticker, date, factor_name, factor_group), so Qlib,
+    GP, FactorMiner, and Alpha158 rows cannot overwrite each other.
+    one row per (ticker, date, model) — typically the latest trading day.
 
 Reads: ~/.qlib/qlib_data/us_data (built by factors/qlib_export.py).
 """
@@ -381,7 +383,25 @@ def init_qlib(market: str = "US"):
     from qlib.constant import REG_US, REG_CN
     region = REG_CN if market == "CN" else REG_US
     provider_uri = QLIB_CN_DIR if market == "CN" else QLIB_US_DIR
-    qlib.init(provider_uri=provider_uri, region=region)
+
+    # Qlib's default MLflow experiment manager writes under ./mlruns. When daily
+    # US/CN retrains or retries overlap, the shared tracking store has produced
+    # intermittent `sqlite3.OperationalError: database is locked` failures. The
+    # model artifacts we actually depend on are saved separately under
+    # data/qlib_checkpoints, so give each subprocess an isolated temp MLflow URI.
+    tracking_uri = os.environ.get(
+        "QLIB_MLFLOW_URI",
+        f"file:/tmp/quant_qlib_mlruns/{market.lower()}_{os.getpid()}",
+    )
+    exp_manager = {
+        "class": "MLflowExpManager",
+        "module_path": "qlib.workflow.expm",
+        "kwargs": {
+            "uri": tracking_uri,
+            "default_exp_name": f"QuantQlib-{market}",
+        },
+    }
+    qlib.init(provider_uri=provider_uri, region=region, exp_manager=exp_manager)
 
 
 def train_and_predict(spec: ModelSpec,
@@ -447,7 +467,16 @@ def train_and_predict(spec: ModelSpec,
     Cls = _import_class(spec.model_class)
     model = Cls(**spec.model_kwargs)
     t0 = time.time()
-    model.fit(dataset)
+    # Several qlib PyTorch models call R.get_recorder() inside fit().  Without
+    # an explicit experiment context they fail with "No valid experiment has
+    # been found" even when qlib.init() configured an exp_manager.  Wrap all
+    # fits in R.start() so GBDT/linear models share the same safe path and
+    # recorder-hungry GRU/Transformer/ALSTM models always have a context.
+    from qlib.workflow import R
+    exp_name = f"QuantQlib-{market}"
+    rec_name = f"{spec.id}_{int(time.time())}_{os.getpid()}"
+    with R.start(experiment_name=exp_name, recorder_name=rec_name):
+        model.fit(dataset)
     log.info("[%s] fit: %.1fs", spec.id, time.time() - t0)
 
     t0 = time.time()
@@ -497,16 +526,29 @@ def write_predictions_to_db(spec: ModelSpec, pred, market: str = "US") -> int:
         log.warning("[%s] all scores NaN", spec.id)
         return 0
 
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        conn.executemany(
-            "INSERT OR REPLACE INTO factor_values "
-            "(ticker, date, factor_name, value, factor_group) VALUES (?, ?, ?, ?, ?)",
-            rows,
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    for attempt in range(5):
+        conn = sqlite3.connect(DB_PATH, timeout=60)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=60000")
+            conn.executemany(
+                "INSERT OR REPLACE INTO factor_values "
+                "(ticker, date, factor_name, value, factor_group) VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+            break
+        except sqlite3.OperationalError as e:
+            conn.rollback()
+            if "locked" not in str(e).lower() or attempt == 4:
+                raise
+            wait = min(2 ** attempt, 10)
+            log.warning("[%s] factor_values locked while writing qlib scores; retry %d/5 in %ss",
+                        spec.id, attempt + 1, wait)
+            time.sleep(wait)
+        finally:
+            conn.close()
     log.info("[%s] wrote %d rows to factor_values factor_name=%s",
              spec.id, len(rows), factor_name)
     return len(rows)

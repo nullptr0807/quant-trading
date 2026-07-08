@@ -3,9 +3,13 @@
 import sqlite3
 import json
 import os
+import time
+import logging
 from datetime import datetime, timezone
 
 import pandas as pd
+
+log = logging.getLogger("quant.store")
 
 DB_PATH = os.path.expanduser("~/quant-trading/data/trading.db")
 
@@ -95,14 +99,14 @@ def init_db(db_path: str | None = None):
     )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_poshist_acct ON positions_history(account, timestamp)")
 
-    # 因子值（按ticker/日期存储）
+    # 因子值（按ticker/日期/group/factor存储）
     c.execute("""CREATE TABLE IF NOT EXISTS factor_values (
         ticker TEXT NOT NULL,
         date TEXT NOT NULL,
         factor_name TEXT NOT NULL,
         value REAL,
-        factor_group TEXT DEFAULT 'alpha158',
-        PRIMARY KEY (ticker, date, factor_name)
+        factor_group TEXT NOT NULL DEFAULT 'alpha158',
+        PRIMARY KEY (ticker, date, factor_name, factor_group)
     )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_fv_date ON factor_values(date)")
 
@@ -156,12 +160,21 @@ class DataStore:
                  row["open"], row["high"], row["low"], row["close"], row["volume"])
                 for idx, row in df.iterrows()
             ]
-        conn.executemany(
-            "INSERT OR REPLACE INTO prices (ticker,datetime,interval,open,high,low,close,volume) "
-            "VALUES (?,?,?,?,?,?,?,?)", rows,
-        )
-        conn.commit()
-        conn.close()
+        try:
+            for attempt in range(3):
+                try:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO prices (ticker,datetime,interval,open,high,low,close,volume) "
+                        "VALUES (?,?,?,?,?,?,?,?)", rows,
+                    )
+                    conn.commit()
+                    break
+                except sqlite3.OperationalError as e:
+                    if "locked" not in str(e).lower() or attempt == 2:
+                        raise
+                    time.sleep(2 ** attempt)
+        finally:
+            conn.close()
 
     def save_prices_bulk(self, df: pd.DataFrame, interval: str = "1d"):
         """Bulk save. df must have columns: ticker, datetime, open, high, low, close, volume."""
@@ -173,12 +186,21 @@ class DataStore:
              r["open"], r["high"], r["low"], r["close"], r["volume"])
             for _, r in df.iterrows()
         ]
-        conn.executemany(
-            "INSERT OR REPLACE INTO prices (ticker,datetime,interval,open,high,low,close,volume) "
-            "VALUES (?,?,?,?,?,?,?,?)", rows,
-        )
-        conn.commit()
-        conn.close()
+        try:
+            for attempt in range(3):
+                try:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO prices (ticker,datetime,interval,open,high,low,close,volume) "
+                        "VALUES (?,?,?,?,?,?,?,?)", rows,
+                    )
+                    conn.commit()
+                    break
+                except sqlite3.OperationalError as e:
+                    if "locked" not in str(e).lower() or attempt == 2:
+                        raise
+                    time.sleep(2 ** attempt)
+        finally:
+            conn.close()
 
     def load_prices(self, tickers: list[str], start: str, end: str,
                     interval: str = "1d",
@@ -425,23 +447,55 @@ class DataStore:
         conn.close()
 
     def save_factor_df(self, factor_dict: dict, group: str = "alpha158"):
-        """Save factors from {ticker: DataFrame} dict. DataFrame columns = factor names."""
-        conn = self._conn()
+        """Save factors from {ticker: DataFrame} dict. DataFrame columns = factor names.
+
+        Bulk-written with observability. The old row-by-row nested execute loop
+        made large Alpha158 writes slow and opaque; if a cron wrapper killed the
+        process later, logs only said "Computed factors" without proving the DB
+        write landed. This method now logs the attempted row count, coverage, max
+        factor date, and elapsed write time.
+        """
+        t0 = time.time()
+        rows: list[tuple[str, str, str, float, str]] = []
+        tickers_seen = 0
+        min_date = None
+        max_date = None
         for ticker, df in factor_dict.items():
             if df is None or df.empty:
                 continue
+            tickers_seen += 1
             for idx, row in df.iterrows():
                 date_str = str(idx)[:10]  # YYYY-MM-DD
+                min_date = date_str if min_date is None else min(min_date, date_str)
+                max_date = date_str if max_date is None else max(max_date, date_str)
                 for col in df.columns:
                     val = row[col]
                     if val is not None and pd.notna(val):
-                        conn.execute(
-                            "INSERT OR REPLACE INTO factor_values (ticker,date,factor_name,value,factor_group) "
-                            "VALUES (?,?,?,?,?)",
-                            (ticker, date_str, col, float(val), group),
-                        )
-        conn.commit()
-        conn.close()
+                        rows.append((ticker, date_str, col, float(val), group))
+
+        if not rows:
+            log.warning(
+                "save_factor_df group=%s: no non-NaN factor rows (tickers=%d)",
+                group, tickers_seen,
+            )
+            return {"rows": 0, "tickers": tickers_seen, "min_date": min_date, "max_date": max_date}
+
+        conn = self._conn()
+        try:
+            conn.executemany(
+                "INSERT OR REPLACE INTO factor_values (ticker,date,factor_name,value,factor_group) "
+                "VALUES (?,?,?,?,?)",
+                rows,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        elapsed = time.time() - t0
+        log.info(
+            "save_factor_df group=%s wrote rows=%d tickers=%d dates=%s..%s elapsed=%.1fs",
+            group, len(rows), tickers_seen, min_date, max_date, elapsed,
+        )
+        return {"rows": len(rows), "tickers": tickers_seen, "min_date": min_date, "max_date": max_date, "elapsed_s": elapsed}
 
     def get_factor_values(self, ticker: str, date: str | None = None,
                           group: str | None = None) -> pd.DataFrame:

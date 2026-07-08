@@ -11,8 +11,10 @@ if [ "$DOW" -gt 5 ]; then
     exit 0
 fi
 
-# Share a lock with run_cycle_quiet.sh so intra-hour :15/:30/:45 runs can't
-# overlap the hourly report run. -w 30 waits up to 30s for any in-flight run.
-exec /usr/bin/flock -w 30 /tmp/quant_run_cycle.lock -c '
+# Share a lock with run_cycle_quiet.sh and update_prices.sh so trading cycles
+# cannot overlap price snapshots or one another. The OS-level timeout prevents a
+# stuck data provider / model path from holding /tmp/quant_run_cycle.lock forever.
+TIMEOUT_SECONDS=${QUANT_RUN_CYCLE_TIMEOUT_SECONDS:-1200}
+exec /usr/bin/flock -w 30 /tmp/quant_run_cycle.lock \
+    /usr/bin/timeout --kill-after=30s "${TIMEOUT_SECONDS}s" \
     python main.py --cycle-no-report 2>&1
-'

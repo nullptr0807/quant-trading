@@ -163,12 +163,24 @@ def _force_price_update() -> bool:
 
 
 def _is_us_market_hours_now() -> bool:
-    """US extended hours: Mon-Fri 04:00-20:00 ET. Mirrors main.is_market_hours()."""
-    now = datetime.now(timezone.utc)
+    """US extended hours: Mon-Fri 04:00-20:00 ET. Mirrors main.is_market_hours().
+
+    Use America/New_York, not a UTC approximation. The old `8 <= hour or
+    hour < 1` shortcut was wrong around DST and the Sunday→Monday UTC boundary.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        # Conservative fallback: avoid the ambiguous 00:00-01:00 UTC tail.
+        now = datetime.now(timezone.utc)
+        if now.weekday() >= 5:
+            return False
+        return 8 <= now.hour < 24
     if now.weekday() >= 5:
         return False
-    h = now.hour
-    return 8 <= h or h < 1
+    m = now.hour * 60 + now.minute
+    return 4 * 60 <= m < 20 * 60
 
 
 def _is_cn_market_hours_now() -> bool:
@@ -256,7 +268,7 @@ def check_stop_losses(
     """Scan all positions, execute protective sells where pnl <= -stop_loss.
 
     Mutates DB inline (removes position row, updates account_state.cash,
-    inserts trade row). Returns list of executed sells for logging.
+    inserts trade row). Returns list of *committed* sells for logging.
 
     Market-hours guard: simulation mirrors real trading. Outside US extended
     hours we never execute trades — even protective stop-losses wait for the
@@ -348,54 +360,66 @@ def check_stop_losses(
         if triggered_reason is None:
             continue
 
-        # Trigger stop loss
+        # Trigger stop loss. Commit each sell independently: the cron wrapper
+        # has a hard wall-clock timeout, and historically the process could be
+        # killed after logging STOP_LOSS but before the batch-level commit. A
+        # per-sell transaction makes every logged execution durable.
         costs = _costs_for_market(acct_market)
         exec_price = costs.slippage(px, "sell")
         fees = costs.calculate("sell", shares, px)
         proceeds = shares * exec_price - fees["total_fees"]
-
-        # Update cash
-        cash_row = cur.execute(
-            "SELECT cash FROM account_state WHERE account=? AND market=?", (acct, acct_market)
-        ).fetchone()
-        if cash_row is None:
-            LOG.warning("Skip stop-loss %s/%s: no account_state row", acct, ticker)
-            continue
-        new_cash = cash_row["cash"] + proceeds
-        cur.execute(
-            "UPDATE account_state SET cash=?, updated_at=? WHERE account=? AND market=?",
-            (new_cash, now_iso, acct, acct_market),
-        )
-
-        # Remove position
-        cur.execute(
-            "DELETE FROM positions WHERE account=? AND ticker=? AND market=?",
-            (acct, ticker, acct_market),
-        )
-
-        # Record trade
-        cur.execute(
-            "INSERT INTO trades (account, ticker, side, shares, price, cost, slippage, timestamp, market) "
-            "VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, ?)",
-            (acct, ticker, shares, px, fees["total_fees"],
-             (px - exec_price) * shares, now_iso, acct_market),
-        )
-
         pnl_dollar = (proceeds - (avg_cost * shares))
-        _insert_trade_event(
-            cur,
-            now_iso=now_iso,
-            market=acct_market,
-            account=acct,
-            ticker=ticker,
-            shares=shares,
-            price=px,
-            avg_cost=avg_cost,
-            pnl_pct=pnl_pct,
-            pnl_dollar=pnl_dollar,
-            stop_loss=stop_loss,
-            reason=triggered_reason,
-        )
+
+        try:
+            cash_row = cur.execute(
+                "SELECT cash FROM account_state WHERE account=? AND market=?", (acct, acct_market)
+            ).fetchone()
+            if cash_row is None:
+                LOG.warning("Skip stop-loss %s/%s: no account_state row", acct, ticker)
+                continue
+            new_cash = cash_row["cash"] + proceeds
+            cur.execute(
+                "UPDATE account_state SET cash=?, updated_at=? WHERE account=? AND market=?",
+                (new_cash, now_iso, acct, acct_market),
+            )
+
+            cur.execute(
+                "DELETE FROM positions WHERE account=? AND ticker=? AND market=?",
+                (acct, ticker, acct_market),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError(f"expected to delete 1 position row, deleted {cur.rowcount}")
+
+            cur.execute(
+                "INSERT INTO trades (account, ticker, side, shares, price, cost, slippage, timestamp, market) "
+                "VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, ?)",
+                (acct, ticker, shares, px, fees["total_fees"],
+                 (px - exec_price) * shares, now_iso, acct_market),
+            )
+
+            _insert_trade_event(
+                cur,
+                now_iso=now_iso,
+                market=acct_market,
+                account=acct,
+                ticker=ticker,
+                shares=shares,
+                price=px,
+                avg_cost=avg_cost,
+                pnl_pct=pnl_pct,
+                pnl_dollar=pnl_dollar,
+                stop_loss=stop_loss,
+                reason=triggered_reason,
+            )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            LOG.error(
+                "%s commit failed [%s/%s] %s: %.0f sh @ %s%.2f (%s)",
+                triggered_reason.upper(), acct_market, acct, ticker, shares,
+                _currency_symbol(acct_market), px, e,
+            )
+            continue
 
         executed.append({
             "account": acct, "ticker": ticker, "shares": shares,
@@ -404,7 +428,7 @@ def check_stop_losses(
             "detail": triggered_msg,
         })
         LOG.warning(
-            "%s [%s/%s] %s: %.0f sh @ %s%.2f (cost %s%.2f, %s)",
+            "%s COMMITTED [%s/%s] %s: %.0f sh @ %s%.2f (cost %s%.2f, %s)",
             triggered_reason.upper(), acct_market, acct, ticker, shares,
             _currency_symbol(acct_market), px, _currency_symbol(acct_market), avg_cost,
             triggered_msg,
@@ -415,8 +439,11 @@ def check_stop_losses(
 
 def update_equity_snapshots(db_path: str = DB_PATH) -> dict:
     """Main entry point."""
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     cur = conn.cursor()
 
     us_open = _is_us_market_hours_now()

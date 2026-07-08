@@ -43,7 +43,11 @@ log = logging.getLogger("qlib_export")
 
 
 def _connect():
-    conn = sqlite3.connect(DB_PATH)
+    # Export is read-heavy and can overlap dashboard/realtime writers. Use WAL +
+    # a generous busy timeout so transient writes don't abort the whole retrain.
+    conn = sqlite3.connect(DB_PATH, timeout=60)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=60000")
     conn.row_factory = sqlite3.Row
     return conn
 

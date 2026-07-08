@@ -13,6 +13,8 @@ akshare quirk: column headers are Chinese; we rename to lowercase OHLCV.
 from __future__ import annotations
 
 import logging
+import re
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from datetime import datetime, timedelta, timezone
 
@@ -192,30 +194,106 @@ class CNDataFetcher:
         self.store.save_prices_bulk(merged, interval=interval)
         return merged
 
-    # ── Realtime quotes (akshare 1-minute bar) ──────────────────────────────
+    # ── Realtime quotes (Sina batch → akshare 1-minute fallback) ─────────────
+
+    @staticmethod
+    def _sina_symbol(ticker: str) -> str:
+        """'600519.SH' → 'sh600519'; '000001.SZ' → 'sz000001'."""
+        code, suffix = _split_code(ticker)
+        return suffix + code
+
+    @staticmethod
+    def _parse_sina_price(payload: str) -> float | None:
+        """Parse one hq.sinajs.cn quote payload into a last price.
+
+        Stock rows are:
+          name,open,prev_close,current,high,low,...,date,time,...
+        Index rows (e.g. sh000300) are:
+          name,current,prev_close,current,high,low,...
+        Prefer field[3] for normal stocks; fall back to field[1] for indices.
+        """
+        if not payload:
+            return None
+        fields = payload.split(",")
+        for idx in (3, 1):
+            if len(fields) <= idx:
+                continue
+            try:
+                px = float(fields[idx])
+            except Exception:
+                continue
+            if px > 0:
+                return px
+        return None
+
+    def _fetch_sina_batch(self, tickers: list[str], timeout_s: float = 8.0) -> dict[str, float]:
+        """Fetch CN realtime quotes in one HTTP call via hq.sinajs.cn.
+
+        This replaces the old one-akshare-call-per-ticker realtime path. For the
+        current CN live book (~88 held tickers), the batch endpoint returns full
+        coverage in <1s instead of timing out after 45s with partial coverage.
+        """
+        if not tickers:
+            return {}
+        symbols = [self._sina_symbol(tk) for tk in tickers]
+        url = "https://hq.sinajs.cn/list=" + ",".join(symbols)
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Referer": "https://finance.sina.com.cn",
+                "User-Agent": "Mozilla/5.0",
+            },
+        )
+        try:
+            raw = urllib.request.urlopen(req, timeout=timeout_s).read()
+            text = raw.decode("gbk", errors="replace")
+        except Exception as e:
+            log.warning("CN Sina batch quote failed: %s", e)
+            return {}
+
+        out: dict[str, float] = {}
+        for ticker, symbol in zip(tickers, symbols):
+            m = re.search(rf'var hq_str_{re.escape(symbol)}="([^"]*)";', text)
+            if not m:
+                continue
+            px = self._parse_sina_price(m.group(1))
+            if px is not None:
+                out[ticker] = px
+        if out:
+            log.info("Fetched CN realtime via Sina batch for %d/%d tickers", len(out), len(tickers))
+        return out
 
     def get_realtime_quotes(self, tickers: list[str]) -> dict[str, float]:
-        """Fetch latest realtime price per CN ticker via akshare's 1-minute bar.
+        """Fetch latest realtime price per CN ticker.
 
-        yfinance can't quote .SH/.SZ symbols (its CSI300 lives at 000300.SS),
-        so this is the canonical CN realtime path. Both main.py's hourly
-        cycle and scripts/update_prices.py's per-minute watchdog call this
-        so equity values agree at every tick.
+        yfinance can't quote .SH/.SZ symbols. Primary path is Sina's batch quote
+        endpoint (`hq.sinajs.cn/list=...`), which returns all held tickers in one
+        request and avoids the old per-ticker akshare minute-bar timeout problem.
+        Missing names fall back to akshare's 1-minute bar path with a bounded
+        total timeout.
 
         Returns {ticker: price}; tickers we could not quote are absent.
         """
         if not tickers:
             return {}
+
+        # Preserve caller order while de-duping so SQL/Dashboard joins remain
+        # deterministic and the batch URL stays compact.
+        tickers = list(dict.fromkeys(tickers))
+        out = self._fetch_sina_batch(tickers)
+        missing = [tk for tk in tickers if tk not in out]
+        if not missing:
+            return out
+
         try:
-            import akshare as ak  # optional dep
+            import akshare as ak  # optional dep; fallback only
         except Exception as e:
-            log.warning("akshare unavailable, can't realtime-quote CN: %s", e)
-            return {}
+            log.warning("akshare unavailable for CN quote fallback: %s", e)
+            return out
 
         def _one(tk: str) -> tuple[str, float | None]:
             try:
-                code, suf = tk.split(".")
-                sina = suf.lower() + code  # '000300.SH' -> 'sh000300'
+                sina = self._sina_symbol(tk)
                 df = ak.stock_zh_a_minute(symbol=sina, period="1", adjust="")
                 if df is None or df.empty:
                     return tk, None
@@ -223,42 +301,38 @@ class CNDataFetcher:
                 if px > 0:
                     return tk, px
             except Exception as e:
-                log.debug("CN realtime fetch %s failed: %s", tk, e)
+                log.debug("CN realtime fallback fetch %s failed: %s", tk, e)
             return tk, None
 
-        out: dict[str, float] = {}
-        # SINA quote endpoint tolerates parallelism: 16 workers brings 65
-        # tickers from ~29s to ~7s, comfortably under a 1-minute cron tick.
-        # Never let one stuck akshare/Sina request stall the whole updater.
-        # ThreadPoolExecutor.map waits for every future in input order and the
-        # executor context waits for all workers on exit; a single hung HTTP
-        # call previously held /tmp/quant_run_cycle.lock for days. Use
-        # as_completed with a bounded total budget and shutdown without waiting
-        # so partial quote coverage can still refresh unaffected accounts.
-        timeout_s = 45.0
-        ex_pool = ThreadPoolExecutor(max_workers=16)
-        futures = {ex_pool.submit(_one, tk): tk for tk in tickers}
+        # Fallback should normally be tiny. Keep a hard budget so a broken
+        # provider cannot starve update_prices/run_cycle under the shared flock.
+        timeout_s = 20.0
+        ex_pool = ThreadPoolExecutor(max_workers=min(8, max(1, len(missing))))
+        futures = {ex_pool.submit(_one, tk): tk for tk in missing}
         try:
             for fut in as_completed(futures, timeout=timeout_s):
                 tk = futures[fut]
                 try:
                     _, px = fut.result(timeout=0)
                 except Exception as e:
-                    log.debug("CN realtime fetch %s failed: %s", tk, e)
+                    log.debug("CN realtime fallback fetch %s failed: %s", tk, e)
                     continue
                 if px is not None:
                     out[tk] = px
         except FuturesTimeoutError:
             pending = sum(1 for fut in futures if not fut.done())
             log.warning(
-                "CN realtime fetch timed out after %.0fs: %d/%d still pending",
-                timeout_s, pending, len(tickers),
+                "CN realtime fallback timed out after %.0fs: %d/%d still pending",
+                timeout_s, pending, len(missing),
             )
         finally:
             ex_pool.shutdown(wait=False, cancel_futures=True)
-        if out:
-            log.info("Fetched CN realtime via akshare for %d/%d tickers",
-                     len(out), len(tickers))
+
+        if missing:
+            log.info(
+                "CN realtime fallback filled %d/%d missing; total %d/%d",
+                len([tk for tk in missing if tk in out]), len(missing), len(out), len(tickers),
+            )
         return out
 
 
