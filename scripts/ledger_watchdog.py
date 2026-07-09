@@ -26,6 +26,12 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from trading.costs import CNCosts, MoomooAUCosts  # noqa: E402
 
+_CN_SUFFIXES = (".SH", ".SZ", ".BJ")
+
+
+def is_cn_ticker(ticker: str) -> bool:
+    return str(ticker or "").upper().endswith(_CN_SUFFIXES)
+
 
 @dataclass
 class Issue:
@@ -775,6 +781,26 @@ def check_account(
         issues.extend(history_curve_audit(
             conn, account, market, initial_cash, status, audit_start, day_end, args
         ))
+
+    mislabeled_trades = conn.execute(
+        """
+        SELECT id,ticker,side,shares,price,timestamp,market
+        FROM trades
+        WHERE account=? AND market='US'
+          AND (ticker LIKE '%.SH' OR ticker LIKE '%.SZ' OR ticker LIKE '%.BJ')
+        ORDER BY timestamp,id
+        LIMIT 20
+        """,
+        (account,),
+    ).fetchall()
+    if mislabeled_trades:
+        issues.append(
+            Issue(
+                "critical", account, "trade_market_mislabel",
+                f"{len(mislabeled_trades)} CN ticker trade row(s) stored with market='US'",
+                {"rows": [dict(r) for r in mislabeled_trades[:12]]},
+            )
+        )
 
     # Daily cash-flow check based on snapshots. This is a smoke test; all-time
     # replay above is authoritative.

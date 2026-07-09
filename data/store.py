@@ -12,6 +12,30 @@ import pandas as pd
 log = logging.getLogger("quant.store")
 
 DB_PATH = os.path.expanduser("~/quant-trading/data/trading.db")
+_CN_SUFFIXES = (".SH", ".SZ", ".BJ")
+
+
+def _is_cn_ticker(ticker: str) -> bool:
+    return str(ticker or "").upper().endswith(_CN_SUFFIXES)
+
+
+def _market_for_trade(account: str, ticker: str, market: str) -> str:
+    """Normalize market for a trade row.
+
+    Historical bug class: CN tickers like ``300782.SZ`` were occasionally
+    persisted with ``market='US'`` by non-main execution paths, which then made
+    account-level replay/audits miss the corresponding sell trades.  Ticker
+    suffix is authoritative for CN A-shares; never allow a .SH/.SZ/.BJ trade to
+    be stored as US.
+    """
+    if _is_cn_ticker(ticker):
+        if market != "CN":
+            log.warning(
+                "correcting trade market for CN ticker: account=%s ticker=%s market=%s -> CN",
+                account, ticker, market,
+            )
+        return "CN"
+    return market or "US"
 
 
 def _connect(db_path: str | None = None) -> sqlite3.Connection:
@@ -259,6 +283,7 @@ class DataStore:
                    timestamp: str | None = None, market: str = "US"):
         """Insert a trade record."""
         ts = timestamp or datetime.now(timezone.utc).isoformat()
+        market = _market_for_trade(account, ticker, market)
         conn = self._conn()
         conn.execute(
             "INSERT INTO trades (account,ticker,side,shares,price,cost,slippage,timestamp,market) "

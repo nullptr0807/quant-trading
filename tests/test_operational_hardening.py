@@ -124,6 +124,14 @@ def test_health_check_accepts_group_pk(tmp_path):
     assert check_schema(con) == []
 
 
+def test_store_never_persists_cn_ticker_trade_as_us():
+    from data.store import _market_for_trade
+
+    assert _market_for_trade("CB13", "300782.SZ", "US") == "CN"
+    assert _market_for_trade("CB13", "688472.SH", "CN") == "CN"
+    assert _market_for_trade("B13", "CRWD", "US") == "US"
+
+
 def test_health_check_qlib_threshold_matches_live_us_gate(tmp_path):
     from scripts.health_check import check_model_factor_freshness
 
