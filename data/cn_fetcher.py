@@ -37,7 +37,7 @@ def _split_code(ticker: str) -> tuple[str, str]:
 
 
 def _hist_one(ticker: str, start: str, end: str, interval: str,
-              max_retries: int = 3) -> pd.DataFrame:
+              max_retries: int = 3, price_mode: str = "adjusted") -> pd.DataFrame:
     """Fetch one ticker's OHLCV from akshare, return normalized DataFrame.
 
     Retries transient connection errors with exponential backoff (akshare's
@@ -70,7 +70,7 @@ def _hist_one(ticker: str, start: str, end: str, interval: str,
                     symbol=f"{ex}{code}",
                     start_date=start.replace("-", ""),
                     end_date=end.replace("-", ""),
-                    adjust="qfq",
+                    adjust="" if price_mode == "raw" else "qfq",
                 )
                 if df is None or df.empty:
                     return pd.DataFrame()
@@ -83,7 +83,7 @@ def _hist_one(ticker: str, start: str, end: str, interval: str,
                     period="60",
                     start_date=f"{start} 09:00:00",
                     end_date=f"{end} 16:00:00",
-                    adjust="qfq",
+                    adjust="" if price_mode == "raw" else "qfq",
                 )
                 if df is None or df.empty:
                     return pd.DataFrame()
@@ -127,7 +127,8 @@ class CNDataFetcher:
         self.store = DataStore()
 
     def get_historical(self, tickers: list[str], days: int = 30,
-                       interval: str = "1d", use_cache: bool = True) -> pd.DataFrame:
+                       interval: str = "1d", use_cache: bool = True,
+                       price_mode: str = "adjusted") -> pd.DataFrame:
         end = datetime.now(timezone.utc).replace(tzinfo=None)
         start = end - timedelta(days=days)
         s, e = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
@@ -136,8 +137,8 @@ class CNDataFetcher:
             return pd.DataFrame(columns=["datetime", "ticker", "open", "high", "low", "close", "volume"])
 
         if use_cache:
-            cached = self.store.load_prices(tickers, s, e, interval=interval)
-            cov = self.store.get_price_coverage(tickers, interval=interval)
+            cached = self.store.load_prices(tickers, s, e, interval=interval, price_mode=price_mode)
+            cov = self.store.get_price_coverage(tickers, interval=interval, price_mode=price_mode)
             if interval == "1d":
                 expected = max(1, int(days * 0.5))   # ~50% trading days (CN: ~250/yr)
             elif interval in ("1h", "60m"):
@@ -169,15 +170,15 @@ class CNDataFetcher:
                      interval, days, hit, len(tickers), len(cached), len(missing))
             frames: list[pd.DataFrame] = []
             with ThreadPoolExecutor(max_workers=3) as ex_pool:
-                for df in ex_pool.map(lambda t: _hist_one(t, s, e, interval), missing):
+                for df in ex_pool.map(lambda t: _hist_one(t, s, e, interval, price_mode=price_mode), missing):
                     if not df.empty:
                         frames.append(df)
             dl_rows = sum(len(f) for f in frames)
             dl_tickers = len(frames)
             if frames:
                 merged = pd.concat(frames, ignore_index=True)
-                self.store.save_prices_bulk(merged, interval=interval)
-            final = self.store.load_prices(tickers, s, e, interval=interval)
+                self.store.save_prices_bulk(merged, interval=interval, price_mode=price_mode)
+            final = self.store.load_prices(tickers, s, e, interval=interval, price_mode=price_mode)
             log.info("📦 [CN %s] %dd | CACHE %d (%d rows) | DOWNLOADED %d (%d rows) | TOTAL %d rows",
                      interval, days, hit, len(cached), dl_tickers, dl_rows, len(final))
             return final
@@ -185,13 +186,13 @@ class CNDataFetcher:
         # use_cache=False — force refresh
         frames: list[pd.DataFrame] = []
         with ThreadPoolExecutor(max_workers=3) as ex_pool:
-            for df in ex_pool.map(lambda t: _hist_one(t, s, e, interval), tickers):
+            for df in ex_pool.map(lambda t: _hist_one(t, s, e, interval, price_mode=price_mode), tickers):
                 if not df.empty:
                     frames.append(df)
         if not frames:
             return pd.DataFrame(columns=["datetime", "ticker", "open", "high", "low", "close", "volume"])
         merged = pd.concat(frames, ignore_index=True)
-        self.store.save_prices_bulk(merged, interval=interval)
+        self.store.save_prices_bulk(merged, interval=interval, price_mode=price_mode)
         return merged
 
     # ── Realtime quotes (Sina batch → akshare 1-minute fallback) ─────────────

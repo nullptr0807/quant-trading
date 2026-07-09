@@ -56,6 +56,44 @@ def _normalize_df(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return out
 
 
+def _restore_split_unadjusted_ohlc(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Convert Yahoo's split-adjusted OHLC back to raw market-price scale.
+
+    yfinance daily history is split-adjusted even when auto_adjust=False:
+    pre-split CRWD 2026-05 closes near 154 instead of the raw traded ~594.
+    For account replay/execution audits we need the raw coordinate, so multiply
+    every row before each future split ex-date by that split ratio.
+    """
+    if df is None or df.empty:
+        return df
+    try:
+        splits = yf.Ticker(ticker).splits
+    except Exception:
+        return df
+    if splits is None or len(splits) == 0:
+        return df
+    if isinstance(splits, pd.DataFrame):
+        if "Stock Splits" not in splits.columns:
+            return df
+        splits = splits["Stock Splits"]
+    out = df.copy()
+    dates = pd.to_datetime(out["datetime"], utc=True, errors="coerce").dt.date
+    for idx, ratio in splits.items():
+        try:
+            split_date = pd.to_datetime(idx, utc=True).date()
+            ratio_f = float(ratio)
+        except Exception:
+            continue
+        if not ratio_f or abs(ratio_f - 1.0) < 1e-12:
+            continue
+        mask = dates < split_date
+        if mask.any():
+            out.loc[mask, ["open", "high", "low", "close"]] = (
+                out.loc[mask, ["open", "high", "low", "close"]].astype(float) * ratio_f
+            )
+    return out
+
+
 # Note: zero-volume / outlier filtering happens at READ time (DataStore.load_prices
 # with skip_zero_volume=True by default), not here. Rationale: DB preserves the
 # raw yfinance output verbatim for audit/debug; business reads transparently
@@ -71,7 +109,8 @@ class DataFetcher:
     # ── Historical (cache-aware) ────────────────────────────────────────────
 
     def get_historical(self, tickers: list[str], days: int = 30,
-                       interval: str = "1d", use_cache: bool = True) -> pd.DataFrame:
+                       interval: str = "1d", use_cache: bool = True,
+                       price_mode: str = "adjusted") -> pd.DataFrame:
         """Download OHLCV history for tickers over the last `days` days.
 
         Cache-aware: reads from DB first, only fetches missing ticker/date ranges
@@ -90,8 +129,8 @@ class DataFetcher:
 
         if use_cache:
             # 1) Load whatever the cache has
-            cached = self.store.load_prices(tickers, start_str, end_str, interval=interval)
-            coverage = self.store.get_price_coverage(tickers, interval=interval)
+            cached = self.store.load_prices(tickers, start_str, end_str, interval=interval, price_mode=price_mode)
+            coverage = self.store.get_price_coverage(tickers, interval=interval, price_mode=price_mode)
 
             # 2) Identify tickers with no data or insufficient coverage
             # Expected bars: rough floor based on interval
@@ -147,13 +186,13 @@ class DataFetcher:
                 "📥 [%s] %d days | CACHE HIT: %d/%d tickers (%d rows) | DOWNLOADING %d tickers from yfinance...",
                 interval, days, hit_tickers, len(tickers), len(cached), len(missing),
             )
-            fetched = self._fetch_yf_batch(missing, start_str, end_str, interval)
+            fetched = self._fetch_yf_batch(missing, start_str, end_str, interval, price_mode=price_mode)
             dl_rows = len(fetched)
             dl_tickers = fetched["ticker"].nunique() if not fetched.empty else 0
             if not fetched.empty:
-                self.store.save_prices_bulk(fetched, interval=interval)
+                self.store.save_prices_bulk(fetched, interval=interval, price_mode=price_mode)
             # Re-load full set from cache now that missing is filled
-            final = self.store.load_prices(tickers, start_str, end_str, interval=interval)
+            final = self.store.load_prices(tickers, start_str, end_str, interval=interval, price_mode=price_mode)
             log.info(
                 "📦 [%s] %d days | CACHE HIT: %d tickers (%d rows) | DOWNLOAD: %d tickers (%d rows) | TOTAL: %d rows",
                 interval, days, hit_tickers, len(cached), dl_tickers, dl_rows, len(final),
@@ -161,13 +200,13 @@ class DataFetcher:
             return final
 
         # use_cache=False: force full fetch
-        fetched = self._fetch_yf_batch(tickers, start_str, end_str, interval)
+        fetched = self._fetch_yf_batch(tickers, start_str, end_str, interval, price_mode=price_mode)
         if not fetched.empty:
-            self.store.save_prices_bulk(fetched, interval=interval)
+            self.store.save_prices_bulk(fetched, interval=interval, price_mode=price_mode)
         return fetched
 
     def _fetch_yf_batch(self, tickers: list[str], start: str, end: str,
-                        interval: str) -> pd.DataFrame:
+                        interval: str, price_mode: str = "adjusted") -> pd.DataFrame:
         """Batch download from yfinance with threading. Returns normalized DataFrame."""
         if not tickers:
             return pd.DataFrame(columns=["datetime", "ticker", "open", "high", "low", "close", "volume"])
@@ -183,7 +222,7 @@ class DataFetcher:
         try:
             raw = yf.download(
                 tickers, start=start, end=end, interval=interval,
-                progress=False, auto_adjust=True, threads=True,
+                progress=False, auto_adjust=(price_mode != "raw"), threads=True,
                 group_by="ticker", prepost=prepost,
             )
         except Exception as e:
@@ -195,6 +234,8 @@ class DataFetcher:
         frames = []
         if len(tickers) == 1:
             df = _normalize_df(raw, tickers[0])
+            if not df.empty and price_mode == "raw":
+                df = _restore_split_unadjusted_ohlc(df, tickers[0])
             if not df.empty:
                 frames.append(df)
         else:
@@ -206,10 +247,14 @@ class DataFetcher:
                     if sub is None or sub.empty:
                         continue
                     df = _normalize_df(sub, t)
+                    if not df.empty and price_mode == "raw":
+                        df = _restore_split_unadjusted_ohlc(df, t)
                     if not df.empty:
                         frames.append(df)
             else:
                 df = _normalize_df(raw, tickers[0])
+                if not df.empty and price_mode == "raw":
+                    df = _restore_split_unadjusted_ohlc(df, tickers[0])
                 if not df.empty:
                     frames.append(df)
 

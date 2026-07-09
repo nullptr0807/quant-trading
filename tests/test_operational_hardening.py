@@ -132,6 +132,51 @@ def test_store_never_persists_cn_ticker_trade_as_us():
     assert _market_for_trade("B13", "CRWD", "US") == "US"
 
 
+def test_store_separates_adjusted_and_raw_price_tables(tmp_path):
+    import pandas as pd
+    from data.store import DataStore
+
+    store = DataStore(str(tmp_path / "prices.db"))
+    adjusted = pd.DataFrame([
+        {"ticker": "CRWD", "datetime": "2026-07-01", "open": 150, "high": 155, "low": 149, "close": 154, "volume": 1000},
+    ])
+    raw = pd.DataFrame([
+        {"ticker": "CRWD", "datetime": "2026-07-01", "open": 600, "high": 620, "low": 596, "close": 616, "volume": 1000},
+    ])
+
+    store.save_prices_bulk(adjusted, interval="1d", price_mode="adjusted")
+    store.save_prices_bulk(raw, interval="1d", price_mode="raw")
+
+    adj_rows = store.load_prices(["CRWD"], "2026-07-01", "2026-07-02", interval="1d", price_mode="adjusted")
+    raw_rows = store.load_prices(["CRWD"], "2026-07-01", "2026-07-02", interval="1d", price_mode="raw")
+    assert float(adj_rows.iloc[0]["close"]) == 154
+    assert float(raw_rows.iloc[0]["close"]) == 616
+    assert store.get_price_coverage(["CRWD"], interval="1d", price_mode="raw")["CRWD"][2] == 1
+
+
+def test_raw_price_restore_reverses_yahoo_split_adjustment(monkeypatch):
+    import pandas as pd
+    import data.fetcher as fetcher
+
+    class DummyTicker:
+        @property
+        def splits(self):
+            return pd.DataFrame(
+                {"Stock Splits": [4.0]},
+                index=pd.to_datetime(["2026-07-02 09:30:00-04:00"]),
+            )
+
+    monkeypatch.setattr(fetcher.yf, "Ticker", lambda ticker: DummyTicker())
+    adjusted_like = pd.DataFrame([
+        {"ticker": "CRWD", "datetime": "2026-05-18", "open": 148.0, "high": 155.0, "low": 146.0, "close": 154.0, "volume": 1000},
+        {"ticker": "CRWD", "datetime": "2026-07-03", "open": 190.0, "high": 195.0, "low": 188.0, "close": 192.0, "volume": 1000},
+    ])
+
+    raw = fetcher._restore_split_unadjusted_ohlc(adjusted_like, "CRWD")
+    assert float(raw.iloc[0]["close"]) == 616.0
+    assert float(raw.iloc[1]["close"]) == 192.0
+
+
 def test_health_check_qlib_threshold_matches_live_us_gate(tmp_path):
     from scripts.health_check import check_model_factor_freshness
 

@@ -13,6 +13,13 @@ log = logging.getLogger("quant.store")
 
 DB_PATH = os.path.expanduser("~/quant-trading/data/trading.db")
 _CN_SUFFIXES = (".SH", ".SZ", ".BJ")
+PRICE_MODE_TABLE = {
+    "adjusted": "prices",
+    "qfq": "prices",
+    "research": "prices",
+    "raw": "prices_raw",
+    "execution": "prices_raw",
+}
 
 
 def _is_cn_ticker(ticker: str) -> bool:
@@ -36,6 +43,13 @@ def _market_for_trade(account: str, ticker: str, market: str) -> str:
             )
         return "CN"
     return market or "US"
+
+
+def _price_table(price_mode: str = "adjusted") -> str:
+    try:
+        return PRICE_MODE_TABLE[str(price_mode or "adjusted").lower()]
+    except KeyError as exc:
+        raise ValueError(f"unsupported price_mode={price_mode!r}; expected adjusted/qfq/raw") from exc
 
 
 def _connect(db_path: str | None = None) -> sqlite3.Connection:
@@ -63,6 +77,18 @@ def init_db(db_path: str | None = None):
         PRIMARY KEY (ticker, datetime, interval)
     )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_prices_ticker_interval ON prices(ticker, interval, datetime)")
+
+    # Raw/unadjusted OHLCV for execution/account replay.  The legacy `prices`
+    # table intentionally remains the adjusted/qfq research series so existing
+    # factor and qlib code keeps its historical semantics.
+    c.execute("""CREATE TABLE IF NOT EXISTS prices_raw (
+        ticker TEXT NOT NULL,
+        datetime TEXT NOT NULL,
+        interval TEXT NOT NULL DEFAULT '1d',
+        open REAL, high REAL, low REAL, close REAL, volume REAL,
+        PRIMARY KEY (ticker, datetime, interval)
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_prices_raw_ticker_interval ON prices_raw(ticker, interval, datetime)")
 
     # 交易记录（每笔交易）
     c.execute("""CREATE TABLE IF NOT EXISTS trades (
@@ -164,11 +190,13 @@ class DataStore:
     # ── Prices ──────────────────────────────────────────────────────────────
 
     def save_prices(self, ticker_or_df, df: pd.DataFrame | None = None,
-                    interval: str = "1d"):
-        """Save price data. Two signatures:
-            save_prices(df, interval=...)           — df must have 'ticker' column
-            save_prices(ticker, df, interval=...)   — df indexed by datetime with ohlcv cols
+                    interval: str = "1d", price_mode: str = "adjusted"):
+        """Save price data.
+
+        price_mode='adjusted' writes the legacy research/qfq table (`prices`);
+        price_mode='raw' writes the execution/account-replay table (`prices_raw`).
         """
+        table = _price_table(price_mode)
         conn = self._conn()
         if df is None:
             frame = ticker_or_df
@@ -188,7 +216,7 @@ class DataStore:
             for attempt in range(3):
                 try:
                     conn.executemany(
-                        "INSERT OR REPLACE INTO prices (ticker,datetime,interval,open,high,low,close,volume) "
+                        f"INSERT OR REPLACE INTO {table} (ticker,datetime,interval,open,high,low,close,volume) "
                         "VALUES (?,?,?,?,?,?,?,?)", rows,
                     )
                     conn.commit()
@@ -200,10 +228,11 @@ class DataStore:
         finally:
             conn.close()
 
-    def save_prices_bulk(self, df: pd.DataFrame, interval: str = "1d"):
+    def save_prices_bulk(self, df: pd.DataFrame, interval: str = "1d", price_mode: str = "adjusted"):
         """Bulk save. df must have columns: ticker, datetime, open, high, low, close, volume."""
         if df is None or df.empty:
             return
+        table = _price_table(price_mode)
         conn = self._conn()
         rows = [
             (r["ticker"], str(r["datetime"]), interval,
@@ -214,7 +243,7 @@ class DataStore:
             for attempt in range(3):
                 try:
                     conn.executemany(
-                        "INSERT OR REPLACE INTO prices (ticker,datetime,interval,open,high,low,close,volume) "
+                        f"INSERT OR REPLACE INTO {table} (ticker,datetime,interval,open,high,low,close,volume) "
                         "VALUES (?,?,?,?,?,?,?,?)", rows,
                     )
                     conn.commit()
@@ -228,32 +257,23 @@ class DataStore:
 
     def load_prices(self, tickers: list[str], start: str, end: str,
                     interval: str = "1d",
-                    skip_zero_volume: bool = True) -> pd.DataFrame:
-        """Load cached prices from DB. Returns DataFrame with ticker/datetime/ohlcv columns.
+                    skip_zero_volume: bool = True,
+                    price_mode: str = "adjusted") -> pd.DataFrame:
+        """Load cached prices from DB.
 
-        skip_zero_volume (default True): for intraday intervals (1m/2m/5m/15m/30m),
-        filter out rows where volume==0. These are Yahoo's pre/post-market
-        placeholder bars synthesized from single odd-lot ECN prints — they
-        cause spike-and-revert artifacts (e.g. SPY 657.39 on 2026-04-21 21:15
-        sandwiched by 706.x bars) in equity/benchmark curves.
-
-        Empirical evidence (2026-04 audit): 100% of 1371 detected spike outliers
-        had volume==0 and occurred outside RTH. Real RTH bars always carry
-        volume. Daily/hourly bars (1d/1h) are aggregated by Yahoo and clean,
-        so filter does not apply.
-
-        DB rows are NOT deleted — pass skip_zero_volume=False to see raw data
-        for audit/debug.
+        price_mode='adjusted' reads legacy research/qfq prices; price_mode='raw'
+        reads raw/unadjusted execution prices.
         """
         if not tickers:
             return pd.DataFrame(columns=["datetime", "ticker", "open", "high", "low", "close", "volume"])
+        table = _price_table(price_mode)
         conn = self._conn()
         placeholders = ",".join("?" * len(tickers))
         # Apply zero-volume filter only on guarded intraday intervals
         intraday_guarded = interval in ("1m", "2m", "5m", "15m", "30m")
         vol_clause = " AND COALESCE(volume,0) > 0" if (skip_zero_volume and intraday_guarded) else ""
         query = (
-            f"SELECT ticker, datetime, open, high, low, close, volume FROM prices "
+            f"SELECT ticker, datetime, open, high, low, close, volume FROM {table} "
             f"WHERE interval=? AND datetime>=? AND datetime<? AND ticker IN ({placeholders})"
             f"{vol_clause} "
             f"ORDER BY ticker, datetime"
@@ -262,14 +282,15 @@ class DataStore:
         conn.close()
         return df
 
-    def get_price_coverage(self, tickers: list[str], interval: str = "1d") -> dict:
-        """Return {ticker: (min_datetime, max_datetime, count)} for given interval."""
+    def get_price_coverage(self, tickers: list[str], interval: str = "1d", price_mode: str = "adjusted") -> dict:
+        """Return {ticker: (min_datetime, max_datetime, count)} for given interval/price mode."""
         if not tickers:
             return {}
+        table = _price_table(price_mode)
         conn = self._conn()
         placeholders = ",".join("?" * len(tickers))
         rows = conn.execute(
-            f"SELECT ticker, MIN(datetime), MAX(datetime), COUNT(*) FROM prices "
+            f"SELECT ticker, MIN(datetime), MAX(datetime), COUNT(*) FROM {table} "
             f"WHERE interval=? AND ticker IN ({placeholders}) GROUP BY ticker",
             [interval, *tickers],
         ).fetchall()

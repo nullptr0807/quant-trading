@@ -48,7 +48,7 @@ def _dedupe(seq):
     return list(dict.fromkeys(seq))
 
 
-def backfill(interval: str, days: int, batch_size: int = 50, market: str = "US"):
+def backfill(interval: str, days: int, batch_size: int = 50, market: str = "US", price_mode: str = "adjusted"):
     if market == "CN":
         from config.settings import CN_UNIVERSE, BENCHMARKS_BY_MARKET
         from data.cn_fetcher import CNDataFetcher
@@ -63,22 +63,22 @@ def backfill(interval: str, days: int, batch_size: int = 50, market: str = "US")
         tickers = _dedupe(list(STOCK_UNIVERSE) + _held_tickers_for_market("US") + ["QQQ", "SPY"])
         fetcher = DataFetcher()
 
-    log.info("Backfilling [%s] %d tickers, interval=%s, days=%d",
-             market, len(tickers), interval, days)
+    log.info("Backfilling [%s] %d tickers, interval=%s, days=%d, price_mode=%s",
+             market, len(tickers), interval, days, price_mode)
     t0 = time.time()
 
     total_rows = 0
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i+batch_size]
         log.info("Batch %d-%d (%d tickers)...", i, i+len(batch), len(batch))
-        df = fetcher.get_historical(batch, days=days, interval=interval, use_cache=False)
+        df = fetcher.get_historical(batch, days=days, interval=interval, use_cache=False, price_mode=price_mode)
         total_rows += len(df)
         log.info("  -> %d rows fetched (cumulative %d)", len(df), total_rows)
 
     elapsed = time.time() - t0
     log.info("Done in %.1fs. Total rows stored: %d", elapsed, total_rows)
 
-    cov = fetcher.store.get_price_coverage(tickers, interval=interval)
+    cov = fetcher.store.get_price_coverage(tickers, interval=interval, price_mode=price_mode)
     counts = sorted([(c[2], t) for t, c in cov.items()])
     log.info("Coverage: %d/%d tickers have data", len(cov), len(tickers))
     if counts:
@@ -96,19 +96,23 @@ def main():
     p.add_argument("--batch-size", type=int, default=50)
     p.add_argument("--market", default="US", choices=["US", "CN"],
                    help="Which market's universe to backfill (default US)")
+    p.add_argument("--price-mode", default="adjusted", choices=["adjusted", "raw", "both"],
+                   help="adjusted/qfq research prices, raw execution prices, or both")
     p.add_argument("--all", action="store_true",
                    help="Backfill 1h (90d) + 1d (400d). For CN: 1d only (no intraday hist).")
     args = p.parse_args()
 
-    if args.all:
-        if args.market == "CN":
-            backfill("1d", max(400, args.days), args.batch_size, market="CN")
+    modes = ["adjusted", "raw"] if args.price_mode == "both" else [args.price_mode]
+    for mode in modes:
+        if args.all:
+            if args.market == "CN":
+                backfill("1d", max(400, args.days), args.batch_size, market="CN", price_mode=mode)
+            else:
+                backfill("5m", 60, args.batch_size, market="US", price_mode=mode)
+                backfill("1h", 90, args.batch_size, market="US", price_mode=mode)
+                backfill("1d", 400, args.batch_size, market="US", price_mode=mode)
         else:
-            backfill("5m", 60, args.batch_size, market="US")
-            backfill("1h", 90, args.batch_size, market="US")
-            backfill("1d", 400, args.batch_size, market="US")
-    else:
-        backfill(args.interval, args.days, args.batch_size, market=args.market)
+            backfill(args.interval, args.days, args.batch_size, market=args.market, price_mode=mode)
 
 
 if __name__ == "__main__":
