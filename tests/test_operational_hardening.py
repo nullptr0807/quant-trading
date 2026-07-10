@@ -1,5 +1,9 @@
 import sqlite3
+import subprocess
+import sys
 from datetime import date, timedelta
+
+import pytest
 
 
 def _make_db(path, *, score_date: str, price_date: str) -> None:
@@ -243,3 +247,54 @@ def test_health_check_qlib_threshold_allows_cn_three_day_lag(tmp_path):
     con.execute("INSERT INTO factor_values VALUES ('000001.SZ','2026-07-04','qlib_Q01_score',1.0,'qlib')")
 
     assert check_model_factor_freshness(con) == []
+
+
+def test_health_check_ledger_critical_exits_nonzero(monkeypatch):
+    import scripts.health_check as health_check
+
+    commands = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(cmd)
+        fail_closed = "--fail-on-critical" in cmd
+        return subprocess.CompletedProcess(
+            cmd,
+            2 if fail_closed else 0,
+            stdout="CRITICAL: ledger invariant failed\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(health_check.subprocess, "run", fake_run)
+    monkeypatch.setattr(health_check, "_conn", lambda: sqlite3.connect(":memory:"))
+    monkeypatch.setattr(health_check, "check_schema", lambda con: [])
+    monkeypatch.setattr(health_check, "check_alpha20", lambda con: [])
+    monkeypatch.setattr(health_check, "check_model_factor_freshness", lambda con: [])
+    monkeypatch.setattr(health_check, "check_snapshot_diff", lambda con: [])
+    monkeypatch.setattr(sys, "argv", [
+        "health_check.py", "--skip-quotes", "--skip-price-health",
+        "--skip-backfill-runtime", "--json",
+    ])
+
+    assert health_check.main() == 2
+    assert commands
+    assert all("--fail-on-critical" in cmd for cmd in commands)
+
+
+def test_main_tries_later_markets_then_raises_if_any_failed(monkeypatch):
+    import main as trading_main
+
+    attempted = []
+
+    def fake_run_for_market(market, mode):
+        attempted.append((market, mode))
+        if market == "US":
+            raise RuntimeError("US failed")
+
+    monkeypatch.setattr(trading_main, "MARKETS", ["US", "CN"])
+    monkeypatch.setattr(trading_main, "_run_for_market", fake_run_for_market)
+    monkeypatch.setattr(sys, "argv", ["main.py", "--once"])
+
+    with pytest.raises(RuntimeError, match="US"):
+        trading_main.main()
+
+    assert attempted == [("US", "once"), ("CN", "once")]

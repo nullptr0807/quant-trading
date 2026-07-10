@@ -6,7 +6,8 @@ the missing date range from yfinance, and writes new bars back to the cache.
 
 import os
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import yfinance as yf
 import finnhub
@@ -27,6 +28,47 @@ INTERVAL_MAX_DAYS = {
     "1h": 730,
     "1d": 36500,
 }
+
+_MARKET_TIMEZONES = {
+    "US": ZoneInfo("America/New_York"),
+    "CN": ZoneInfo("Asia/Shanghai"),
+}
+_MARKET_CLOSES = {
+    "US": time(16, 0),
+    "CN": time(15, 0),
+}
+
+
+def _utc_now() -> datetime:
+    """Return an aware UTC clock value; kept injectable for boundary tests."""
+    return datetime.now(timezone.utc)
+
+
+def latest_completed_session_date(market: str, now: datetime | None = None) -> date:
+    """Return the latest completed weekday trading session for ``market``.
+
+    This deliberately has no online exchange-calendar dependency. It is exact
+    for close-time and weekend boundaries. On an exchange holiday it is
+    conservative: the weekday may be requested, while an empty provider result
+    simply leaves the previous cached session intact.
+    """
+    market = market.upper()
+    try:
+        market_tz = _MARKET_TIMEZONES[market]
+        close_time = _MARKET_CLOSES[market]
+    except KeyError as exc:
+        raise ValueError(f"unsupported market: {market}") from exc
+
+    now = now or _utc_now()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    local_now = now.astimezone(market_tz)
+    target = local_now.date()
+    if local_now.weekday() >= 5 or local_now.time() < close_time:
+        target -= timedelta(days=1)
+    while target.weekday() >= 5:
+        target -= timedelta(days=1)
+    return target
 
 
 def _normalize_df(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
@@ -116,10 +158,18 @@ class DataFetcher:
         Cache-aware: reads from DB first, only fetches missing ticker/date ranges
         from yfinance, then writes new bars back. Pass use_cache=False to force refresh.
         """
-        end = datetime.now(timezone.utc).replace(tzinfo=None)
+        now_utc = _utc_now()
+        end = now_utc.replace(tzinfo=None)
         start = end - timedelta(days=days)
         start_str = start.strftime("%Y-%m-%d")
-        end_str = end.strftime("%Y-%m-%d")
+        if interval == "1d":
+            target_session = latest_completed_session_date("US", now_utc)
+            # yfinance's ``end`` boundary is exclusive. Request through the day
+            # after the latest completed session so its bar is included.
+            end_str = (target_session + timedelta(days=1)).isoformat()
+        else:
+            target_session = None
+            end_str = end.strftime("%Y-%m-%d")
 
         # Cap `days` to yfinance limit for the given interval
         max_days = INTERVAL_MAX_DAYS.get(interval, 36500)
@@ -146,14 +196,9 @@ class DataFetcher:
                 expected = 1
 
             missing = []
-            # Freshness rule (per-interval). For 1d we MUST refetch as soon as
-            # DB's latest date is older than today's UTC date — otherwise daily
-            # bars for the current trading day never land in cache, and every
-            # cycle silently re-uses T-1 close (the RKLB 5/8 incident: 1h pre/
-            # post bars made max_dt look fresh while the 1d row for today was
-            # missing). Intraday intervals get a looser 3-day window since
-            # filling them is best-effort.
-            today_utc_date = end.date()
+            # Daily freshness is measured against the latest completed US
+            # session, not today's still-forming candle. Otherwise every ticker
+            # is classified stale throughout regular trading hours.
             for t in tickers:
                 cov = coverage.get(t)
                 if not cov or cov[2] < expected:
@@ -166,8 +211,8 @@ class DataFetcher:
                     missing.append(t)
                     continue
                 if interval == "1d":
-                    # Daily: stale unless DB has a bar dated today (UTC).
-                    if max_d.date() < today_utc_date:
+                    assert target_session is not None
+                    if max_d.date() < target_session:
                         missing.append(t)
                 else:
                     # Intraday: stale if older than 3 days.

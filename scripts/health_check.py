@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterable
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -20,6 +22,19 @@ CN_SUFFIXES = (".SH", ".SZ", ".BJ")
 ROLL20_FACTORS = [
     "ROC_20", "MA_RATIO_20", "VMOM_20", "VSTD_20", "STD_20", "BBPOS_20", "BETA_20",
 ]
+BACKFILL_LOG = PROJECT_ROOT / "logs" / "backfill.log"
+_BACKFILL_WRAPPER_RE = re.compile(
+    r"^===== Backfill \[(?P<market>US|CN)/(?P<interval>[^/\]]+)/(?P<price_mode>[^\]]+)\] "
+    r"(?P<event>start|OK|FAIL) (?P<timestamp>\S+)(?: .*?exit=(?P<exit_code>\d+))? =====$"
+)
+_LEGACY_BACKFILL_START_RE = re.compile(
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:,\d+)? \[INFO\] "
+    r"Backfilling \[(?P<market>US|CN)\].*?interval=(?P<interval>[^, ]+)"
+    r"(?:.*?price_mode=(?P<price_mode>\w+))?\s*$"
+)
+_LEGACY_BACKFILL_OK_RE = re.compile(
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:,\d+)? \[INFO\] Done in "
+)
 
 
 def _conn() -> sqlite3.Connection:
@@ -31,6 +46,168 @@ def _conn() -> sqlite3.Connection:
 
 def _is_cn(ticker: str) -> bool:
     return ticker.upper().endswith(CN_SUFFIXES)
+
+
+def _table_exists(con: sqlite3.Connection, table: str) -> bool:
+    row = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    return row is not None
+
+
+def _market_clause(market: str) -> str:
+    if market == "CN":
+        return "ticker LIKE '%.SH' OR ticker LIKE '%.SZ' OR ticker LIKE '%.BJ'"
+    return "ticker NOT LIKE '%.SH' AND ticker NOT LIKE '%.SZ' AND ticker NOT LIKE '%.BJ'"
+
+
+def _normalize_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip().replace("Z", "+00:00")
+    try:
+        return _normalize_utc(datetime.fromisoformat(text))
+    except ValueError:
+        try:
+            return datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            return None
+
+
+def _latest_by_ticker(
+    con: sqlite3.Connection,
+    table: str,
+    market: str,
+    tickers: Iterable[str],
+) -> dict[str, str]:
+    wanted = sorted(set(tickers))
+    if not wanted or not _table_exists(con, table):
+        return {}
+    placeholders = ",".join("?" for _ in wanted)
+    rows = con.execute(
+        f"""
+        SELECT ticker, MAX(substr(datetime,1,10)) AS max_date
+        FROM {table}
+        WHERE interval='1d' AND ({_market_clause(market)})
+          AND ticker IN ({placeholders})
+        GROUP BY ticker
+        """,
+        wanted,
+    ).fetchall()
+    return {str(r["ticker"]): str(r["max_date"]) for r in rows if r["max_date"]}
+
+
+def _active_held_tickers(con: sqlite3.Connection, market: str) -> list[str]:
+    if not _table_exists(con, "positions"):
+        return []
+    has_meta = _table_exists(con, "account_meta")
+    if has_meta:
+        rows = con.execute(
+            """
+            SELECT DISTINCT p.ticker
+            FROM positions p
+            LEFT JOIN account_meta m
+              ON m.account_id=p.account AND COALESCE(m.market,p.market,'US')=COALESCE(p.market,'US')
+            WHERE COALESCE(p.market,'US')=? AND COALESCE(p.shares,0)>0
+              AND COALESCE(m.status,'active')='active'
+            ORDER BY p.ticker
+            """,
+            (market,),
+        ).fetchall()
+    else:
+        rows = con.execute(
+            """
+            SELECT DISTINCT ticker FROM positions
+            WHERE COALESCE(market,'US')=? AND COALESCE(shares,0)>0
+            ORDER BY ticker
+            """,
+            (market,),
+        ).fetchall()
+    return [str(r[0]) for r in rows]
+
+
+def _price_set_issues(
+    *,
+    con: sqlite3.Connection,
+    market: str,
+    price_mode: str,
+    tickers: Iterable[str],
+    target_date: str,
+) -> list[dict]:
+    expected = sorted(set(tickers))
+    if not expected:
+        return []
+    table = "prices_raw" if price_mode == "raw" else "prices"
+    latest = _latest_by_ticker(con, table, market, expected)
+    covered = sorted(latest)
+    missing = sorted(set(expected) - set(covered))
+    stale = sorted(t for t, d in latest.items() if d < target_date)
+    issues: list[dict] = []
+    if missing:
+        coverage = len(covered) / len(expected)
+        issues.append({
+            "severity": "critical" if coverage < 0.8 else "warning",
+            "check": "price_1d_coverage",
+            "market": market,
+            "price_mode": price_mode,
+            "table": table,
+            "scope": "active_holdings" if price_mode == "raw" else "universe",
+            "expected": len(expected),
+            "covered": len(covered),
+            "coverage": round(coverage, 4),
+            "missing_sample": missing[:20],
+        })
+    if stale:
+        freshest = max((latest[t] for t in stale), default=None)
+        issues.append({
+            "severity": "critical" if len(stale) == len(expected) else "warning",
+            "check": "price_1d_freshness",
+            "market": market,
+            "price_mode": price_mode,
+            "table": table,
+            "scope": "active_holdings" if price_mode == "raw" else "universe",
+            "target_date": target_date,
+            "freshest_stale_date": freshest,
+            "stale": len(stale),
+            "expected": len(expected),
+            "stale_sample": stale[:20],
+        })
+    return issues
+
+
+def check_price_1d_health(
+    con: sqlite3.Connection,
+    *,
+    universe_by_market: dict[str, Iterable[str]],
+    target_dates: dict[str, str],
+) -> list[dict]:
+    """Check adjusted universe and raw active-holding 1d coverage/freshness."""
+    issues: list[dict] = []
+    for market in ("US", "CN"):
+        target = target_dates[market]
+        issues.extend(_price_set_issues(
+            con=con,
+            market=market,
+            price_mode="adjusted",
+            tickers=universe_by_market.get(market, ()),
+            target_date=target,
+        ))
+        issues.extend(_price_set_issues(
+            con=con,
+            market=market,
+            price_mode="raw",
+            tickers=_active_held_tickers(con, market),
+            target_date=target,
+        ))
+    return issues
 
 
 def check_schema(con: sqlite3.Connection) -> list[dict]:
@@ -56,10 +233,7 @@ def check_schema(con: sqlite3.Connection) -> list[dict]:
 
 
 def latest_trading_date(con: sqlite3.Connection, market: str) -> str | None:
-    if market == "CN":
-        clause = "ticker LIKE '%.SH' OR ticker LIKE '%.SZ' OR ticker LIKE '%.BJ'"
-    else:
-        clause = "ticker NOT LIKE '%.SH' AND ticker NOT LIKE '%.SZ' AND ticker NOT LIKE '%.BJ'"
+    clause = _market_clause(market)
     row = con.execute(
         f"SELECT MAX(substr(datetime,1,10)) FROM prices WHERE interval='1d' AND ({clause})"
     ).fetchone()
@@ -355,8 +529,206 @@ def check_cn_quotes(min_coverage: float = 0.95) -> list[dict]:
     return issues
 
 
+def parse_backfill_log_events(text: str) -> list[dict]:
+    """Parse wrapper and legacy backfill lifecycle lines without filesystem I/O."""
+    events: list[dict] = []
+    pending_legacy: dict | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        match = _BACKFILL_WRAPPER_RE.match(line)
+        if match:
+            item = match.groupdict()
+            item["event"] = item["event"].lower()
+            item["price_mode"] = item["price_mode"].lower()
+            item["exit_code"] = int(item["exit_code"]) if item.get("exit_code") else None
+            item["timestamp"] = _parse_datetime(item["timestamp"])
+            events.append(item)
+            continue
+        match = _LEGACY_BACKFILL_START_RE.match(line)
+        if match:
+            item = match.groupdict()
+            item.update({
+                "event": "start",
+                "price_mode": (item.get("price_mode") or "adjusted").lower(),
+                "exit_code": None,
+                "timestamp": _parse_datetime(item["timestamp"]),
+            })
+            events.append(item)
+            pending_legacy = item
+            continue
+        match = _LEGACY_BACKFILL_OK_RE.match(line)
+        if match and pending_legacy:
+            events.append({
+                **{k: pending_legacy[k] for k in ("market", "interval", "price_mode")},
+                "event": "ok",
+                "timestamp": _parse_datetime(match.group("timestamp")),
+                "exit_code": 0,
+            })
+            pending_legacy = None
+    return events
+
+
+def evaluate_backfill_log_events(
+    events: list[dict],
+    *,
+    now: datetime,
+    max_success_age_seconds: float,
+    max_incomplete_seconds: float,
+) -> list[dict]:
+    """Classify stale/failed/incomplete backfill lifecycle events."""
+    now = _normalize_utc(now)
+    latest: dict[tuple[str, str, str], dict[str, datetime | None]] = {}
+    for event in events:
+        ts = event.get("timestamp")
+        if not isinstance(ts, datetime):
+            continue
+        key = (str(event["market"]), str(event["interval"]), str(event["price_mode"]))
+        state = latest.setdefault(key, {"start": None, "success": None, "failure": None})
+        kind = str(event.get("event", "")).lower()
+        if kind == "start":
+            state["start"] = ts
+        elif kind == "ok":
+            state["success"] = max(ts, state["success"]) if state["success"] else ts
+        elif kind == "fail":
+            state["failure"] = max(ts, state["failure"]) if state["failure"] else ts
+
+    issues: list[dict] = []
+    for (market, interval, price_mode), state in sorted(latest.items()):
+        start = state["start"]
+        success = state["success"]
+        failure = state["failure"]
+        if failure and (not success or failure > success):
+            issues.append({
+                "severity": "critical",
+                "check": "backfill_log_stale",
+                "status": "failed",
+                "market": market,
+                "interval": interval,
+                "price_mode": price_mode,
+                "failure_at": failure.isoformat(),
+            })
+            continue
+        if start and (not success or start > success):
+            age = (now - start).total_seconds()
+            if age > max_incomplete_seconds:
+                issues.append({
+                    "severity": "critical",
+                    "check": "backfill_log_stale",
+                    "status": "incomplete",
+                    "market": market,
+                    "interval": interval,
+                    "price_mode": price_mode,
+                    "started_at": start.isoformat(),
+                    "age_seconds": round(age, 1),
+                })
+            continue
+        if success:
+            age = (now - success).total_seconds()
+            if age > max_success_age_seconds:
+                issues.append({
+                    "severity": "warning",
+                    "check": "backfill_log_stale",
+                    "status": "stale_success",
+                    "market": market,
+                    "interval": interval,
+                    "price_mode": price_mode,
+                    "last_success_at": success.isoformat(),
+                    "age_seconds": round(age, 1),
+                })
+    return issues
+
+
+def parse_process_rows(text: str) -> list[dict]:
+    """Parse ``ps -eo pid=,etimes=,args=`` output without shell coupling."""
+    rows: list[dict] = []
+    for line in text.splitlines():
+        parts = line.strip().split(maxsplit=2)
+        if len(parts) != 3:
+            continue
+        try:
+            rows.append({"pid": int(parts[0]), "elapsed_seconds": int(parts[1]), "command": parts[2]})
+        except ValueError:
+            continue
+    return rows
+
+
+def evaluate_backfill_processes(
+    rows: list[dict], *, max_runtime_seconds: float
+) -> list[dict]:
+    issues: list[dict] = []
+    for row in rows:
+        command = str(row.get("command", ""))
+        elapsed = int(row.get("elapsed_seconds", 0) or 0)
+        if "scripts.backfill_prices" not in command or elapsed <= max_runtime_seconds:
+            continue
+        issues.append({
+            "severity": "critical",
+            "check": "backfill_process_stale",
+            "pid": int(row["pid"]),
+            "elapsed_seconds": elapsed,
+            "command": command[:500],
+        })
+    return issues
+
+
+def check_backfill_runtime(
+    *,
+    log_path: Path = BACKFILL_LOG,
+    now: datetime | None = None,
+    max_success_age_seconds: float = 36 * 3600,
+    max_incomplete_seconds: float = 30 * 60,
+    max_process_runtime_seconds: float = 30 * 60,
+) -> list[dict]:
+    """Read current process/log state and delegate classifications to pure functions."""
+    now = now or datetime.now(timezone.utc)
+    issues: list[dict] = []
+    try:
+        text = log_path.read_text(errors="replace")
+    except FileNotFoundError:
+        issues.append({
+            "severity": "warning",
+            "check": "backfill_log_stale",
+            "status": "missing_log",
+            "path": str(log_path),
+        })
+    else:
+        issues.extend(evaluate_backfill_log_events(
+            parse_backfill_log_events(text),
+            now=now,
+            max_success_age_seconds=max_success_age_seconds,
+            max_incomplete_seconds=max_incomplete_seconds,
+        ))
+    try:
+        proc = subprocess.run(
+            ["ps", "-eo", "pid=,etimes=,args="],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            issues.extend(evaluate_backfill_processes(
+                parse_process_rows(proc.stdout),
+                max_runtime_seconds=max_process_runtime_seconds,
+            ))
+        else:
+            issues.append({
+                "severity": "warning",
+                "check": "backfill_process_probe",
+                "exit_code": proc.returncode,
+                "detail": proc.stderr[-500:],
+            })
+    except Exception as exc:
+        issues.append({
+            "severity": "warning",
+            "check": "backfill_process_probe",
+            "detail": repr(exc),
+        })
+    return issues
+
+
 def run_ledger(market: str) -> list[dict]:
-    cmd = [sys.executable, str(PROJECT_ROOT / "scripts" / "ledger_watchdog.py"), "--market", market, "--history-days", "0", "--quiet-ok"]
+    cmd = [sys.executable, str(PROJECT_ROOT / "scripts" / "ledger_watchdog.py"), "--market", market, "--history-days", "0", "--quiet-ok", "--fail-on-critical"]
     proc = subprocess.run(cmd, cwd=PROJECT_ROOT, text=True, capture_output=True, timeout=180)
     if proc.returncode == 0:
         return []
@@ -374,6 +746,8 @@ def main() -> int:
     ap.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     ap.add_argument("--skip-quotes", action="store_true", help="Skip live CN quote probe")
     ap.add_argument("--skip-ledger", action="store_true", help="Skip ledger watchdog subprocesses")
+    ap.add_argument("--skip-price-health", action="store_true", help="Skip adjusted/raw 1d freshness and coverage checks")
+    ap.add_argument("--skip-backfill-runtime", action="store_true", help="Skip backfill log/process stale checks")
     args = ap.parse_args()
 
     issues: list[dict] = []
@@ -382,6 +756,22 @@ def main() -> int:
         issues.extend(check_alpha20(con))
         issues.extend(check_model_factor_freshness(con))
         issues.extend(check_snapshot_diff(con))
+        if not args.skip_price_health:
+            from config.settings import CN_UNIVERSE, STOCK_UNIVERSE
+            from data.fetcher import latest_completed_session_date
+
+            now = datetime.now(timezone.utc)
+            targets = {
+                market: latest_completed_session_date(market, now).isoformat()
+                for market in ("US", "CN")
+            }
+            issues.extend(check_price_1d_health(
+                con,
+                universe_by_market={"US": STOCK_UNIVERSE, "CN": CN_UNIVERSE},
+                target_dates=targets,
+            ))
+    if not args.skip_backfill_runtime:
+        issues.extend(check_backfill_runtime())
     if not args.skip_quotes:
         issues.extend(check_cn_quotes())
     if not args.skip_ledger:

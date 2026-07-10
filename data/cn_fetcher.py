@@ -24,6 +24,8 @@ from data.store import DataStore
 
 log = logging.getLogger("quant.cn")
 
+CN_HISTORICAL_BATCH_TIMEOUT_S = 120.0
+
 # A-share index codes we treat specially (akshare uses stock_zh_index_daily for these)
 INDEX_CODES = {"000300", "000001", "399001", "399006", "000016", "000905"}
 
@@ -120,6 +122,57 @@ def _hist_one(ticker: str, start: str, end: str, interval: str,
     return pd.DataFrame()
 
 
+def _fetch_historical_batch(tickers: list[str], start: str, end: str,
+                            interval: str, price_mode: str,
+                            timeout_s: float,
+                            max_workers: int = 1) -> list[pd.DataFrame]:
+    """Fetch a CN batch within one wall-clock budget and keep partial results."""
+    if not tickers:
+        return []
+
+    frames: list[pd.DataFrame] = []
+    collected = set()
+    ex_pool = ThreadPoolExecutor(max_workers=max(1, int(max_workers)))
+    futures = {
+        ex_pool.submit(
+            _hist_one, ticker, start, end, interval, price_mode=price_mode,
+        ): ticker
+        for ticker in tickers
+    }
+    try:
+        for future in as_completed(futures, timeout=timeout_s):
+            ticker = futures[future]
+            try:
+                frame = future.result(timeout=0)
+            except Exception as exc:
+                log.debug("CN historical fetch %s failed: %s", ticker, exc)
+                continue
+            if frame is not None and not frame.empty:
+                frames.append(frame)
+                collected.add(future)
+    except FuturesTimeoutError:
+        # A future may finish exactly as as_completed raises; harvest every
+        # completed result once more so timeout races do not discard good data.
+        for future, ticker in futures.items():
+            if future in collected or not future.done() or future.cancelled():
+                continue
+            try:
+                frame = future.result(timeout=0)
+            except Exception as exc:
+                log.debug("CN historical fetch %s failed: %s", ticker, exc)
+                continue
+            if frame is not None and not frame.empty:
+                frames.append(frame)
+        pending = sum(1 for future in futures if not future.done())
+        log.warning(
+            "CN historical batch timed out after %.1fs: %d/%d still pending; returning %d partial tickers",
+            timeout_s, pending, len(tickers), len(frames),
+        )
+    finally:
+        ex_pool.shutdown(wait=False, cancel_futures=True)
+    return frames
+
+
 class CNDataFetcher:
     """Cache-aware CN price fetcher mirroring DataFetcher.get_historical."""
 
@@ -128,7 +181,9 @@ class CNDataFetcher:
 
     def get_historical(self, tickers: list[str], days: int = 30,
                        interval: str = "1d", use_cache: bool = True,
-                       price_mode: str = "adjusted") -> pd.DataFrame:
+                       price_mode: str = "adjusted",
+                       batch_timeout_s: float = CN_HISTORICAL_BATCH_TIMEOUT_S,
+                       historical_workers: int = 1) -> pd.DataFrame:
         end = datetime.now(timezone.utc).replace(tzinfo=None)
         start = end - timedelta(days=days)
         s, e = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
@@ -168,11 +223,10 @@ class CNDataFetcher:
 
             log.info("📥 [CN %s] %dd | CACHE %d/%d (%d rows) | DOWNLOADING %d via akshare...",
                      interval, days, hit, len(tickers), len(cached), len(missing))
-            frames: list[pd.DataFrame] = []
-            with ThreadPoolExecutor(max_workers=3) as ex_pool:
-                for df in ex_pool.map(lambda t: _hist_one(t, s, e, interval, price_mode=price_mode), missing):
-                    if not df.empty:
-                        frames.append(df)
+            frames = _fetch_historical_batch(
+                missing, s, e, interval, price_mode, batch_timeout_s,
+                max_workers=historical_workers,
+            )
             dl_rows = sum(len(f) for f in frames)
             dl_tickers = len(frames)
             if frames:
@@ -184,11 +238,10 @@ class CNDataFetcher:
             return final
 
         # use_cache=False — force refresh
-        frames: list[pd.DataFrame] = []
-        with ThreadPoolExecutor(max_workers=3) as ex_pool:
-            for df in ex_pool.map(lambda t: _hist_one(t, s, e, interval, price_mode=price_mode), tickers):
-                if not df.empty:
-                    frames.append(df)
+        frames = _fetch_historical_batch(
+            tickers, s, e, interval, price_mode, batch_timeout_s,
+            max_workers=historical_workers,
+        )
         if not frames:
             return pd.DataFrame(columns=["datetime", "ticker", "open", "high", "low", "close", "volume"])
         merged = pd.concat(frames, ignore_index=True)

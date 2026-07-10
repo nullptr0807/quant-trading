@@ -450,7 +450,7 @@ def _latest_price_timestamp(
     row = conn.execute(
         f"""
         SELECT MAX(datetime) AS max_dt
-        FROM prices
+        FROM prices_raw
         WHERE ticker IN ({placeholders}) AND interval IN ({interval_placeholders})
         """,
         [*sorted(tickers), *intervals],
@@ -473,16 +473,21 @@ def _load_price_history(
     interval_placeholders = ",".join("?" for _ in intervals)
     start_dt = parse_ts(start_ts) or datetime.now(timezone.utc)
     start_buf = (start_dt - timedelta(days=7)).isoformat()
-    rows = conn.execute(
-        f"""
-        SELECT ticker, datetime, interval, close
-        FROM prices
-        WHERE ticker IN ({placeholders}) AND interval IN ({interval_placeholders})
-          AND datetime >= ? AND datetime <= ?
-        ORDER BY ticker, datetime, CASE interval WHEN '1d' THEN 0 ELSE 1 END
-        """,
-        [*sorted(tickers), *intervals, start_buf, end_ts],
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT ticker, datetime, interval, close
+            FROM prices_raw
+            WHERE ticker IN ({placeholders}) AND interval IN ({interval_placeholders})
+              AND datetime >= ? AND datetime <= ?
+            ORDER BY ticker, datetime, CASE interval WHEN '1d' THEN 0 ELSE 1 END
+            """,
+            [*sorted(tickers), *intervals, start_buf, end_ts],
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table: prices_raw" in str(exc):
+            return {}
+        raise
     out: dict[str, list[tuple[float, float, str]]] = {}
     for r in rows:
         dt = parse_ts(str(r["datetime"]))
@@ -537,6 +542,11 @@ def history_curve_audit(
     if not rows:
         return []
     is_cn_history = market == "CN"
+    raw_price_warning = Issue(
+        "warning", account, "history_curve_prices",
+        "historical equity audit skipped where raw execution-price coverage is insufficient; adjusted prices were not used as fallback",
+        {"audit_start": audit_start, "audit_end": audit_end, "price_table": "prices_raw"},
+    )
     if _is_benchmark_account(account, market):
         bt = _benchmark_ticker(account, market)
         tickers = {bt} if bt else set()
@@ -556,13 +566,14 @@ def history_curve_audit(
         # intraday bars overlapping this audit window, pricing them with stale
         # daily closes creates thousands of false critical mismatches. Keep the
         # authoritative current-ledger checks and silently skip this historical
-        # curve audit until intraday history is backfilled/maintained.
+        # curve audit until raw intraday history is backfilled/maintained. Never
+        # substitute adjusted/qfq bars for the execution coordinate.
         if tickers and (
             latest_intraday is None
             or (audit_start_dt is not None and latest_intraday < audit_start_dt)
             or (audit_end_dt is not None and latest_intraday < audit_end_dt - timedelta(days=1))
         ):
-            return []
+            return [raw_price_warning]
     if len(rows) > args.history_max_points:
         step = len(rows) / float(args.history_max_points)
         rows = [rows[int(i * step)] for i in range(args.history_max_points)]
@@ -624,23 +635,26 @@ def history_curve_audit(
         ))
 
     if missing_price_rows and market == "US":
-        # US minute-level history rows are realtime-quote snapshots. The price
-        # cache intentionally does not maintain complete sub-hour bars for every
-        # held/legacy ticker and benchmark row, so missing fine-grain history is
-        # a coverage limitation rather than a ledger issue. Current replay,
-        # cash/positions, and latest-equity checks remain authoritative.
+        # US minute-level history rows are realtime-quote snapshots. The raw
+        # price cache intentionally does not maintain complete sub-hour bars for
+        # every held/legacy ticker and benchmark row, so missing fine-grain
+        # history is a coverage limitation rather than a ledger issue. Never
+        # fall back to adjusted prices; current replay, cash/positions, and
+        # latest-equity checks remain authoritative.
+        issues.append(raw_price_warning)
         return issues
     if missing_price_rows and checked == 0:
-        # If every sampled row lacks price resolution fine enough for this
+        # If every sampled row lacks raw price resolution fine enough for this
         # audit, the watchdog has learned only "history curve audit not
-        # possible", not "ledger is dirty". Keep this silent so --quiet-ok
-        # can still pass when current cash/positions/equity reconcile.
+        # possible", not "ledger is dirty". Emit a clear operational warning
+        # and skip rather than crossing into adjusted price coordinates.
+        issues.append(raw_price_warning)
         return issues
     if missing_price_rows:
         issues.append(Issue(
             "warning", account, "history_curve_prices",
-            f"{missing_price_rows} sampled history row(s) could not be audited due to missing historical prices",
-            {"audit_start": audit_start, "audit_end": audit_end},
+            f"{missing_price_rows} sampled history row(s) could not be audited due to missing raw execution prices; adjusted prices were not used as fallback",
+            {"audit_start": audit_start, "audit_end": audit_end, "price_table": "prices_raw"},
         ))
     return issues
 
@@ -871,13 +885,21 @@ def check_account(
     return issues, stats
 
 
-def load_accounts(conn: sqlite3.Connection, market: str) -> list[sqlite3.Row]:
+def load_accounts(
+    conn: sqlite3.Connection,
+    market: str,
+    *,
+    include_retired: bool = False,
+) -> list[sqlite3.Row]:
+    """Load active operational accounts, optionally including retired archives."""
+    status_clause = "" if include_retired else " AND COALESCE(status,'active')='active'"
     if market == "ALL":
+        where = "WHERE 1=1" + status_clause
         return conn.execute(
-            "SELECT * FROM account_meta ORDER BY market, account_id"
+            f"SELECT * FROM account_meta {where} ORDER BY market, account_id"
         ).fetchall()
     return conn.execute(
-        "SELECT * FROM account_meta WHERE market=? ORDER BY account_id",
+        f"SELECT * FROM account_meta WHERE market=?{status_clause} ORDER BY account_id",
         (market,),
     ).fetchall()
 
@@ -979,7 +1001,11 @@ def main() -> int:
     conn = sqlite3.connect(db)
     conn.row_factory = sqlite3.Row
     try:
-        metas = load_accounts(conn, args.market)
+        metas = load_accounts(
+            conn,
+            args.market,
+            include_retired=args.history_include_retired,
+        )
         all_issues: list[Issue] = []
         all_stats: list[dict[str, Any]] = []
         for meta in metas:
@@ -988,10 +1014,24 @@ def main() -> int:
             all_stats.append(stats)
     finally:
         conn.close()
-    report = render_report(args.date, args.market, all_issues, all_stats, args.quiet_ok)
+    operational_issues = [
+        issue for issue in all_issues
+        if next((s for s in all_stats if s["account"] == issue.account), {}).get("status") != "retired"
+    ]
+    archival_issues = [issue for issue in all_issues if issue not in operational_issues]
+    if args.history_include_retired and archival_issues:
+        # Retired ledgers remain auditable, but they are frozen/non-operational
+        # and must not page the live risk monitor.
+        print(
+            f"Archival findings (non-operational): {len(archival_issues)}; "
+            f"Operational issues: critical={sum(i.severity == 'critical' for i in operational_issues)}"
+        )
+        for issue in archival_issues:
+            print(f"- [{issue.account}] {issue.check}: {issue.message}")
+    report = render_report(args.date, args.market, operational_issues, all_stats, args.quiet_ok)
     if report:
         print(report)
-    if args.fail_on_critical and any(i.severity == "critical" for i in all_issues):
+    if args.fail_on_critical and any(i.severity == "critical" for i in operational_issues):
         return 2
     return 0
 

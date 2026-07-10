@@ -1,7 +1,8 @@
 """Virtual trading account with position tracking and cost basis."""
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+import copy
+from dataclasses import dataclass
 from .costs import MoomooAUCosts
 
 
@@ -21,6 +22,20 @@ class VirtualAccount:
         self.costs = costs or MoomooAUCosts()
         self._positions: dict[str, _Position] = {}
         self.trade_log: list[dict] = []
+
+    def snapshot(self) -> dict:
+        """Capture mutable account state for fail-closed trade rollback."""
+        return {
+            "cash": self.cash,
+            "positions": copy.deepcopy(self._positions),
+            "trade_log": copy.deepcopy(self.trade_log),
+        }
+
+    def restore(self, snapshot: dict) -> None:
+        """Restore a snapshot created by :meth:`snapshot`."""
+        self.cash = snapshot["cash"]
+        self._positions = snapshot["positions"]
+        self.trade_log = snapshot["trade_log"]
 
     def buy(self, ticker: str, shares: float, price: float) -> dict:
         """Buy shares. Returns trade details or raises on insufficient funds."""

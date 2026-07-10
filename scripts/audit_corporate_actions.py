@@ -473,10 +473,13 @@ def run_audit(markets: set[str], focus_accounts: set[str] | None, start: str, en
     md.append("- `warning` means a share-count action occurred during a historical holding interval that later closed; realized PnL should be replayed with the action.\n")
     md.append("- Cash dividends are listed as `info`; cash-credit policy still needs to be defined before repair.\n")
     md_path.write_text("".join(md))
+    summary_path = OUT_DIR / "summary.json"
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2))
 
     return {
         "summary": summary,
         "paths": {
+            "summary": str(summary_path),
             "md": str(md_path),
             "actions_csv": str(actions_csv),
             "affected_csv": str(affected_csv),

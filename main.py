@@ -16,6 +16,7 @@ from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
 import numpy as np
+import pandas as pd
 
 # Ensure project root on path
 PROJECT_ROOT = os.path.expanduser("~/quant-trading")
@@ -29,10 +30,10 @@ from config.settings import (
 from trading.churn_controls import get_stop_cooldown_set, get_min_hold_set
 from data.fetcher import DataFetcher
 from data.cn_fetcher import get_fetcher_for
-from data.store import DataStore, init_db
+from data.store import DataStore
 from factors.alpha_factors import FactorEngine
 from factors.signal import SignalGenerator
-from trading.engine import TradingEngine
+from trading.engine import TradingEngine, TradePersistenceError
 from trading.costs import MoomooAUCosts, CNCosts
 from accounts.strategies import STRATEGIES
 from accounts.gp_strategies import active_gp_strategies_for_market
@@ -316,9 +317,8 @@ class QuantSystem:
         else:
             self.qlib_strategies = list(QLIB_STRATEGIES)
 
-        # Init database
+        # Init database. DataStore owns schema initialization.
         self.db_path = os.path.join(PROJECT_ROOT, "data", "trading.db")
-        init_db(self.db_path)
         self.store = DataStore(self.db_path)
 
         # Data — market-aware fetcher
@@ -386,6 +386,10 @@ class QuantSystem:
         # State
         self._historical_data = {}
         self._factors_dict = {}
+        self._prepared_alpha_signals = {}
+        self._prepared_gp_signals = {}
+        self._prepared_qlib_scores = {}
+        self._fast_live_mode = False
         self._last_data_fetch = None
         self._last_report = None
         self._realtime_prices = {}  # {ticker: float} latest real-time prices
@@ -572,50 +576,60 @@ class QuantSystem:
 
     # -- State persistence ----------------------------------------------------
     def _on_trade(self, account_name: str, trade: dict):
-        """Callback: persist every trade to DB."""
-        try:
-            self.store.save_trade(
-                account=account_name,
-                ticker=trade["ticker"],
-                side=trade["side"],
-                shares=trade["shares"],
-                price=trade["price"],
-                cost=trade.get("total_fees", 0),
-                slippage=trade.get("slippage_cost", 0),
-                market=self.market,
-            )
-        except Exception as e:
-            log.warning("Failed to persist trade: %s", e)
+        """Atomically persist a trade, its event, and the resulting account state."""
+        side = trade["side"]
+        ticker = trade["ticker"]
+        shares = trade["shares"]
+        price = trade["price"]
+        reason = trade.get("reason", "signal")
+        from config.settings import CURRENCY_SYMBOL
+        sym = CURRENCY_SYMBOL.get(self.market, "$")
+        if side == "buy":
+            title = f"BUY {ticker} ×{int(shares)} @ {sym}{price:.2f}"
+            detail = {"shares": shares, "price": price, "fees": trade.get("total_fees", 0)}
+        else:
+            pnl_pct = trade.get("pnl_pct")
+            pnl_dollar = trade.get("pnl_dollar")
+            reason_label = {"stop_loss": "🛑 stop-loss", "signal": "📉 signal-exit",
+                            "take_profit": "🎯 take-profit"}.get(reason, reason)
+            pnl_str = ""
+            if pnl_pct is not None:
+                pnl_str = f" PnL {pnl_pct*100:+.2f}%"
+                if pnl_dollar is not None:
+                    pnl_str += f" ({sym}{pnl_dollar:+.2f})"
+            title = f"SELL {ticker} ×{int(shares)} @ {sym}{price:.2f} · {reason_label}{pnl_str}"
+            detail = {"shares": shares, "price": price, "reason": reason,
+                      "pnl_pct": pnl_pct, "pnl_dollar": pnl_dollar}
 
-        # Emit dashboard event
-        try:
-            side = trade["side"]
-            ticker = trade["ticker"]
-            shares = trade["shares"]
-            price = trade["price"]
-            reason = trade.get("reason", "signal")
-            from config.settings import CURRENCY_SYMBOL
-            sym = CURRENCY_SYMBOL.get(self.market, "$")
-            if side == "buy":
-                title = f"BUY {ticker} ×{int(shares)} @ {sym}{price:.2f}"
-                detail = {"shares": shares, "price": price, "fees": trade.get("total_fees", 0)}
-            else:
-                pnl_pct = trade.get("pnl_pct")
-                pnl_dollar = trade.get("pnl_dollar")
-                reason_label = {"stop_loss": "🛑 stop-loss", "signal": "📉 signal-exit",
-                                "take_profit": "🎯 take-profit"}.get(reason, reason)
-                pnl_str = ""
-                if pnl_pct is not None:
-                    pnl_str = f" PnL {pnl_pct*100:+.2f}%"
-                    if pnl_dollar is not None:
-                        pnl_str += f" ({sym}{pnl_dollar:+.2f})"
-                title = f"SELL {ticker} ×{int(shares)} @ {sym}{price:.2f} · {reason_label}{pnl_str}"
-                detail = {"shares": shares, "price": price, "reason": reason,
-                          "pnl_pct": pnl_pct, "pnl_dollar": pnl_dollar}
-            emit_event("trade", title, account=account_name, ticker=ticker,
-                       detail=detail, market=self.market)
-        except Exception as e:
-            log.warning("Failed to emit trade event: %s", e)
+        account = self.engine.get_account(account_name)
+        durable_prices = self.store.load_position_prices(account_name, market=self.market)
+        positions = [
+            {
+                "ticker": held_ticker,
+                "shares": position.shares,
+                "avg_cost": position.avg_cost,
+                "total_cost": position.total_cost,
+                # Preserve a durable mark for each still-open holding. The
+                # triggering quote is safe for both buys and partial sells;
+                # untouched positions keep their previous mark.
+                "current_price": (
+                    float(price)
+                    if held_ticker == ticker
+                    else durable_prices.get(held_ticker)
+                ),
+            }
+            for held_ticker, position in account._positions.items()
+            if position.shares > 0
+        ]
+        self.store.save_trade_with_state(
+            account=account_name,
+            trade=trade,
+            cash=account.cash,
+            initial_cash=account.initial_cash,
+            positions=positions,
+            event={"title": title, "detail": detail},
+            market=self.market,
+        )
 
     def _restore_state(self):
         """Restore account cash, positions, and adaptive state from DB."""
@@ -673,7 +687,9 @@ class QuantSystem:
 
     def _save_all_state(self):
         """Persist all account states, positions, and adaptive state."""
-        current_prices = self._get_current_prices()
+        current_prices = self._get_current_prices(
+            fetch_missing_benchmarks=not getattr(self, "_fast_live_mode", False)
+        )
         retired = self._retired_accounts()
 
         all_accounts = (
@@ -682,6 +698,21 @@ class QuantSystem:
             + [(q.id,) for q in self.qlib_strategies]
             + [(bm["id"],) for bm in self.benchmarks]
         )
+        if getattr(self, "_fast_live_mode", False):
+            missing_marks = sorted(
+                {
+                    ticker
+                    for (acct_id,) in all_accounts
+                    if acct_id not in retired
+                    for ticker, position in self.engine.get_account(acct_id)._positions.items()
+                    if position.shares > 0 and ticker not in current_prices
+                }
+            )
+            if missing_marks:
+                raise RuntimeError(
+                    "fast live state save aborted: missing realtime marks for held tickers "
+                    + ",".join(missing_marks[:20])
+                )
         for (acct_id,) in all_accounts:
             if acct_id in retired:
                 continue  # frozen — preserve last-known state, no equity drift
@@ -780,8 +811,430 @@ class QuantSystem:
             log.warning("Failed to fetch any real-time prices, using historical close")
         return prices
 
-    def _get_current_prices(self) -> dict[str, float]:
-        """Get best available prices: real-time > historical close."""
+    def _fetch_realtime_prices_for(self, tickers) -> dict[str, float]:
+        """Fetch quotes for an explicit, already-bounded fast-cycle universe."""
+        requested = sorted({str(t) for t in tickers if t})
+        if not requested:
+            return {}
+        try:
+            prices = self.fetcher.get_realtime_quotes(requested)
+        except Exception as e:
+            log.warning("bounded realtime quote fetch failed: %s", e)
+            return {}
+        if not prices:
+            log.warning("Bounded realtime quote fetch returned no prices")
+            return {}
+        return {
+            ticker: float(price)
+            for ticker, price in prices.items()
+            if ticker in requested and price is not None and float(price) > 0
+        }
+
+    # -- Persisted-signal fast live path -------------------------------------
+    def _latest_market_price_date(self, conn) -> str | None:
+        """Latest cached daily price date for this market's configured universe."""
+        universe = list(self.universe)
+        if not universe:
+            return None
+        placeholders = ",".join("?" * len(universe))
+        row = conn.execute(
+            f"SELECT MAX(substr(datetime,1,10)) FROM prices "
+            f"WHERE interval='1d' AND ticker IN ({placeholders})",
+            universe,
+        ).fetchone()
+        return row[0] if row else None
+
+    def _emit_persisted_signal_gate(
+        self,
+        *,
+        account_id: str,
+        factor_group: str,
+        reason: str,
+        factor_date: str | None,
+        latest_price_date: str | None,
+        covered_tickers: int,
+        universe_size: int,
+        coverage: float,
+        required_coverage: float,
+        lag_days: int | None,
+        max_lag_days: int,
+    ) -> None:
+        detail = {
+            "reason": reason,
+            "factor_group": factor_group,
+            "factor_date": factor_date,
+            "latest_price_date": latest_price_date,
+            "lag_days": lag_days,
+            "max_lag_days": max_lag_days,
+            "covered_tickers": covered_tickers,
+            "universe_size": universe_size,
+            "coverage": round(coverage, 4),
+            "required_coverage": required_coverage,
+        }
+        log.error(
+            "[%s] persisted signal gate failed: group=%s reason=%s date=%s "
+            "latest_price=%s lag=%s coverage=%d/%d (%.1f%%; need %.1f%%); no-op",
+            account_id, factor_group, reason, factor_date, latest_price_date,
+            lag_days, covered_tickers, universe_size, coverage * 100,
+            required_coverage * 100,
+        )
+        emit_event(
+            "factor",
+            f"⚠️ Persisted signal skipped: {account_id} ({reason})",
+            severity="error",
+            account=account_id,
+            detail=detail,
+            market=self.market,
+        )
+
+    def _load_latest_persisted_factor_frames(
+        self,
+        *,
+        account_id: str,
+        factor_group: str,
+        factor_names: list[str],
+        min_coverage: float = 0.80,
+        max_lag_days: int | None = None,
+    ) -> dict[str, pd.DataFrame]:
+        """Load one account's newest persisted factor cross-section, fail closed.
+
+        Every requested factor must come from the same latest factor date.  The
+        account is allowed to trade only when that date is near the market's
+        latest cached daily bar and enough of the configured universe has at
+        least one usable requested factor.  A failed gate returns an empty dict;
+        callers treat it as a technical no-op and never liquidate positions.
+        """
+        import sqlite3
+
+        names = list(dict.fromkeys(name for name in factor_names if name))
+        universe = list(self.universe)
+        if max_lag_days is None:
+            max_lag_days = 3 if self.market == "CN" else 2
+        if not names or not universe:
+            self._emit_persisted_signal_gate(
+                account_id=account_id,
+                factor_group=factor_group,
+                reason="empty_config",
+                factor_date=None,
+                latest_price_date=None,
+                covered_tickers=0,
+                universe_size=len(universe),
+                coverage=0.0,
+                required_coverage=min_coverage,
+                lag_days=None,
+                max_lag_days=max_lag_days,
+            )
+            return {}
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            ticker_ph = ",".join("?" * len(universe))
+            factor_ph = ",".join("?" * len(names))
+            latest_row = conn.execute(
+                f"SELECT MAX(date) FROM factor_values "
+                f"WHERE factor_group=? AND factor_name IN ({factor_ph}) "
+                f"AND ticker IN ({ticker_ph}) AND value IS NOT NULL",
+                (factor_group, *names, *universe),
+            ).fetchone()
+            factor_date = latest_row[0] if latest_row else None
+            latest_price_date = self._latest_market_price_date(conn)
+            rows = []
+            if factor_date:
+                rows = conn.execute(
+                    f"SELECT ticker,factor_name,value FROM factor_values "
+                    f"WHERE factor_group=? AND date=? AND value IS NOT NULL "
+                    f"AND factor_name IN ({factor_ph}) "
+                    f"AND ticker IN ({ticker_ph})",
+                    (factor_group, factor_date, *names, *universe),
+                ).fetchall()
+            conn.close()
+        except Exception as e:
+            log.warning("[%s] persisted factor load failed for %s: %s", account_id, factor_group, e)
+            return {}
+
+        covered = len({ticker for ticker, _name, _value in rows})
+        coverage = covered / len(universe) if universe else 0.0
+        lag_days = None
+        if factor_date and latest_price_date:
+            try:
+                from datetime import date as _date
+                lag_days = (
+                    _date.fromisoformat(str(latest_price_date)[:10])
+                    - _date.fromisoformat(str(factor_date)[:10])
+                ).days
+            except (TypeError, ValueError):
+                lag_days = None
+
+        reason = None
+        if not factor_date or not rows:
+            reason = "missing"
+        elif latest_price_date and (lag_days is None or lag_days > max_lag_days):
+            reason = "stale"
+        elif coverage < min_coverage:
+            reason = "coverage"
+        if reason:
+            self._emit_persisted_signal_gate(
+                account_id=account_id,
+                factor_group=factor_group,
+                reason=reason,
+                factor_date=factor_date,
+                latest_price_date=latest_price_date,
+                covered_tickers=covered,
+                universe_size=len(universe),
+                coverage=coverage,
+                required_coverage=min_coverage,
+                lag_days=lag_days,
+                max_lag_days=max_lag_days,
+            )
+            return {}
+
+        by_ticker: dict[str, dict[str, float]] = defaultdict(dict)
+        for ticker, factor_name, value in rows:
+            by_ticker[ticker][factor_name] = float(value)
+        return {
+            ticker: pd.DataFrame(
+                [[values.get(name, np.nan) for name in names]],
+                index=[pd.Timestamp(str(factor_date)[:10])],
+                columns=names,
+            )
+            for ticker, values in by_ticker.items()
+        }
+
+    @staticmethod
+    def _signals_from_persisted_alpha_frames(
+        frames: dict[str, pd.DataFrame],
+        *,
+        strategy_type: str,
+        buy_top: int,
+        sell_top: int = 10,
+    ) -> dict:
+        """Rank exactly the account-declared persisted factors cross-sectionally."""
+        rows = {}
+        for ticker, frame in frames.items():
+            if frame is None or frame.empty:
+                continue
+            rows[ticker] = frame.iloc[-1]
+        if not rows:
+            return {"buy": [], "sell": []}
+        cross_section = pd.DataFrame(rows).T
+        composite = cross_section.rank(axis=0, pct=True).mean(axis=1, skipna=True).dropna()
+        if composite.empty:
+            return {"buy": [], "sell": []}
+        ranks = composite.rank(pct=True)
+        if strategy_type == "mean_reversion":
+            ranks = 1 - ranks
+        ranked = ranks.sort_values(ascending=False)
+        return {
+            "buy": [(ticker, round(float(score), 4)) for ticker, score in ranked.head(buy_top).items()],
+            "sell": [(ticker, round(float(score), 4)) for ticker, score in ranked.tail(sell_top).items()],
+        }
+
+    @staticmethod
+    def _signal_tickers(signals: dict | None, hold_count: int) -> set[str]:
+        """Extract candidate + hold-band tickers from A or GP signal shapes."""
+        if not signals:
+            return set()
+        buy = signals.get("buy") or []
+        out = set()
+        for item in buy[:max(0, hold_count)]:
+            ticker = item[0] if isinstance(item, (tuple, list)) else item
+            if ticker:
+                out.add(str(ticker))
+        return out
+
+    def _active_holding_tickers(self) -> set[str]:
+        retired = self._retired_accounts()
+        return {
+            ticker
+            for account_id, account in self.engine.accounts.items()
+            if account_id not in retired
+            for ticker, position in account._positions.items()
+            if position.shares > 0
+        }
+
+    def prepare_fast_live_cycle(self) -> set[str]:
+        """Load persisted A/GP/F/Q signals and return the bounded quote universe."""
+        cc = CHURN_CONTROLS if CHURN_CONTROLS.get("enabled", True) else {}
+        hold_mult = int(cc.get("hold_band_mult", 1) or 1)
+        quote_tickers = self._active_holding_tickers()
+        quote_tickers.update(bm["ticker"] for bm in self.benchmarks)
+        self._prepared_alpha_signals = {}
+        self._prepared_gp_signals = {}
+        self._prepared_qlib_scores = {}
+        self._factors_dict = {}
+        self._per_account_gp_factors = {}
+
+        # Alpha accounts use exactly the factors declared by each account.  A06
+        # is the legacy "all factors" account; derive its active names from the
+        # latest alpha158 date rather than loading arbitrary historical rows.
+        all_alpha_names = None
+        for strat in self.strategies:
+            names = list(getattr(strat, "factor_names", None) or [])
+            if not names:
+                if all_alpha_names is None:
+                    import sqlite3
+                    with sqlite3.connect(self.db_path) as conn:
+                        universe = list(self.universe)
+                        if universe:
+                            ph = ",".join("?" * len(universe))
+                            row = conn.execute(
+                                f"SELECT MAX(date) FROM factor_values "
+                                f"WHERE factor_group='alpha158' AND ticker IN ({ph})",
+                                universe,
+                            ).fetchone()
+                            latest = row[0] if row else None
+                            if latest:
+                                all_alpha_names = [
+                                    r[0] for r in conn.execute(
+                                        f"SELECT DISTINCT factor_name FROM factor_values "
+                                        f"WHERE factor_group='alpha158' AND date=? "
+                                        f"AND ticker IN ({ph}) ORDER BY factor_name",
+                                        (latest, *universe),
+                                    ).fetchall()
+                                ]
+                        if all_alpha_names is None:
+                            all_alpha_names = []
+                names = all_alpha_names
+            frames = self._load_latest_persisted_factor_frames(
+                account_id=strat.id,
+                factor_group="alpha158",
+                factor_names=names,
+            )
+            # Persist per-account signals because A configurations may select
+            # different factor names even when strategy_type is the same.
+            signals = (
+                self._signals_from_persisted_alpha_frames(
+                    frames,
+                    strategy_type=strat.strategy_type,
+                    buy_top=max(30, strat.top_n * hold_mult),
+                )
+                if frames else {"buy": [], "sell": []}
+            )
+            self._prepared_alpha_signals[strat.id] = signals
+            quote_tickers.update(
+                self._signal_tickers(signals, strat.top_n * hold_mult)
+            )
+
+        for gp_strat in self.gp_strategies:
+            mined = [
+                f for f in self._per_account_mined.get(gp_strat.id, [])
+                if self._is_active_mined_factor(f)
+            ]
+            names = [f.get("name") for f in mined if f.get("name")]
+            prefix = "fmgp" if getattr(gp_strat, "family", "B") == "F" else "gp"
+            frames = self._load_latest_persisted_factor_frames(
+                account_id=gp_strat.id,
+                factor_group=f"{prefix}_{gp_strat.id}",
+                factor_names=names,
+            )
+            self._per_account_gp_factors[gp_strat.id] = frames
+            filtered = self._filter_gp_factors(gp_strat, frames) if frames else {}
+            signals = (
+                self.gp_signal_gen.generate_signals(
+                    filtered,
+                    top_n=gp_strat.top_n,
+                    buy_candidates=max(gp_strat.top_n * 5, 30),
+                )
+                if filtered else {"buy": [], "sell": []}
+            )
+            self._prepared_gp_signals[gp_strat.id] = signals
+            quote_tickers.update(
+                self._signal_tickers(signals, gp_strat.top_n * hold_mult)
+            )
+
+        for q_strat in self.qlib_strategies:
+            scored = self._load_qlib_scores(q_strat.id)
+            self._prepared_qlib_scores[q_strat.id] = scored
+            quote_tickers.update(
+                ticker for ticker, _score in scored[:q_strat.top_n * hold_mult]
+            )
+
+        log.info(
+            "Prepared persisted signals [%s]: A=%d GP/F=%d Q=%d bounded_quotes=%d "
+            "(universe=%d)",
+            self.market,
+            sum(bool(v.get("buy")) for v in self._prepared_alpha_signals.values()),
+            sum(bool(v.get("buy")) for v in self._prepared_gp_signals.values()),
+            sum(bool(v) for v in self._prepared_qlib_scores.values()),
+            len(quote_tickers), len(self.universe),
+        )
+        return quote_tickers
+
+    def run_fast_live_cycle(
+        self,
+        prepared_path: str | None = None,
+        *,
+        dry_run: bool = False,
+    ):
+        """Trade from persisted signals without universe history/factor work."""
+        if not is_market_hours_for(self.market) and not dry_run:
+            log.info("Outside %s market window — fast live cycle skipped", self.market)
+            return None
+
+        self._fast_live_mode = True
+        if prepared_path:
+            prepared = json.loads(open(prepared_path).read())
+            if prepared.get("market") != self.market:
+                raise RuntimeError(
+                    f"prepared fast-cycle market mismatch: {prepared.get('market')} != {self.market}"
+                )
+            quote_tickers = set(prepared.get("tickers") or [])
+            self._prepared_alpha_signals = prepared.get("prepared_alpha_signals") or {}
+            self._prepared_gp_signals = prepared.get("prepared_gp_signals") or {}
+            self._prepared_qlib_scores = {
+                account: [(str(ticker), float(score)) for ticker, score in scores]
+                for account, scores in (prepared.get("prepared_qlib_scores") or {}).items()
+            }
+            # The fast trade phase no longer needs factor frames; prepared GP
+            # rankings are authoritative for this cycle.
+            self._per_account_gp_factors = {
+                account: {} for account in self._prepared_gp_signals
+            }
+        else:
+            t0 = time.time()
+            quote_tickers = self.prepare_fast_live_cycle()
+            prepare_seconds = time.time() - t0
+            if prepare_seconds > 90:
+                log.error(
+                    "[%s] fast live cycle aborted: persisted-signal preparation took %.1fs (>90s)",
+                    self.market, prepare_seconds,
+                )
+                return None
+        self._realtime_prices = self._fetch_realtime_prices_for(quote_tickers)
+        if not self._realtime_prices:
+            log.error("[%s] fast live cycle aborted: no bounded realtime quotes", self.market)
+            return None
+        if dry_run:
+            held = self._active_holding_tickers()
+            missing_held = sorted(held - set(self._realtime_prices))
+            if missing_held:
+                raise RuntimeError(
+                    "fast dry-run missing quotes for held tickers: "
+                    + ",".join(missing_held[:20])
+                )
+            log.info(
+                "Fast live dry-run [%s] OK: prepared=%d quoted=%d held=%d; no trades/state writes",
+                self.market, len(quote_tickers), len(self._realtime_prices), len(held),
+            )
+            return None
+
+        self.initialize_benchmarks()
+        self.run_trading_cycle()
+        self.run_gp_trading_cycle()
+        self.run_qlib_trading_cycle()
+        try:
+            self._save_all_state()
+        except Exception:
+            log.exception("Failed to save state after fast live cycle")
+            raise
+        return None
+
+    def _get_current_prices(self, fetch_missing_benchmarks: bool = True) -> dict[str, float]:
+        """Get best available prices: real-time > historical close.
+
+        Fast live cycles pass ``fetch_missing_benchmarks=False`` so this helper
+        cannot silently expand the bounded quote request with historical calls.
+        """
         # Base: historical close prices
         prices = {}
         for ticker, df in self._historical_data.items():
@@ -792,7 +1245,7 @@ class QuantSystem:
         # Ensure benchmark tickers have prices
         for bm in self.benchmarks:
             t = bm["ticker"]
-            if t not in prices:
+            if t not in prices and fetch_missing_benchmarks:
                 # Realtime via the market-aware fetcher (no direct yfinance).
                 try:
                     q = self.fetcher.get_realtime_quotes([t])
@@ -847,13 +1300,6 @@ class QuantSystem:
         # 更新自适应换仓的市场波动率数据
         if self._adaptive_enabled:
             self._update_market_returns()
-
-        # Save prices to DB
-        for ticker, df in self._historical_data.items():
-            try:
-                self.store.save_prices(ticker, df)
-            except Exception as e:
-                log.warning("Failed to save prices for %s: %s", ticker, e)
 
     # -- Step 2: Compute factors --------------------------------------------
     def compute_factors(self):
@@ -1114,12 +1560,14 @@ class QuantSystem:
     # -- Benchmark buy-and-hold -----------------------------------------------
     def initialize_benchmarks(self):
         """Buy-and-hold: for each benchmark, if no position, buy with all cash."""
-        current_prices = self._get_current_prices()
+        current_prices = self._get_current_prices(
+            fetch_missing_benchmarks=not getattr(self, "_fast_live_mode", False)
+        )
         for bm in self.benchmarks:
             acct = self.engine.get_account(bm["id"])
             ticker = bm["ticker"]
             price = current_prices.get(ticker)
-            if not price:
+            if not price and not getattr(self, "_fast_live_mode", False):
                 # Last-ditch: ask the fetcher for a fresh realtime quote.
                 try:
                     q = self.fetcher.get_realtime_quotes([ticker])
@@ -1137,15 +1585,12 @@ class QuantSystem:
             shares = int(acct.cash * 0.999 / price)  # leave tiny margin for fees
             if shares <= 0:
                 continue
-            result = acct.buy(ticker, shares, price)
+            result = self.engine.execute_trade(
+                bm["id"], ticker, "buy", shares, price
+            )
             if result:
                 log.info("Benchmark %s: bought %d shares of %s @ $%.2f",
                          bm["id"], shares, ticker, price)
-                if self.engine.trade_callback:
-                    try:
-                        self.engine.trade_callback(bm["id"], result)
-                    except Exception:
-                        pass
 
     # -- Step 3a: Trade original accounts -----------------------------------
     def run_gp_trading_cycle(self):
@@ -1161,7 +1606,9 @@ class QuantSystem:
             return
 
         log.info("Running GP trading cycle...")
-        current_prices = self._get_current_prices()
+        current_prices = self._get_current_prices(
+            fetch_missing_benchmarks=not getattr(self, "_fast_live_mode", False)
+        )
         retired = self._retired_accounts()
 
         for gp_strat in self.gp_strategies:
@@ -1183,6 +1630,8 @@ class QuantSystem:
                     account=gp_strat.id,
                     market=self.market,
                 )
+            except TradePersistenceError:
+                raise
             except Exception as e:
                 log.error("Error trading GP %s: %s", gp_strat.id, e)
                 traceback.print_exc()
@@ -1192,18 +1641,24 @@ class QuantSystem:
         acct = self.engine.get_account(gp_strat.id)
         equity = acct.get_equity(current_prices)
 
-        # Get this account's factors
-        account_factors = self._per_account_gp_factors.get(gp_strat.id, {})
-        if not account_factors:
-            return False
-
-        # Filter factors based on strategy config
-        filtered_factors = self._filter_gp_factors(gp_strat, account_factors)
-
-        # Generate signals using GP signal generator
-        signals = self.gp_signal_gen.generate_signals(
-            filtered_factors, top_n=gp_strat.top_n, buy_candidates=max(gp_strat.top_n * 5, 30)
-        )
+        # Get this account's factors/signals. Fast cycles already computed the
+        # persisted ranking; use it directly so scoring cannot drift between the
+        # bounded quote preparation and the locked trade phase.
+        if getattr(self, "_fast_live_mode", False):
+            signals = self._prepared_gp_signals.get(
+                gp_strat.id, {"buy": [], "sell": []}
+            )
+            filtered_factors = self._per_account_gp_factors.get(gp_strat.id, {})
+        else:
+            account_factors = self._per_account_gp_factors.get(gp_strat.id, {})
+            if not account_factors:
+                return False
+            filtered_factors = self._filter_gp_factors(gp_strat, account_factors)
+            signals = self.gp_signal_gen.generate_signals(
+                filtered_factors,
+                top_n=gp_strat.top_n,
+                buy_candidates=max(gp_strat.top_n * 5, 30),
+            )
 
         buy_tickers = set(signals["buy"])
         sell_tickers = set(signals["sell"])
@@ -1264,6 +1719,8 @@ class QuantSystem:
                     log.info("[%s] GP Stop loss %s: %.1f%%", gp_strat.id, ticker, pnl_pct * 100)
                     try:
                         self.engine.execute_signal(gp_strat.id, ticker, "sell", shares, price, current_prices, reason="stop_loss")
+                    except TradePersistenceError:
+                        raise
                     except Exception as e:
                         log.warning("[%s] GP Sell failed %s: %s", gp_strat.id, ticker, e)
                     continue
@@ -1276,6 +1733,8 @@ class QuantSystem:
                 try:
                     self.engine.execute_signal(gp_strat.id, ticker, "sell", shares, price, current_prices)
                     log.info("[%s] GP Sold %s x%.0f @ $%.2f", gp_strat.id, ticker, shares, price)
+                except TradePersistenceError:
+                    raise
                 except Exception as e:
                     log.warning("[%s] GP Sell failed %s: %s", gp_strat.id, ticker, e)
 
@@ -1321,6 +1780,8 @@ class QuantSystem:
                     if held <= 0:
                         active_count += 1
                     log.info("[%s] GP Bought %s x%d @ $%.2f", gp_strat.id, ticker, result["shares"], price)
+            except TradePersistenceError:
+                raise
             except Exception as e:
                 log.warning("[%s] GP Buy failed %s: %s", gp_strat.id, ticker, e)
 
@@ -1390,7 +1851,9 @@ class QuantSystem:
             log.info("Outside US RTH (09:30-16:00 ET) — Qlib cycle skipped (avoids pre/post-market alpha leakage)")
             return
         log.info("Running Qlib trading cycle...")
-        current_prices = self._get_current_prices()
+        current_prices = self._get_current_prices(
+            fetch_missing_benchmarks=not getattr(self, "_fast_live_mode", False)
+        )
         retired = self._retired_accounts()
 
         for q_strat in self.qlib_strategies:
@@ -1409,6 +1872,8 @@ class QuantSystem:
                     account=q_strat.id,
                     market=self.market,
                 )
+            except TradePersistenceError:
+                raise
             except Exception as e:
                 log.error("Error trading Qlib %s: %s", q_strat.id, e)
                 traceback.print_exc()
@@ -1491,10 +1956,33 @@ class QuantSystem:
 
             rows = conn.execute(
                 f"SELECT ticker, value FROM factor_values "
-                f"WHERE factor_name=? AND date=? AND value IS NOT NULL "
+                f"WHERE factor_group='qlib' AND factor_name=? AND date=? AND value IS NOT NULL "
                 f"AND ticker IN ({placeholders})",
                 (factor_name, latest, *uni_list),
             ).fetchall()
+            coverage = len({ticker for ticker, _value in rows}) / len(uni_list)
+            if coverage < 0.80:
+                conn.close()
+                self._emit_persisted_signal_gate(
+                    account_id=q_id,
+                    factor_group="qlib",
+                    reason="coverage",
+                    factor_date=latest,
+                    latest_price_date=latest_price_date,
+                    covered_tickers=len({ticker for ticker, _value in rows}),
+                    universe_size=len(uni_list),
+                    coverage=coverage,
+                    required_coverage=0.80,
+                    lag_days=(
+                        (
+                            datetime.fromisoformat(str(latest_price_date)[:10]).date()
+                            - datetime.fromisoformat(str(latest)[:10]).date()
+                        ).days
+                        if latest_price_date else None
+                    ),
+                    max_lag_days=3 if self.market == "CN" else 2,
+                )
+                return []
             conn.close()
         except Exception as e:
             log.warning("[%s] Failed to load qlib scores: %s", q_id, e)
@@ -1508,7 +1996,10 @@ class QuantSystem:
     def _trade_qlib_account(self, q_strat, current_prices: dict):
         """Execute one Q-account's trading using model scores from DB."""
         acct = self.engine.get_account(q_strat.id)
-        scored = self._load_qlib_scores(q_strat.id)
+        if getattr(self, "_fast_live_mode", False):
+            scored = self._prepared_qlib_scores.get(q_strat.id, [])
+        else:
+            scored = self._load_qlib_scores(q_strat.id)
         if not scored:
             log.warning("[%s] no qlib scores found in factor_values, skipping", q_strat.id)
             return False
@@ -1547,6 +2038,8 @@ class QuantSystem:
                             q_strat.id, ticker, "sell", shares, price, current_prices,
                             reason="stop_loss",
                         )
+                    except TradePersistenceError:
+                        raise
                     except Exception as e:
                         log.warning("[%s] Qlib sell failed %s: %s", q_strat.id, ticker, e)
                     continue
@@ -1560,6 +2053,8 @@ class QuantSystem:
                         q_strat.id, ticker, "sell", shares, price, current_prices,
                     )
                     log.info("[%s] Qlib sold %s x%.0f @ $%.2f", q_strat.id, ticker, shares, price)
+                except TradePersistenceError:
+                    raise
                 except Exception as e:
                     log.warning("[%s] Qlib sell failed %s: %s", q_strat.id, ticker, e)
 
@@ -1607,6 +2102,8 @@ class QuantSystem:
                     if held <= 0:
                         active_count += 1
                     log.info("[%s] Qlib bought %s x%d @ $%.2f", q_strat.id, ticker, result["shares"], price)
+            except TradePersistenceError:
+                raise
             except Exception as e:
                 log.warning("[%s] Qlib buy failed %s: %s", q_strat.id, ticker, e)
         return True
@@ -1714,7 +2211,9 @@ class QuantSystem:
             return
         log.info("Running trading cycle...")
 
-        current_prices = self._get_current_prices()
+        current_prices = self._get_current_prices(
+            fetch_missing_benchmarks=not getattr(self, "_fast_live_mode", False)
+        )
         retired = self._retired_accounts()
 
         for strat in self.strategies:
@@ -1723,7 +2222,9 @@ class QuantSystem:
             try:
                 if not self._should_rebalance(strat.id, strat.rebalance_hours):
                     continue
-                self._trade_account(strat, current_prices)
+                executed = self._trade_account(strat, current_prices)
+                if executed is False:
+                    continue
                 self._last_rebalance[strat.id] = datetime.now(timezone.utc)
                 emit_event(
                     "rebalance",
@@ -1731,6 +2232,8 @@ class QuantSystem:
                     account=strat.id,
                     market=self.market,
                 )
+            except TradePersistenceError:
+                raise
             except Exception as e:
                 log.error("Error trading %s: %s", strat.id, e)
                 traceback.print_exc()
@@ -1740,10 +2243,21 @@ class QuantSystem:
         acct = self.engine.get_account(strat.id)
         equity = acct.get_equity(current_prices)
 
-        # Generate signals
-        signals = self.signal_gen.generate_signals(
-            self._factors_dict, strat.strategy_type
-        )
+        # Generate signals.  Fast cycles prepare account-specific persisted
+        # scores up front; an empty prepared list is a technical no-op.
+        prepared = getattr(self, "_prepared_alpha_signals", {})
+        if getattr(self, "_fast_live_mode", False):
+            signals = prepared.get(strat.id, {"buy": [], "sell": []})
+        else:
+            signals = self.signal_gen.generate_signals(
+                self._factors_dict, strat.strategy_type
+            )
+        if not signals.get("buy"):
+            log.warning(
+                "[%s] Alpha signals empty — skipping rebalance to preserve positions",
+                strat.id,
+            )
+            return False
 
         # --- Churn controls (P0, 2026-06-01): hysteresis + cooldown + min_hold ---
         # See trading/churn_controls.py and CHURN_CONTROLS in config/settings.py.
@@ -1779,6 +2293,8 @@ class QuantSystem:
                             strat.id, ticker, "sell", shares, price, current_prices,
                             reason="stop_loss",
                         )
+                    except TradePersistenceError:
+                        raise
                     except Exception as e:
                         log.warning("[%s] Sell failed %s: %s", strat.id, ticker, e)
                     continue
@@ -1794,6 +2310,8 @@ class QuantSystem:
                         strat.id, ticker, "sell", shares, price, current_prices
                     )
                     log.info("[%s] Sold %s x%.0f @ $%.2f", strat.id, ticker, shares, price)
+                except TradePersistenceError:
+                    raise
                 except Exception as e:
                     log.warning("[%s] Sell failed %s: %s", strat.id, ticker, e)
 
@@ -1853,6 +2371,8 @@ class QuantSystem:
                         active_count += 1
                     log.info("[%s] Bought %s x%d @ $%.2f (score=%.3f)",
                              strat.id, ticker, result["shares"], price, score)
+            except TradePersistenceError:
+                raise
             except Exception as e:
                 log.warning("[%s] Buy failed %s: %s", strat.id, ticker, e)
 
@@ -2261,7 +2781,7 @@ class QuantSystem:
 # ---------------------------------------------------------------------------
 # Entry points
 # ---------------------------------------------------------------------------
-def _run_for_market(market: str, mode: str):
+def _run_for_market(market: str, mode: str, *, dry_run: bool = False):
     """Instantiate a QuantSystem for `market` and dispatch to the requested mode."""
     log.info("===== Running market: %s (%s) =====", market, mode)
     system = QuantSystem(market=market)
@@ -2270,6 +2790,11 @@ def _run_for_market(market: str, mode: str):
         return system.run_once(send_report=send_report)
     if mode == "cycle_no_report":
         return system.run_once(send_report=False)
+    if mode == "fast_cycle":
+        return system.run_fast_live_cycle(
+            prepared_path=os.environ.get("QUANT_FAST_PREPARED_PATH"),
+            dry_run=dry_run,
+        )
     if mode == "loop":
         # In loop mode each call runs its own forever-loop; we only support
         # single-market loop via this helper. main() handles multi-market.
@@ -2297,7 +2822,11 @@ def main():
     parser = argparse.ArgumentParser(description="Multi-Market Quant Trading System")
     parser.add_argument("--once", action="store_true", help="Run single cycle then exit")
     parser.add_argument("--cycle-no-report", action="store_true",
-                        help="Run trading cycle but skip Telegram report (for intra-hour cron)")
+                        help="Run legacy full trading cycle without Telegram report")
+    parser.add_argument("--fast-cycle", action="store_true",
+                        help="Run bounded live cycle from persisted signals (cron default)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="For --fast-cycle: fetch/validate bounded quotes but do not trade/write")
     parser.add_argument("--loop", action="store_true", help="Run continuous loop (US only)")
     parser.add_argument("--test", action="store_true", help="Quick smoke test")
     parser.add_argument("--market", choices=MARKETS + ["ALL"], default="ALL",
@@ -2306,6 +2835,8 @@ def main():
 
     if args.once:
         mode = "once"
+    elif args.fast_cycle:
+        mode = "fast_cycle"
     elif args.cycle_no_report:
         mode = "cycle_no_report"
     elif args.loop:
@@ -2323,15 +2854,27 @@ def main():
         market = markets[0]
         if len(markets) > 1:
             log.warning("--loop only supports one market at a time; using %s", market)
-        _run_for_market(market, mode)
+        _run_for_market(market, mode, dry_run=args.dry_run)
         return
 
+    first_failure = None
     for market in markets:
         try:
-            _run_for_market(market, mode)
+            try:
+                _run_for_market(market, mode, dry_run=args.dry_run)
+            except TypeError as exc:
+                # Preserve monkeypatchability for legacy two-argument test
+                # doubles while production uses the explicit dry-run keyword.
+                if "dry_run" not in str(exc):
+                    raise
+                _run_for_market(market, mode)
         except Exception as e:
             log.exception("Market %s failed: %s", market, e)
+            if first_failure is None:
+                first_failure = e
             continue
+    if first_failure is not None:
+        raise first_failure
 
 
 if __name__ == "__main__":

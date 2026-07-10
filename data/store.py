@@ -175,6 +175,40 @@ def init_db(db_path: str | None = None):
         avg_return REAL NOT NULL
     )""")
 
+    # Trades and account state are market-scoped. Keep fresh databases aligned
+    # with the deployed schema; existing databases already receive these columns
+    # from scripts/migrate_add_market.py.
+    market_scoped = (
+        "trades", "accounts", "positions", "account_state",
+        "positions_history", "adaptive_state",
+    )
+    for table in market_scoped:
+        columns = {row[1] for row in c.execute(f"PRAGMA table_info({table})")}
+        if "market" not in columns:
+            c.execute(
+                f"ALTER TABLE {table} ADD COLUMN market TEXT NOT NULL DEFAULT 'US'"
+            )
+
+    # Trade events share the same connection/transaction as the ledger write.
+    c.execute("""CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        category TEXT NOT NULL,
+        severity TEXT NOT NULL DEFAULT 'info',
+        account TEXT,
+        ticker TEXT,
+        title TEXT NOT NULL,
+        detail TEXT,
+        market TEXT NOT NULL DEFAULT 'US'
+    )""")
+    event_columns = {row[1] for row in c.execute("PRAGMA table_info(events)")}
+    if "market" not in event_columns:
+        c.execute("ALTER TABLE events ADD COLUMN market TEXT NOT NULL DEFAULT 'US'")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_events_cat ON events(category)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_trades_market_ts ON trades(market, timestamp)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_events_market_ts ON events(market, ts)")
+
     conn.commit()
     conn.close()
 
@@ -313,6 +347,122 @@ class DataStore:
         )
         conn.commit()
         conn.close()
+
+    def save_trade_with_state(
+        self,
+        *,
+        account: str,
+        trade: dict,
+        cash: float,
+        initial_cash: float,
+        positions: list[dict],
+        event: dict,
+        market: str = "US",
+    ) -> None:
+        """Atomically persist one trade, its event, and resulting account state."""
+        ts = datetime.now(timezone.utc).isoformat()
+        ticker = trade["ticker"]
+        market = _market_for_trade(account, ticker, market)
+        expected_tickers = {
+            str(position["ticker"])
+            for position in positions
+            if float(position.get("shares", 0) or 0) > 0
+        }
+        expected_position_count = len(expected_tickers)
+        conn = self._conn()
+        try:
+            conn.execute("BEGIN")
+            db_tickers = {
+                str(row[0]) for row in conn.execute(
+                    "SELECT ticker FROM positions WHERE account=? AND market=? AND shares>0",
+                    (account, market),
+                ).fetchall()
+            }
+            current_position_count = len(db_tickers)
+            # A trade may add or fully remove only its own ticker. Every other
+            # holding must already match between restored memory and durable DB.
+            if (db_tickers - {ticker}) != (expected_tickers - {ticker}):
+                raise RuntimeError(
+                    f"atomic trade precondition failed for {account}/{market}: "
+                    f"memory_tickers={sorted(expected_tickers)} db_tickers={sorted(db_tickers)}"
+                )
+            # A first trade can legitimately create the first position. Otherwise
+            # the DB and restored in-memory book must agree before we overwrite
+            # the full position set in this transaction.
+            allowed_counts = {expected_position_count}
+            if trade["side"] == "buy" and expected_position_count > 0:
+                allowed_counts.add(expected_position_count - 1)
+            if trade["side"] == "sell":
+                allowed_counts.add(expected_position_count + 1)
+            if current_position_count not in allowed_counts:
+                raise RuntimeError(
+                    f"atomic trade precondition failed for {account}/{market}: "
+                    f"post_trade_memory_positions={expected_position_count} "
+                    f"db_positions={current_position_count}"
+                )
+            conn.execute(
+                "INSERT INTO trades (account,ticker,side,shares,price,cost,slippage,timestamp,market) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    account, ticker, trade["side"], trade["shares"], trade["price"],
+                    trade.get("total_fees", 0),
+                    trade.get(
+                        "slippage_cost",
+                        abs(float(trade.get("exec_price", trade["price"])) - float(trade["price"]))
+                        * float(trade["shares"]),
+                    ),
+                    ts, market,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO events (ts,category,severity,account,ticker,title,detail,market) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    ts, "trade", "info", account, ticker, event["title"],
+                    json.dumps(event.get("detail"), ensure_ascii=False)
+                    if event.get("detail") is not None else None,
+                    market,
+                ),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO account_state "
+                "(account,cash,initial_cash,updated_at,market) VALUES (?,?,?,?,?)",
+                (account, cash, initial_cash, ts, market),
+            )
+            conn.execute(
+                "DELETE FROM positions WHERE account=? AND market=?",
+                (account, market),
+            )
+            for position in positions:
+                conn.execute(
+                    "INSERT INTO positions "
+                    "(account,ticker,shares,avg_cost,total_cost,current_price,updated_at,market) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        account, position["ticker"], position["shares"],
+                        position["avg_cost"], position.get("total_cost", 0),
+                        position.get("current_price"), ts, market,
+                    ),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def load_position_prices(self, account: str, market: str = "US") -> dict[str, float]:
+        """Return last durable positive marks for one account's positions."""
+        conn = self._conn()
+        try:
+            rows = conn.execute(
+                "SELECT ticker,current_price FROM positions "
+                "WHERE account=? AND market=? AND current_price>0",
+                (account, market),
+            ).fetchall()
+            return {str(ticker): float(price) for ticker, price in rows}
+        finally:
+            conn.close()
 
     def get_trades(self, account: str | None = None, limit: int = 1000,
                    market: str = "US") -> pd.DataFrame:

@@ -6,6 +6,10 @@ from .account import VirtualAccount
 from .costs import MoomooAUCosts
 
 
+class TradePersistenceError(RuntimeError):
+    """The account mutation was rolled back because durable publication failed."""
+
+
 class TradingEngine:
     """Manages multiple virtual accounts with risk controls."""
 
@@ -81,6 +85,33 @@ class TradingEngine:
     def get_account(self, name: str) -> VirtualAccount:
         return self.accounts[name]
 
+    def execute_trade(
+        self, account_name: str, ticker: str, side: str,
+        shares: float, price: float, reason: str = "signal",
+    ) -> dict | None:
+        """Mutate an account and durably publish the trade, or roll it back."""
+        acct = self.accounts[account_name]
+        snapshot = acct.snapshot()
+        try:
+            if side == "buy":
+                result = acct.buy(ticker, shares, price)
+            elif side == "sell":
+                result = acct.sell(ticker, shares, price, reason=reason)
+            else:
+                return None
+
+            if result and self.trade_callback:
+                try:
+                    self.trade_callback(account_name, result)
+                except Exception as exc:
+                    raise TradePersistenceError(
+                        f"failed to persist {side} {account_name}/{ticker}: {exc}"
+                    ) from exc
+            return result
+        except Exception:
+            acct.restore(snapshot)
+            raise
+
     def execute_signal(
         self, account_name: str, ticker: str, side: str,
         shares: float, price: float, prices: dict[str, float] | None = None,
@@ -115,19 +146,15 @@ class TradingEngine:
                 shares = self._round_buy_shares(max_value / exec_price)
                 if shares <= 0:
                     return None
-            result = acct.buy(ticker, shares, price)
+            result = self.execute_trade(account_name, ticker, "buy", shares, price)
 
         elif side == "sell":
-            result = acct.sell(ticker, shares, price, reason=reason)
+            result = self.execute_trade(
+                account_name, ticker, "sell", shares, price, reason=reason
+            )
         else:
             return None
 
-        if result and self.trade_callback:
-            try:
-                self.trade_callback(account_name, result)
-            except Exception as e:
-                import logging
-                logging.getLogger("trading").warning("trade_callback failed: %s", e)
         return result
 
     def check_stop_losses(
@@ -142,14 +169,13 @@ class TradingEngine:
         for detail in acct.get_holdings_detail(prices):
             pnl_pct = detail["unrealized_pnl"] / (detail["shares"] * detail["avg_cost"])
             if pnl_pct <= self.stop_loss_pct:
-                trade = acct.sell(
-                    detail["ticker"], detail["shares"], prices[detail["ticker"]],
+                trade = self.execute_trade(
+                    account_name,
+                    detail["ticker"],
+                    "sell",
+                    detail["shares"],
+                    prices[detail["ticker"]],
                     reason="stop_loss",
                 )
-                if trade and self.trade_callback:
-                    try:
-                        self.trade_callback(account_name, trade)
-                    except Exception:
-                        pass
                 trades.append(trade)
         return trades
