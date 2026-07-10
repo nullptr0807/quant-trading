@@ -14,9 +14,17 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 DB = ROOT / "data/trading.db"
+
+
+def _shanghai_date(value: str) -> str:
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
 
 
 def find_violations(con: sqlite3.Connection) -> list[dict]:
@@ -29,7 +37,7 @@ def find_violations(con: sqlite3.Connection) -> list[dict]:
     bad = []
     for row in rows:
         key = (row["account"], row["ticker"])
-        day = str(row["timestamp"])[:10]
+        day = _shanghai_date(row["timestamp"])
         item = state.setdefault(key, {"day": day, "held": 0.0, "settled": 0.0})
         if day != item["day"]:
             item["day"] = day
@@ -58,9 +66,11 @@ def run(*, apply: bool, backup: str | None) -> dict:
         "policy": "archive_and_quarantine_only",
     }
     if not apply:
-        con.close(); return result
+        con.close()
+        return result
     if not backup or not Path(backup).exists():
-        con.close(); raise RuntimeError("--apply requires --backup pointing to an existing full DB backup")
+        con.close()
+        raise RuntimeError("--apply requires --backup pointing to an existing full DB backup")
     existing_table = con.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='data_quality_quarantine'"
     ).fetchone()
@@ -115,7 +125,8 @@ def run(*, apply: bool, backup: str | None) -> dict:
             )
         con.commit()
     except Exception:
-        con.rollback(); raise
+        con.rollback()
+        raise
     finally:
         con.close()
     result.update({"applied": True, "archive_table": table, "backup": backup})

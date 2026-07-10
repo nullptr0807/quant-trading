@@ -139,6 +139,38 @@ def test_no_trades_updates_snapshots_without_selling(tmp_path, monkeypatch):
         assert conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == before_counts["accounts"] + 1
 
 
+def test_no_trades_routes_risk_regime_to_selected_database(tmp_path, monkeypatch):
+    db = tmp_path / "trading.db"
+    _seed_account(db)
+    now = update_prices._utc_now()
+    monkeypatch.setattr(update_prices, "_is_us_market_hours_now", lambda: True)
+    monkeypatch.setattr(update_prices, "_is_cn_market_hours_now", lambda: False)
+    monkeypatch.setattr(
+        update_prices,
+        "fetch_quote_metadata",
+        lambda tickers: {
+            "AAPL": __import__("data.quotes", fromlist=["RealtimeQuote"]).RealtimeQuote(
+                ticker="AAPL", price=101.0, source="test",
+                source_timestamp=now, received_at=now, tradable=True,
+            )
+        },
+    )
+    from trading import risk_regime
+
+    original = risk_regime.DB_PATH
+    seen = []
+    monkeypatch.setattr(
+        risk_regime,
+        "evaluate_and_update",
+        lambda: seen.append(risk_regime.DB_PATH) or {"transitioned": False},
+    )
+
+    update_prices.update_equity_snapshots(str(db), no_trades=True)
+
+    assert seen == [str(db)]
+    assert risk_regime.DB_PATH == original
+
+
 def test_cli_requires_explicit_live_flag_and_forwards_safety_modes(monkeypatch):
     calls = []
     monkeypatch.setattr(

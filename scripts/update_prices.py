@@ -855,7 +855,12 @@ def update_equity_snapshots(
     # the trailing stop. Best-effort — never block snapshot updates on this.
     try:
         from trading import risk_regime
-        rr = risk_regime.evaluate_and_update()
+        old_db_path = risk_regime.DB_PATH
+        risk_regime.DB_PATH = db_path
+        try:
+            rr = risk_regime.evaluate_and_update()
+        finally:
+            risk_regime.DB_PATH = old_db_path
         if rr.get("transitioned"):
             LOG.warning("Risk regime transition: %s", rr)
     except Exception as e:

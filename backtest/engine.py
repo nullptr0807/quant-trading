@@ -324,7 +324,6 @@ class BacktestEngine:
 
         # T close forms the signal; the order can only fill at T+1 open.
         # Keeping signal and execution on the same close is explicit look-ahead.
-        pending_signals = None
         for i, date in enumerate(sim_dates):
             # Get data strictly before this date for factor computation
             data_to_date = {}
