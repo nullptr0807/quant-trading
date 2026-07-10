@@ -9,11 +9,10 @@ A-group accounts only: A01-A10. B/Q groups skipped — they have their own
 training/serving cycles. IDX1 (QQQ) and IDX2 (SPY) buy-and-hold benchmarks
 are bought at the first timepoint and held.
 
-Bar timestamp convention: 1d bars are stored with `datetime` = midnight of
-the trading day (e.g. '2026-05-22 00:00:00'). The replay timeline is one
-timepoint per trading day, taken at 14:00 ET (≈ midday session) to mimic
-the live system's rebalance hour. We use the bar's CLOSE as the fill price
-(no intraday fill model — yagni for daily strategies with 12h rebalance).
+The replay is look-ahead safe: signals use data through T close and orders fill
+at T+1 open. It also fails closed for capital-allocation use unless a
+point-in-time universe_membership table covers the requested window; pass
+--allow-survivorship-biased only for explicitly labelled exploratory research.
 
 Usage:
     python scripts/replay_us.py --start 2026-04-01 --end 2026-05-22 \\
@@ -168,25 +167,23 @@ class USReplay:
 
     # ---- Helpers ----------------------------------------------------------
     def _slice_history(self, t_date: date) -> dict[str, pd.DataFrame]:
-        """All bars with date <= t_date (inclusive)."""
+        """All bars strictly before execution day T (signal known at T-1 close)."""
         out: dict[str, pd.DataFrame] = {}
-        cutoff = pd.Timestamp(t_date) + pd.Timedelta(hours=23, minutes=59)
+        cutoff = pd.Timestamp(t_date)
         for tk, df in self.daily.items():
-            sl = df[df.index <= cutoff]
+            sl = df[df.index < cutoff]
             if not sl.empty:
                 out[tk] = sl
         return out
 
     def _current_prices(self, history: dict[str, pd.DataFrame], t_date: date) -> dict[str, float]:
-        """Use the bar AT t_date if present; else last available close."""
+        """T+1 execution uses the execution day's open, never the signal close."""
         prices = {}
-        for tk, df in history.items():
-            # Find bar on t_date
-            mask = (df.index.date == t_date)
-            if mask.any():
-                prices[tk] = float(df.loc[mask, "close"].iloc[-1])
-            else:
-                prices[tk] = float(df["close"].iloc[-1])
+        day = pd.Timestamp(t_date)
+        for tk, full in self.daily.items():
+            row = full[full.index == day]
+            if not row.empty:
+                prices[tk] = float(row["open"].iloc[0])
         return prices
 
     # ---- DB writers -------------------------------------------------------
@@ -292,7 +289,7 @@ class USReplay:
                 SELECT MAX(date) FROM factor_values fv2
                 WHERE fv2.ticker = factor_values.ticker
                   AND fv2.factor_name = factor_values.factor_name
-                  AND fv2.date <= ?
+                  AND fv2.date < ?
               )
             """,
             self.conn,
@@ -437,6 +434,8 @@ def main():
                     help="Apply PCA whitening to remove factor redundancy (V2). Default: ON.")
     ap.add_argument("--no-decorrelate", action="store_false", dest="decorrelate",
                     help="Disable PCA whitening (legacy V1 plain rank-mean composite).")
+    ap.add_argument("--allow-survivorship-biased", action="store_true",
+                    help="Exploratory only: use today's universe and mark output invalid for capital allocation")
     args = ap.parse_args()
 
     if args.label == "US":
@@ -449,6 +448,12 @@ def main():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    from research.validity import ensure_point_in_time_universe
+    validity = ensure_point_in_time_universe(
+        conn, market="US", start_date=start.isoformat(), end_date=end.isoformat(),
+        allow_survivorship_biased=args.allow_survivorship_biased,
+    )
+    print("RESEARCH_VALIDITY", json.dumps(validity, ensure_ascii=False))
 
     replay = USReplay(conn,
                       label=args.label,

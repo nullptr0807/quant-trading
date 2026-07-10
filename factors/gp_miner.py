@@ -302,25 +302,41 @@ def _prepare_dataset(
     historical_data: dict[str, pd.DataFrame],
     feature_cols: list[str] | None = None,
     y_target: str = "next_1d_ret",
+    *,
+    return_dates: bool = False,
 ):
-    """Stack all tickers into X (features) and y (configurable forward target).
+    """Stack ticker samples in global chronological order.
 
-    feature_cols: subset of FEATURE_COLS to use as terminals; None = all 13.
-    y_target:    name passed to _build_y_target.
+    Returning globally sorted dates is essential for a real time holdout: the
+    prior ticker-by-ticker ``vstack`` made the last 20% mostly a ticker split,
+    not a future-period split.
     """
     cols = feature_cols if feature_cols else FEATURE_COLS
-    all_X, all_y = [], []
+    rows: list[pd.DataFrame] = []
     for ticker, df in historical_data.items():
         feat = _compute_features(df)
         target = _build_y_target(df["close"], y_target)
         combined = feat.assign(target=target).dropna(subset=list(cols) + ["target"])
         if len(combined) < 5:
             continue
-        all_X.append(combined[cols].values)
-        all_y.append(combined["target"].values)
-    if not all_X:
-        return np.empty((0, len(cols))), np.empty(0)
-    return np.vstack(all_X), np.concatenate(all_y)
+        frame = combined[list(cols) + ["target"]].copy()
+        frame["_date"] = pd.to_datetime(frame.index, utc=True)
+        frame["_ticker"] = str(ticker)
+        rows.append(frame)
+    if not rows:
+        empty = (np.empty((0, len(cols))), np.empty(0))
+        if return_dates:
+            return (*empty, np.empty(0, dtype="datetime64[ns]"))
+        return empty
+    stacked = pd.concat(rows, axis=0).sort_values(
+        ["_date", "_ticker"], kind="stable"
+    )
+    X = stacked[list(cols)].to_numpy()
+    y = stacked["target"].to_numpy()
+    if return_dates:
+        dates = stacked["_date"].dt.tz_localize(None).to_numpy()
+        return X, y, dates
+    return X, y
 
 
 class GPAlphaMiner:
@@ -349,9 +365,21 @@ class GPAlphaMiner:
         dedup_threshold: |corr| above which a candidate is dropped vs already-kept factors.
         """
         cols = list(feature_subset) if feature_subset else list(FEATURE_COLS)
-        X, y = _prepare_dataset(historical_data, feature_cols=cols, y_target=y_target)
-        if len(X) < 10:
+        X, y, dates = _prepare_dataset(
+            historical_data,
+            feature_cols=cols,
+            y_target=y_target,
+            return_dates=True,
+        )
+        if len(X) < 20:
             return []
+        split = max(10, int(len(X) * 0.8))
+        if len(X) - split < 10:
+            return []
+        X_train, y_train = X[:split], y[:split]
+        X_oos, y_oos = X[split:], y[split:]
+        train_end = pd.Timestamp(dates[split - 1]).isoformat()
+        oos_start = pd.Timestamp(dates[split]).isoformat()
 
         # Run multiple smaller GP with different seeds for diversity
         all_programs = []
@@ -367,27 +395,36 @@ class GPAlphaMiner:
                 function_set=GP_FUNCTION_SET,
                 metric="spearman",
                 parsimony_coefficient=parsimony_coefficient,
-                max_samples=min(0.8, 4000 / max(len(X), 1)),
+                max_samples=min(0.8, 4000 / max(len(X_train), 1)),
                 random_state=seed_i * 17 + base_seed,
                 n_jobs=1,
                 verbose=0,
             )
-            st.fit(X, y)
-            Xt = st.transform(X)
+            st.fit(X_train, y_train)
+            Xt_train = st.transform(X_train)
+            Xt_oos = st.transform(X_oos)
 
             for i, prog in enumerate(st._best_programs):
-                col = Xt[:, i]
+                train_col = Xt_train[:, i]
+                col = Xt_oos[:, i]
+                train_valid = ~(np.isnan(train_col) | np.isinf(train_col))
                 valid = ~(np.isnan(col) | np.isinf(col))
-                if valid.sum() < 10:
+                if train_valid.sum() < 10 or valid.sum() < 10:
                     continue
-                ic, _ = spearmanr(col[valid], y[valid])
-                if np.isnan(ic):
+                train_ic, _ = spearmanr(train_col[train_valid], y_train[train_valid])
+                ic, _ = spearmanr(col[valid], y_oos[valid])
+                if np.isnan(train_ic) or np.isnan(ic):
                     continue
                 all_programs.append({
                     "name": f"gp_alpha_{seed_i}_{i:02d}",
                     "expression": str(prog),
                     "fitness": float(prog.fitness_),
+                    "train_ic": float(train_ic),
+                    "oos_ic": float(ic),
                     "ic": float(ic),
+                    "selection_basis": "global_date_20pct_holdout_ic",
+                    "train_end": train_end,
+                    "oos_start": oos_start,
                     "feature_cols": cols,   # which features X0..Xk map to
                     "y_target": y_target,   # what y this was fit against
                     "_col": col,

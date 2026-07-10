@@ -321,16 +321,20 @@ class BacktestEngine:
         rebalance_counter = 0
         market_returns = []  # 用于自适应换仓
 
+        # T close forms the signal; the order can only fill at T+1 open.
+        # Keeping signal and execution on the same close is explicit look-ahead.
+        pending_signals = None
         for i, date in enumerate(sim_dates):
-            # Get data up to this date for factor computation
+            # Get data strictly before this date for factor computation
             data_to_date = {}
             current_prices = {}
             for ticker, df in all_data.items():
-                mask = df.index <= date
+                mask = df.index < date
                 sub = df.loc[mask]
-                if len(sub) >= 20:  # need enough data for factors
+                today = df.loc[df.index == date]
+                if len(sub) >= 20 and not today.empty:
                     data_to_date[ticker] = sub
-                    current_prices[ticker] = float(sub["close"].iloc[-1])
+                    current_prices[ticker] = float(today["open"].iloc[0])
 
             if not data_to_date:
                 equity_curve.append((str(date), self.initial_cash))
@@ -401,14 +405,16 @@ class BacktestEngine:
             )
 
         for i, date in enumerate(sim_dates):
+            # GP signal uses bars through T-1 and fills at T open.
             data_to_date = {}
             current_prices = {}
             for ticker, df in all_data.items():
-                mask = df.index <= date
+                mask = df.index < date
                 sub = df.loc[mask]
-                if len(sub) >= 20:
+                today = df.loc[df.index == date]
+                if len(sub) >= 20 and not today.empty:
                     data_to_date[ticker] = sub
-                    current_prices[ticker] = float(sub["close"].iloc[-1])
+                    current_prices[ticker] = float(today["open"].iloc[0])
 
             if not data_to_date:
                 equity_curve.append((str(date), self.initial_cash))

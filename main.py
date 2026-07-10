@@ -18,9 +18,11 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 
-# Ensure project root on path
-PROJECT_ROOT = os.path.expanduser("~/quant-trading")
-sys.path.insert(0, PROJECT_ROOT)
+# Ensure this checkout's project root is first on sys.path. Using ~/quant-trading
+# here made an isolated worktree silently import production modules.
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from config.settings import (
     STOCK_UNIVERSE, FINNHUB_API_KEY, FEES, ACCOUNTS, ADAPTIVE_REBALANCE,
