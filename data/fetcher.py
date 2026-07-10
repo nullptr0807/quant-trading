@@ -370,9 +370,40 @@ class DataFetcher:
                     )
             except Exception:
                 pass
-            # 2) Legacy compatibility fallback.  Price is usable for display,
-            # but not for a fail-closed trade/snapshot because no source time is
-            # available from FastInfo.
+            # 2) Yahoo quote metadata. Use the session-specific pre/post quote
+            # and provider epoch when available; otherwise regular-market fields.
+            try:
+                info = yf.Ticker(ticker).info
+                candidates = (
+                    ("preMarketPrice", "preMarketTime"),
+                    ("postMarketPrice", "postMarketTime"),
+                    ("regularMarketPrice", "regularMarketTime"),
+                )
+                for price_key, time_key in candidates:
+                    price = info.get(price_key)
+                    source_epoch = info.get(time_key)
+                    if price and float(price) > 0 and source_epoch:
+                        return ticker, RealtimeQuote(
+                            ticker=ticker,
+                            price=float(price),
+                            source="yfinance_quote_metadata",
+                            source_timestamp=datetime.fromtimestamp(
+                                float(source_epoch), tz=timezone.utc
+                            ),
+                            received_at=received_at,
+                            tradable=True,
+                            prev_close=(
+                                float(info["regularMarketPreviousClose"])
+                                if info.get("regularMarketPreviousClose") else None
+                            ),
+                            volume=(
+                                float(info["regularMarketVolume"])
+                                if info.get("regularMarketVolume") is not None else None
+                            ),
+                        )
+            except Exception:
+                pass
+            # 3) Legacy display-only fallback. FastInfo has no source epoch.
             try:
                 price = yf.Ticker(ticker).fast_info.get("lastPrice")
                 if price and float(price) > 0:

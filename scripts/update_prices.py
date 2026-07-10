@@ -726,6 +726,8 @@ def update_equity_snapshots(
             "accounts_updated": 0, "tickers": len(held),
             "prices_fetched": len(prices),
             "held_coverage": validation["coverage"],
+            "held_valid": validation["valid"],
+            "held_expected": validation["expected"],
             "would_stop_losses": len(stop_candidates), "stop_losses": 0,
             "fetch_seconds": round(dt_fetch, 2),
         }
@@ -878,6 +880,8 @@ def update_equity_snapshots(
         "tickers": len(held),
         "prices_fetched": len(prices),
         "held_coverage": validation["coverage"],
+        "held_valid": validation["valid"],
+        "held_expected": validation["expected"],
         "would_stop_losses": len(stop_candidates),
         "stop_losses": len(stop_executed),
         "fetch_seconds": round(dt_fetch, 2),

@@ -39,6 +39,35 @@ def test_us_quote_metadata_keeps_finnhub_source_timestamp(monkeypatch):
     assert fetcher.get_realtime_quotes(["AAPL"]) == {"AAPL": 123.45}
 
 
+def test_us_quote_metadata_uses_yahoo_provider_timestamp_when_finnhub_unavailable(monkeypatch):
+    import data.fetcher as fetcher_module
+
+    now_epoch = 1_786_745_400
+
+    class YahooTicker:
+        info = {
+            "preMarketPrice": 124.5,
+            "preMarketTime": now_epoch,
+            "regularMarketPrice": 123.0,
+            "regularMarketTime": now_epoch - 3600,
+            "regularMarketPreviousClose": 122.0,
+            "regularMarketVolume": 1000,
+        }
+        fast_info = {"lastPrice": 123.0}
+
+    fetcher = object.__new__(fetcher_module.DataFetcher)
+    fetcher.finnhub_client = SimpleNamespace(quote=lambda ticker: {})
+    monkeypatch.setattr(fetcher_module.yf, "Ticker", lambda ticker: YahooTicker())
+
+    quote = fetcher.get_realtime_quote_metadata(["AAPL"])["AAPL"]
+
+    assert quote.price == 124.5
+    assert quote.source == "yfinance_quote_metadata"
+    assert quote.source_timestamp == datetime.fromtimestamp(now_epoch, tz=timezone.utc)
+    assert quote.tradable is True
+    assert quote.prev_close == 122.0
+
+
 def test_cn_sina_quote_metadata_keeps_exchange_date_time(monkeypatch):
     import data.cn_fetcher as cn_fetcher
 
