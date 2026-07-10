@@ -41,7 +41,11 @@ from accounts.strategies import STRATEGIES
 from accounts.gp_strategies import active_gp_strategies_for_market
 from accounts.qlib_strategies import QLIB_STRATEGIES
 from factors.gp_miner import GPAlphaMiner, FEATURE_COLS
-from data.quotes import prices_from_quotes, validate_required_quotes
+from data.quotes import (
+    prices_from_quotes,
+    validate_required_quotes,
+    valid_quote_tickers,
+)
 from factors.factor_miner_gp import FactorMinerGPBackend
 from dataclasses import replace as _dc_replace
 
@@ -767,9 +771,9 @@ class QuantSystem:
                 }
             )
             if missing_marks:
-                raise RuntimeError(
-                    "fast live state save aborted: missing realtime marks for held tickers "
-                    + ",".join(missing_marks[:20])
+                log.warning(
+                    "Fast live state save will skip accounts with blocked/missing marks: %s",
+                    ",".join(missing_marks[:20]),
                 )
         for (acct_id,) in all_accounts:
             if acct_id in retired:
@@ -800,6 +804,14 @@ class QuantSystem:
                 positions.append(item)
 
             verified_equity = None
+            if missing_prices and getattr(self, "_fast_live_mode", False):
+                log.warning(
+                    "Skipping all state persistence for %s: blocked/missing realtime prices "
+                    "for %d/%d held tickers: %s",
+                    acct_id, len(missing_prices), len(held_tickers),
+                    ",".join(missing_prices[:8]),
+                )
+                continue
             if missing_prices:
                 log.error(
                     "Saving cash+positions for %s but skipping equity snapshot: "
@@ -1237,21 +1249,22 @@ class QuantSystem:
                     f"prepared fast-cycle market mismatch: {prepared.get('market')} != {self.market}"
                 )
             prepared_at = prepared.get("prepared_at")
-            if prepared_at is not None:
-                try:
-                    prepared_dt = datetime.fromisoformat(
-                        str(prepared_at).replace("Z", "+00:00")
-                    )
-                    if prepared_dt.tzinfo is None:
-                        prepared_dt = prepared_dt.replace(tzinfo=timezone.utc)
-                    age = (_utc_now() - prepared_dt.astimezone(timezone.utc)).total_seconds()
-                except (TypeError, ValueError):
-                    raise RuntimeError("prepared fast-cycle artifact has invalid prepared_at")
-                max_age = float(os.environ.get("QUANT_FAST_PREPARED_MAX_AGE_SECONDS", "180"))
-                if age < -30 or age > max_age:
-                    raise RuntimeError(
-                        f"prepared fast-cycle artifact stale: age={age:.1f}s max={max_age:.1f}s"
-                    )
+            if prepared_at is None:
+                raise RuntimeError("prepared fast-cycle artifact missing prepared_at")
+            try:
+                prepared_dt = datetime.fromisoformat(
+                    str(prepared_at).replace("Z", "+00:00")
+                )
+                if prepared_dt.tzinfo is None:
+                    prepared_dt = prepared_dt.replace(tzinfo=timezone.utc)
+                age = (_utc_now() - prepared_dt.astimezone(timezone.utc)).total_seconds()
+            except (TypeError, ValueError):
+                raise RuntimeError("prepared fast-cycle artifact has invalid prepared_at")
+            max_age = float(os.environ.get("QUANT_FAST_PREPARED_MAX_AGE_SECONDS", "180"))
+            if age < -30 or age > max_age:
+                raise RuntimeError(
+                    f"prepared fast-cycle artifact stale: age={age:.1f}s max={max_age:.1f}s"
+                )
             quote_tickers = set(prepared.get("tickers") or [])
             self._prepared_alpha_signals = prepared.get("prepared_alpha_signals") or {}
             self._prepared_gp_signals = prepared.get("prepared_gp_signals") or {}
@@ -1301,13 +1314,26 @@ class QuantSystem:
         # Every quote that can reach a buy/sell path must be positive, fresh,
         # timestamped, and tradable. Validating only held names still allowed a
         # stale/untradable candidate quote to create a new position.
+        max_quote_age = float(os.environ.get("QUANT_MAX_QUOTE_AGE_SECONDS", "180"))
         validation = validate_required_quotes(
             quotes, quote_tickers, now=_utc_now(),
-            max_age_seconds=float(os.environ.get("QUANT_MAX_QUOTE_AGE_SECONDS", "180")),
+            max_age_seconds=max_quote_age,
         )
-        if not validation["ok"]:
-            raise RuntimeError(f"fast-cycle quote validation failed: {validation}")
-        self._realtime_prices = prices_from_quotes(quotes)
+        valid_tickers = valid_quote_tickers(
+            quotes, quote_tickers, now=_utc_now(),
+            max_age_seconds=max_quote_age,
+        )
+        blocked_tickers = sorted(quote_tickers - valid_tickers)
+        if blocked_tickers:
+            log.warning(
+                "Fast-cycle quote gate blocked %d/%d tickers individually: %s",
+                len(blocked_tickers), len(quote_tickers), ",".join(blocked_tickers[:20]),
+            )
+        self._realtime_prices = {
+            ticker: price
+            for ticker, price in prices_from_quotes(quotes).items()
+            if ticker in valid_tickers
+        }
         self._realtime_quote_details = {
             ticker: {
                 "price": quote.price,
@@ -1315,6 +1341,7 @@ class QuantSystem:
                 "volume": quote.volume,
             }
             for ticker, quote in quotes.items()
+            if ticker in valid_tickers
         }
         if not self._realtime_prices:
             raise RuntimeError(f"[{self.market}] fast live cycle: no bounded realtime quotes")
@@ -1721,6 +1748,19 @@ class QuantSystem:
         for gp_strat in self.gp_strategies:
             if gp_strat.id in retired:
                 continue  # retired account: no trading, no rebalance event
+            if getattr(self, "_fast_live_mode", False):
+                held = {
+                    ticker for ticker, shares in
+                    self.engine.get_account(gp_strat.id).get_positions().items()
+                    if shares > 0
+                }
+                missing = sorted(held - set(current_prices))
+                if missing:
+                    log.warning(
+                        "[%s] GP fast cycle skipped: stale/missing held quotes %s",
+                        gp_strat.id, ",".join(missing[:8]),
+                    )
+                    continue
             try:
                 if not self._should_rebalance(gp_strat.id, gp_strat.rebalance_hours):
                     continue
@@ -1966,6 +2006,19 @@ class QuantSystem:
         for q_strat in self.qlib_strategies:
             if q_strat.id in retired:
                 continue
+            if getattr(self, "_fast_live_mode", False):
+                held = {
+                    ticker for ticker, shares in
+                    self.engine.get_account(q_strat.id).get_positions().items()
+                    if shares > 0
+                }
+                missing = sorted(held - set(current_prices))
+                if missing:
+                    log.warning(
+                        "[%s] Qlib fast cycle skipped: stale/missing held quotes %s",
+                        q_strat.id, ",".join(missing[:8]),
+                    )
+                    continue
             try:
                 if not self._should_rebalance(q_strat.id, q_strat.rebalance_hours):
                     continue
@@ -2326,6 +2379,19 @@ class QuantSystem:
         for strat in self.strategies:
             if strat.id in retired:
                 continue
+            if getattr(self, "_fast_live_mode", False):
+                held = {
+                    ticker for ticker, shares in
+                    self.engine.get_account(strat.id).get_positions().items()
+                    if shares > 0
+                }
+                missing = sorted(held - set(current_prices))
+                if missing:
+                    log.warning(
+                        "[%s] Alpha fast cycle skipped: stale/missing held quotes %s",
+                        strat.id, ",".join(missing[:8]),
+                    )
+                    continue
             try:
                 if not self._should_rebalance(strat.id, strat.rebalance_hours):
                     continue

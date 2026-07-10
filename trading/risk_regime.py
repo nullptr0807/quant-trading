@@ -143,9 +143,13 @@ def _send_telegram(message: str) -> None:
         log.warning("telegram send failed: %s", e)
 
 
-def get_state(conn: Optional[sqlite3.Connection] = None) -> dict:
+def get_state(
+    conn: Optional[sqlite3.Connection] = None,
+    *,
+    db_path: str = DB_PATH,
+) -> dict:
     own = conn is None
-    c = conn or sqlite3.connect(DB_PATH)
+    c = conn or sqlite3.connect(db_path)
     try:
         _ensure_table(c)
         r = c.execute(
@@ -159,11 +163,11 @@ def get_state(conn: Optional[sqlite3.Connection] = None) -> dict:
                 last_drawdown=r[3] or 0.0, last_check_at=r[4])
 
 
-def evaluate_and_update() -> dict:
+def evaluate_and_update(*, db_path: str = DB_PATH) -> dict:
     """Compute drawdown, run state machine, persist + alert on transitions.
     Call once per day (e.g. after equity-snapshot update). Idempotent within
     a day — re-runs just refresh `last_drawdown`."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(db_path)
     try:
         _ensure_table(conn)
         dd = _portfolio_drawdown(conn)
@@ -219,12 +223,12 @@ def evaluate_and_update() -> dict:
         conn.close()
 
 
-def get_effective_trailing_stop() -> Optional[float]:
+def get_effective_trailing_stop(*, db_path: str = DB_PATH) -> Optional[float]:
     """The single source of truth used by trading logic.
     Priority: manual override > auto-armed > disabled."""
     if settings.TRAILING_STOP_PCT is not None:
         return float(settings.TRAILING_STOP_PCT)
-    st = get_state()
+    st = get_state(db_path=db_path)
     if st["state"] == "ARMED":
         return float(settings.AUTO_ARM_TRAIL_PCT)
     return None

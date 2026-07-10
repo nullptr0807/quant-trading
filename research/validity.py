@@ -28,16 +28,25 @@ def ensure_point_in_time_universe(
             "WHERE market=? AND date BETWEEN ? AND ? GROUP BY date ORDER BY date",
             (market, start_date, end_date),
         ).fetchall()
-        covered_dates = len(rows)
-        window_days = int(conn.execute(
-            "SELECT COUNT(DISTINCT substr(datetime,1,10)) FROM prices "
-            "WHERE interval='1d' AND substr(datetime,1,10) BETWEEN ? AND ?",
-            (start_date, end_date),
-        ).fetchone()[0]) if conn.execute(
+        membership_dates = {str(row[0]) for row in rows}
+        covered_dates = len(membership_dates)
+        if conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='prices'"
-        ).fetchone() else 0
-        complete = covered_dates > 0 and (window_days == 0 or covered_dates >= window_days)
+        ).fetchone():
+            required_dates = {
+                str(row[0]) for row in conn.execute(
+                    "SELECT DISTINCT substr(datetime,1,10) FROM prices "
+                    "WHERE interval='1d' AND substr(datetime,1,10) BETWEEN ? AND ?",
+                    (start_date, end_date),
+                ).fetchall()
+            }
+        else:
+            required_dates = set()
+        window_days = len(required_dates)
+        missing_dates = sorted(required_dates - membership_dates)
+        complete = covered_dates > 0 and not missing_dates
     else:
+        missing_dates = []
         complete = False
     if not table or not complete:
         result = {
@@ -47,6 +56,7 @@ def ensure_point_in_time_universe(
             "window": [start_date, end_date],
             "membership_dates": covered_dates,
             "required_trading_dates": window_days,
+            "missing_membership_dates": missing_dates,
         }
         if not allow_survivorship_biased:
             raise ResearchValidityError(str(result))

@@ -180,6 +180,39 @@ def _make_stop_db(path):
     return store
 
 
+def test_stop_loss_reads_trailing_regime_from_selected_database(tmp_path, monkeypatch):
+    from scripts import update_prices as updater
+    from trading import risk_regime
+
+    db = tmp_path / "selected.db"
+    _make_stop_db(db)
+    with sqlite3.connect(db) as con:
+        con.execute("UPDATE account_meta SET market='US' WHERE account_id='CB16'")
+        con.execute("UPDATE account_state SET market='US' WHERE account='CB16'")
+        con.execute("UPDATE positions SET market='US',avg_cost=100,total_cost=30000")
+        con.execute(
+            "INSERT INTO positions_history (account,ticker,shares,avg_cost,market_price,"
+            "market_value,unrealized_pnl,timestamp,market) "
+            "VALUES ('CB16','300418.SZ',300,100,110,33000,3000,"
+            "'2026-07-10T13:00:00+00:00','US')"
+        )
+
+    seen = []
+    monkeypatch.setattr(updater, "_is_market_hours_now", lambda: True)
+    monkeypatch.setattr(updater, "_is_market_open_for", lambda market: True)
+    monkeypatch.setattr(
+        risk_regime,
+        "get_effective_trailing_stop",
+        lambda *, db_path: seen.append(db_path) or None,
+    )
+
+    with sqlite3.connect(db) as con:
+        con.row_factory = sqlite3.Row
+        updater.check_stop_losses(con, {"300418.SZ": 105.0}, execute=False)
+
+    assert seen == [str(db)]
+
+
 def test_update_prices_cb16_cf15_same_day_stop_loss_is_guard_not_trade(
     tmp_path, monkeypatch
 ):

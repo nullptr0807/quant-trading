@@ -43,6 +43,29 @@ def test_point_in_time_universe_gate_rejects_partial_membership_coverage():
         )
 
 
+def test_point_in_time_universe_gate_rejects_wrong_date_set_with_same_count():
+    from research.validity import ResearchValidityError, ensure_point_in_time_universe
+
+    con = sqlite3.connect(":memory:")
+    con.executescript(
+        """
+        CREATE TABLE universe_membership (
+            market TEXT,date TEXT,ticker TEXT,PRIMARY KEY(market,date,ticker)
+        );
+        CREATE TABLE prices (ticker TEXT,datetime TEXT,interval TEXT);
+        INSERT INTO universe_membership VALUES ('US','2025-01-01','AAPL');
+        INSERT INTO universe_membership VALUES ('US','2025-01-02','AAPL');
+        INSERT INTO prices VALUES ('AAPL','2025-01-02','1d');
+        INSERT INTO prices VALUES ('AAPL','2025-01-03','1d');
+        """
+    )
+
+    with pytest.raises(ResearchValidityError, match="missing_point_in_time_universe"):
+        ensure_point_in_time_universe(
+            con, market="US", start_date="2025-01-01", end_date="2025-01-03"
+        )
+
+
 def test_point_in_time_universe_gate_accepts_covered_membership():
     from research.validity import ensure_point_in_time_universe
 

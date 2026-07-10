@@ -33,6 +33,37 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def valid_quote_tickers(
+    quotes: Mapping[str, RealtimeQuote],
+    required_tickers: Iterable[str],
+    *,
+    now: datetime | None = None,
+    max_age_seconds: float,
+    require_source_timestamp: bool = True,
+) -> set[str]:
+    """Return tickers whose quote is positive, tradable, timestamped and fresh."""
+    current = _as_utc(now or datetime.now(timezone.utc))
+    valid: set[str] = set()
+    for ticker in {str(value) for value in required_tickers if value}:
+        quote = quotes.get(ticker)
+        if quote is None:
+            continue
+        try:
+            price = float(quote.price)
+        except (TypeError, ValueError):
+            continue
+        if not isfinite(price) or price <= 0 or not quote.tradable:
+            continue
+        age = quote.age_seconds(current)
+        if age is None:
+            if require_source_timestamp:
+                continue
+        elif age > max_age_seconds:
+            continue
+        valid.add(ticker)
+    return valid
+
+
 def prices_from_quotes(quotes: Mapping[str, RealtimeQuote]) -> dict[str, float]:
     """Project metadata quotes onto the legacy ``dict[str, float]`` API."""
     return {

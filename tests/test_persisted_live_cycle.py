@@ -1,5 +1,6 @@
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -229,6 +230,7 @@ def test_fast_cycle_can_consume_prepared_artifact_without_reloading_factors(
     artifact = tmp_path / "prepared.json"
     artifact.write_text(__import__("json").dumps({
         "market": "US",
+        "prepared_at": datetime.now(timezone.utc).isoformat(),
         "tickers": ["AAA", "SPY"],
         "prepared_alpha_signals": {"A01": {"buy": [["AAA", 1.0]], "sell": []}},
         "prepared_gp_signals": {},

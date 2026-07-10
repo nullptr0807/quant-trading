@@ -44,7 +44,12 @@ from accounts.qlib_strategies import QLIB_STRATEGIES  # noqa: E402
 from config.settings import ACCOUNT_PREFIX  # noqa: E402
 from trading.costs import CNCosts, MoomooAUCosts  # noqa: E402
 from data.cn_fetcher import get_fetcher_for  # noqa: E402
-from data.quotes import RealtimeQuote, prices_from_quotes, validate_required_quotes  # noqa: E402
+from data.quotes import (  # noqa: E402
+    RealtimeQuote,
+    prices_from_quotes,
+    validate_required_quotes,
+    valid_quote_tickers,
+)
 
 LOG = logging.getLogger("update_prices")
 logging.basicConfig(
@@ -390,6 +395,7 @@ def check_stop_losses(
     prices: Mapping[str, object],
     *,
     execute: bool = True,
+    db_path: str | None = None,
 ) -> list[dict]:
     """Scan all positions and return triggered protective sells.
 
@@ -401,6 +407,9 @@ def check_stop_losses(
         LOG.info("Outside US extended-hours window — stop-loss check skipped")
         return []
     cur = conn.cursor()
+    if db_path is None:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        db_path = str(row[2]) if row and row[2] else DB_PATH
     now = _now_utc()
     now_iso = now.isoformat()
     executed: list[dict] = []
@@ -455,7 +464,7 @@ def check_stop_losses(
         if triggered_reason is None:
             try:
                 from trading.risk_regime import get_effective_trailing_stop
-                trail_pct = get_effective_trailing_stop()
+                trail_pct = get_effective_trailing_stop(db_path=db_path)
             except Exception:
                 trail_pct = None
             if trail_pct is not None:
@@ -680,15 +689,27 @@ def update_equity_snapshots(
         ticker for ticker in held
         if (_is_cn(ticker) and cn_open) or (not _is_cn(ticker) and us_open)
     ]
+    max_quote_age = float(os.environ.get("QUANT_MAX_QUOTE_AGE_SECONDS", "180"))
     validation = validate_required_quotes(
         quote_metadata, required_live, now=now,
-        max_age_seconds=float(os.environ.get("QUANT_MAX_QUOTE_AGE_SECONDS", "180")),
+        max_age_seconds=max_quote_age,
+    )
+    valid_live = valid_quote_tickers(
+        quote_metadata, required_live, now=now,
+        max_age_seconds=max_quote_age,
     )
     dt_fetch = time.time() - t0
-    if not validation["ok"]:
-        conn.close()
-        raise RuntimeError(f"quote validation failed: {validation}")
-    prices = prices_from_quotes(quote_metadata)
+    blocked_live = sorted(set(required_live) - valid_live)
+    if blocked_live:
+        LOG.warning(
+            "Quote gate blocked %d/%d tickers individually: %s",
+            len(blocked_live), len(required_live), ",".join(blocked_live[:20]),
+        )
+    prices = {
+        ticker: price
+        for ticker, price in prices_from_quotes(quote_metadata).items()
+        if ticker in valid_live
+    }
     # Closed-market force-refresh quotes without a provider timestamp remain
     # display-only; include their positive prices but never use them for trades.
     if force_update:
@@ -702,6 +723,7 @@ def update_equity_snapshots(
             "volume": quote.volume,
         }
         for ticker, quote in quote_metadata.items()
+        if ticker in valid_live
     }
     LOG.info(
         "Fetched fresh tradable quotes for %d/%d tickers in %.1fs",
@@ -712,7 +734,9 @@ def update_equity_snapshots(
     # modes call the same decision path with execute=False; the helper itself
     # guarantees no transaction or audit-event writes in that mode.
     stop_candidates = check_stop_losses(
-        conn, execution_quotes, execute=not (dry_run or no_trades)
+        conn, execution_quotes,
+        execute=not (dry_run or no_trades),
+        db_path=db_path,
     )
     stop_executed = [] if (dry_run or no_trades) else stop_candidates
     if dry_run:
@@ -839,14 +863,16 @@ def update_equity_snapshots(
             "coverage": market_validation["coverage"],
             "expected": market_validation["expected"],
             "valid": market_validation["valid"],
+            "blocked": market_validation["expected"] - market_validation["valid"],
             "fetch_seconds": round(dt_fetch, 2),
         }
+        health_status = "ok" if market_validation["ok"] else "degraded"
         conn.execute(
             "INSERT OR REPLACE INTO operational_health "
             "(component,market,status,success_at,source_timestamp,details) "
-            "VALUES ('update_prices',?,'ok',?,?,?)",
+            "VALUES ('update_prices',?,?,?,?,?)",
             (
-                market, now.isoformat(),
+                market, health_status, now.isoformat(),
                 market_oldest.isoformat() if market_oldest else None,
                 __import__("json").dumps(market_details, ensure_ascii=False),
             ),
@@ -857,12 +883,7 @@ def update_equity_snapshots(
     # the trailing stop. Best-effort — never block snapshot updates on this.
     try:
         from trading import risk_regime
-        old_db_path = risk_regime.DB_PATH
-        risk_regime.DB_PATH = db_path
-        try:
-            rr = risk_regime.evaluate_and_update()
-        finally:
-            risk_regime.DB_PATH = old_db_path
+        rr = risk_regime.evaluate_and_update(db_path=db_path)
         if rr.get("transitioned"):
             LOG.warning("Risk regime transition: %s", rr)
     except Exception as e:

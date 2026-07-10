@@ -138,11 +138,87 @@ def test_update_prices_rejects_partial_or_stale_held_quotes_and_writes_no_heartb
         },
     )
 
-    with pytest.raises(RuntimeError, match="quote validation failed"):
-        updater.update_equity_snapshots(str(db))
+    stats = updater.update_equity_snapshots(str(db))
+
+    assert stats["held_valid"] == 0
+    assert stats["held_expected"] == 2
+    assert stats["accounts_updated"] == 0
 
     with sqlite3.connect(db) as con:
-        assert con.execute("SELECT COUNT(*) FROM operational_health").fetchone()[0] == 0
+        assert con.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 0
+        assert con.execute("SELECT current_price FROM positions WHERE ticker='AAPL'").fetchone()[0] == 100
+        row = con.execute(
+            "SELECT status,details FROM operational_health "
+            "WHERE component='update_prices' AND market='US'"
+        ).fetchone()
+    assert row[0] == "degraded"
+    assert '"valid": 0' in row[1]
+
+
+def test_update_prices_blocks_stale_ticker_but_executes_fresh_ticker(tmp_path, monkeypatch):
+    import scripts.update_prices as updater
+    from data.quotes import RealtimeQuote
+    from data.store import DataStore
+
+    db = tmp_path / "trading.db"
+    DataStore(str(db))
+    with sqlite3.connect(db) as con:
+        con.executemany(
+            "INSERT INTO account_meta (account_id,market,status) VALUES (?,?,?)",
+            [("A01", "US", "active"), ("A02", "US", "active")],
+        )
+        con.executemany(
+            "INSERT INTO account_state (account,cash,initial_cash,updated_at,market) "
+            "VALUES (?,9000,10000,'2026-07-10T13:00:00+00:00','US')",
+            [("A01",), ("A02",)],
+        )
+        con.executemany(
+            "INSERT INTO positions "
+            "(account,ticker,shares,avg_cost,total_cost,current_price,updated_at,market) "
+            "VALUES (?,?,10,100,1000,100,'2026-07-10T13:00:00+00:00','US')",
+            [("A01", "FRESH"), ("A02", "STALE")],
+        )
+
+    now = datetime(2026, 7, 10, 14, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(updater, "_utc_now", lambda: now)
+    monkeypatch.setattr(updater, "_now_utc", lambda: now)
+    monkeypatch.setattr(updater, "_is_us_market_hours_now", lambda: True)
+    monkeypatch.setattr(updater, "_is_cn_market_hours_now", lambda: False)
+    monkeypatch.setattr(updater, "_is_market_hours_now", lambda: True)
+    monkeypatch.setattr(updater, "_is_market_open_for", lambda market: True)
+    monkeypatch.setattr(updater, "_force_price_update", lambda: False)
+    monkeypatch.setattr(updater, "STOP_LOSS_BY_ACCT", {"A01": 0.05, "A02": 0.05})
+    monkeypatch.setattr(
+        updater,
+        "fetch_quote_metadata",
+        lambda tickers: {
+            "FRESH": RealtimeQuote(
+                ticker="FRESH", price=90.0, source="test",
+                source_timestamp=now - timedelta(seconds=5), received_at=now,
+                tradable=True,
+            ),
+            "STALE": RealtimeQuote(
+                ticker="STALE", price=80.0, source="test",
+                source_timestamp=now - timedelta(seconds=181), received_at=now,
+                tradable=True,
+            ),
+        },
+    )
+
+    stats = updater.update_equity_snapshots(str(db))
+
+    assert stats["held_valid"] == 1
+    assert stats["stop_losses"] == 1
+    with sqlite3.connect(db) as con:
+        assert con.execute(
+            "SELECT COUNT(*) FROM trades WHERE account='A01' AND ticker='FRESH' AND side='sell'"
+        ).fetchone()[0] == 1
+        assert con.execute(
+            "SELECT COUNT(*) FROM trades WHERE account='A02' AND ticker='STALE'"
+        ).fetchone()[0] == 0
+        assert con.execute(
+            "SELECT current_price FROM positions WHERE account='A02' AND ticker='STALE'"
+        ).fetchone()[0] == 100
 
 
 def test_update_prices_success_writes_durable_market_heartbeat(tmp_path, monkeypatch):
@@ -218,9 +294,35 @@ def test_fast_cycle_fails_closed_for_missing_or_untradable_held_quote(tmp_path, 
     monkeypatch.setattr("main.is_market_hours_for", lambda market: True)
     monkeypatch.setattr("main._utc_now", lambda: now)
     monkeypatch.setattr(system, "prepare_fast_live_cycle", lambda: {"HELD", "AAA", "SPY"})
+    calls = []
+    monkeypatch.setattr(system, "initialize_benchmarks", lambda: calls.append("benchmarks"))
+    monkeypatch.setattr(system, "run_trading_cycle", lambda: calls.append("alpha"))
+    monkeypatch.setattr(system, "run_gp_trading_cycle", lambda: calls.append("gp"))
+    monkeypatch.setattr(system, "run_qlib_trading_cycle", lambda: calls.append("qlib"))
+    monkeypatch.setattr(system, "_save_all_state", lambda: calls.append("save"))
 
-    with pytest.raises(RuntimeError, match="fast-cycle quote validation failed"):
-        system.run_fast_live_cycle()
+    system.run_fast_live_cycle()
+
+    assert "HELD" not in system._realtime_prices
+    assert calls == ["benchmarks", "alpha", "gp", "qlib", "save"]
+
+
+def test_fast_cycle_rejects_prepared_artifact_without_timestamp(tmp_path, monkeypatch):
+    from tests.test_persisted_live_cycle import _bare_system
+
+    system = _bare_system(tmp_path, universe=("AAA",))
+    artifact = tmp_path / "prepared.json"
+    artifact.write_text(__import__("json").dumps({
+        "market": "US",
+        "tickers": ["AAA", "SPY"],
+        "prepared_alpha_signals": {},
+        "prepared_gp_signals": {},
+        "prepared_qlib_scores": {},
+    }))
+    monkeypatch.setattr("main.is_market_hours_for", lambda market: True)
+
+    with pytest.raises(RuntimeError, match="missing prepared_at"):
+        system.run_fast_live_cycle(str(artifact))
 
 
 def test_fast_cycle_rejects_stale_prepared_artifact(tmp_path, monkeypatch):
@@ -258,6 +360,7 @@ def test_fast_cycle_rejects_prepared_artifact_with_missing_held_ticker(
     artifact = tmp_path / "prepared.json"
     artifact.write_text(__import__("json").dumps({
         "market": "US",
+        "prepared_at": datetime.now(timezone.utc).isoformat(),
         "tickers": ["AAA", "SPY"],
         "prepared_alpha_signals": {},
         "prepared_gp_signals": {},
@@ -294,8 +397,17 @@ def test_fast_cycle_rejects_untradable_candidate_quote_before_buy(tmp_path, monk
         system, "prepare_fast_live_cycle", lambda: {"CANDIDATE", "SPY"}
     )
 
-    with pytest.raises(RuntimeError, match="fast-cycle quote validation failed"):
-        system.run_fast_live_cycle()
+    calls = []
+    monkeypatch.setattr(system, "initialize_benchmarks", lambda: calls.append("benchmarks"))
+    monkeypatch.setattr(system, "run_trading_cycle", lambda: calls.append("alpha"))
+    monkeypatch.setattr(system, "run_gp_trading_cycle", lambda: calls.append("gp"))
+    monkeypatch.setattr(system, "run_qlib_trading_cycle", lambda: calls.append("qlib"))
+    monkeypatch.setattr(system, "_save_all_state", lambda: calls.append("save"))
+
+    system.run_fast_live_cycle()
+
+    assert "CANDIDATE" not in system._realtime_prices
+    assert calls == ["benchmarks", "alpha", "gp", "qlib", "save"]
 
 
 def test_health_check_flags_stale_heartbeat_and_snapshot_only_during_session():

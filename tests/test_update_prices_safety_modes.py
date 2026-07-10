@@ -162,7 +162,7 @@ def test_no_trades_routes_risk_regime_to_selected_database(tmp_path, monkeypatch
     monkeypatch.setattr(
         risk_regime,
         "evaluate_and_update",
-        lambda: seen.append(risk_regime.DB_PATH) or {"transitioned": False},
+        lambda *, db_path: seen.append(db_path) or {"transitioned": False},
     )
 
     update_prices.update_equity_snapshots(str(db), no_trades=True)
