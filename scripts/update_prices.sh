@@ -31,5 +31,5 @@ PYTHON=/home/gexin/quant-trading/venv/bin/python
 TIMEOUT_SECONDS=${QUANT_UPDATE_TIMEOUT_SECONDS:-110}
 exec /usr/bin/flock -w 8 /tmp/quant_run_cycle.lock \
     /usr/bin/timeout --kill-after=15s "${TIMEOUT_SECONDS}s" \
-    "$PYTHON" -m scripts.update_prices \
+    "$PYTHON" -m scripts.update_prices --live \
     >> /home/gexin/quant-trading/logs/update_prices.log 2>&1

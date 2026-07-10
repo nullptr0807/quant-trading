@@ -20,10 +20,13 @@ Does NOT:
 Safe to run every minute via cron. Typical wall-time 2-5s.
 
 Usage:
-    python -m scripts.update_prices
+    python -m scripts.update_prices --dry-run    # read-only validation
+    python -m scripts.update_prices --no-trades  # snapshots only
+    python -m scripts.update_prices --live       # protective sells enabled
 """
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import sys
@@ -264,16 +267,14 @@ def _insert_trade_event(
 def check_stop_losses(
     conn: sqlite3.Connection,
     prices: dict[str, float],
+    *,
+    execute: bool = True,
 ) -> list[dict]:
-    """Scan all positions, execute protective sells where pnl <= -stop_loss.
+    """Scan all positions and return triggered protective sells.
 
-    Mutates DB inline (removes position row, updates account_state.cash,
-    inserts trade row). Returns list of *committed* sells for logging.
-
-    Market-hours guard: simulation mirrors real trading. Outside US extended
-    hours we never execute trades — even protective stop-losses wait for the
-    next session open (real brokers behave the same; off-hours quotes are stale
-    and untradeable).
+    With ``execute=True`` (live mode), each trigger is committed atomically.
+    With ``execute=False`` (dry-run/no-trades), the same trigger logic runs but
+    no cash, position, trade, event, or transaction state is mutated.
     """
     if not _is_market_hours_now():
         LOG.info("Outside US extended-hours window — stop-loss check skipped")
@@ -360,6 +361,22 @@ def check_stop_losses(
         if triggered_reason is None:
             continue
 
+        planned = {
+            "account": acct, "ticker": ticker, "shares": shares,
+            "price": px, "avg_cost": avg_cost, "pnl_pct": pnl_pct * 100,
+            "stop_loss": stop_loss * 100, "reason": triggered_reason,
+            "detail": triggered_msg,
+        }
+        if not execute:
+            executed.append(planned)
+            LOG.warning(
+                "%s WOULD EXECUTE [%s/%s] %s: %.0f sh @ %s%.2f (cost %s%.2f, %s)",
+                triggered_reason.upper(), acct_market, acct, ticker, shares,
+                _currency_symbol(acct_market), px, _currency_symbol(acct_market), avg_cost,
+                triggered_msg,
+            )
+            continue
+
         # Trigger stop loss. Commit each sell independently: the cron wrapper
         # has a hard wall-clock timeout, and historically the process could be
         # killed after logging STOP_LOSS but before the batch-level commit. A
@@ -421,12 +438,7 @@ def check_stop_losses(
             )
             continue
 
-        executed.append({
-            "account": acct, "ticker": ticker, "shares": shares,
-            "price": px, "avg_cost": avg_cost, "pnl_pct": pnl_pct * 100,
-            "stop_loss": stop_loss * 100, "reason": triggered_reason,
-            "detail": triggered_msg,
-        })
+        executed.append(planned)
         LOG.warning(
             "%s COMMITTED [%s/%s] %s: %.0f sh @ %s%.2f (cost %s%.2f, %s)",
             triggered_reason.upper(), acct_market, acct, ticker, shares,
@@ -437,13 +449,30 @@ def check_stop_losses(
     return executed
 
 
-def update_equity_snapshots(db_path: str = DB_PATH) -> dict:
-    """Main entry point."""
-    conn = sqlite3.connect(db_path, timeout=30)
+def update_equity_snapshots(
+    db_path: str = DB_PATH,
+    *,
+    dry_run: bool = False,
+    no_trades: bool = False,
+) -> dict:
+    """Refresh quotes and optionally snapshots/trades.
+
+    ``dry_run`` is strictly read-only: it fetches quotes and evaluates stop
+    triggers but writes no database state. ``no_trades`` allows snapshot/price
+    writes while suppressing all protective sells. Live trading requires both
+    flags to be false.
+    """
+    if dry_run and no_trades:
+        raise ValueError("--dry-run and --no-trades are mutually exclusive")
+    if dry_run:
+        conn = sqlite3.connect(f"file:{os.path.abspath(db_path)}?mode=ro", uri=True, timeout=30)
+    else:
+        conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=30000")
+    if not dry_run:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=30000")
     cur = conn.cursor()
 
     us_open = _is_us_market_hours_now()
@@ -481,7 +510,15 @@ def update_equity_snapshots(db_path: str = DB_PATH) -> dict:
     ]
     if not held:
         LOG.info("No open-market active positions found — nothing to update.")
-        return {"accounts_updated": 0, "tickers": 0}
+        conn.close()
+        return {
+            "dry_run": dry_run,
+            "no_trades": no_trades,
+            "accounts_updated": 0,
+            "tickers": 0,
+            "would_stop_losses": 0,
+            "stop_losses": 0,
+        }
 
     t0 = time.time()
     prices = fetch_quotes(held)
@@ -492,10 +529,38 @@ def update_equity_snapshots(db_path: str = DB_PATH) -> dict:
     )
     if not prices:
         LOG.warning("No realtime prices — skipping.")
-        return {"accounts_updated": 0, "tickers": 0}
+        conn.close()
+        return {
+            "dry_run": dry_run,
+            "no_trades": no_trades,
+            "accounts_updated": 0,
+            "tickers": len(held),
+            "prices_fetched": 0,
+            "would_stop_losses": 0,
+            "stop_losses": 0,
+        }
 
     # 1. Stop-loss check FIRST (may remove positions / change cash)
-    stop_executed = check_stop_losses(conn, prices)
+    stop_candidates = check_stop_losses(
+        conn, prices, execute=not (dry_run or no_trades)
+    )
+    stop_executed = [] if (dry_run or no_trades) else stop_candidates
+    if dry_run:
+        conn.close()
+        LOG.info(
+            "Dry-run complete: %d quotes, %d would-stop sells, zero DB writes",
+            len(prices), len(stop_candidates),
+        )
+        return {
+            "dry_run": True,
+            "no_trades": False,
+            "accounts_updated": 0,
+            "tickers": len(held),
+            "prices_fetched": len(prices),
+            "would_stop_losses": len(stop_candidates),
+            "stop_losses": 0,
+            "fetch_seconds": round(dt_fetch, 2),
+        }
     if stop_executed:
         conn.commit()  # persist before equity recomputation
         # Fire-and-forget Telegram alert (don't block equity update on failure)
@@ -598,19 +663,53 @@ def update_equity_snapshots(db_path: str = DB_PATH) -> dict:
         updated, len(stop_executed),
     )
     return {
+        "dry_run": False,
+        "no_trades": no_trades,
         "accounts_updated": updated,
         "tickers": len(held),
         "prices_fetched": len(prices),
+        "would_stop_losses": len(stop_candidates),
         "stop_losses": len(stop_executed),
         "fetch_seconds": round(dt_fetch, 2),
     }
 
 
-if __name__ == "__main__":
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Refresh held-position quotes, snapshots, and optional protective sells"
+    )
+    parser.add_argument("--db", default=DB_PATH, help="SQLite DB path")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--dry-run", action="store_true",
+        help="read-only quote/stop evaluation; guarantees zero DB writes",
+    )
+    mode.add_argument(
+        "--no-trades", action="store_true",
+        help="update prices/equity snapshots but suppress every sell",
+    )
+    mode.add_argument(
+        "--live", action="store_true",
+        help="allow protective sells and snapshot writes (cron production mode)",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
     t0 = time.time()
+    stats = update_equity_snapshots(
+        args.db,
+        dry_run=args.dry_run,
+        no_trades=args.no_trades,
+    )
+    LOG.info("Done in %.1fs: %s", time.time() - t0, stats)
+    return 0
+
+
+if __name__ == "__main__":
     try:
-        stats = update_equity_snapshots()
-        LOG.info("Done in %.1fs: %s", time.time() - t0, stats)
+        sys.exit(main())
     except Exception as e:
         LOG.exception("update_prices failed: %s", e)
         sys.exit(1)
