@@ -228,6 +228,12 @@ def _is_us_market_hours_now() -> bool:
     return 4 * 60 <= m < 20 * 60
 
 
+def _is_us_regular_session_now() -> bool:
+    from data.us_market_calendar import is_us_regular_session
+
+    return is_us_regular_session(_now_utc())
+
+
 def _is_cn_market_hours_now() -> bool:
     """CN A-share hours: Mon-Fri 09:30-11:30 + 13:00-15:00 CST (UTC+8).
 
@@ -256,7 +262,7 @@ def _is_market_open_for(market: str) -> bool:
     """Return whether a specific account market is currently tradeable."""
     if market == "CN":
         return _is_cn_market_hours_now()
-    return _is_us_market_hours_now()
+    return _is_us_regular_session_now()
 
 
 def _insert_trade_event(
@@ -638,14 +644,15 @@ def update_equity_snapshots(
         conn.execute("PRAGMA busy_timeout=30000")
     cur = conn.cursor()
 
-    us_open = _is_us_market_hours_now()
+    us_extended_open = _is_us_market_hours_now()
+    us_regular_open = _is_us_regular_session_now()
     cn_open = _is_cn_market_hours_now()
     force_update = _force_price_update()
-    fetch_us = us_open or force_update
+    fetch_us = us_extended_open or force_update
     fetch_cn = cn_open or force_update
     LOG.info(
-        "market-hours gate: US_open=%s CN_open=%s force_update=%s",
-        us_open, cn_open, force_update,
+        "market-hours gate: US_extended=%s US_RTH=%s CN_open=%s force_update=%s",
+        us_extended_open, us_regular_open, cn_open, force_update,
     )
 
     # Fetch quotes only for markets whose snapshots/trades can be written on
@@ -687,7 +694,7 @@ def update_equity_snapshots(
     # freshness/tradability applies to markets that are actually open now.
     required_live = [
         ticker for ticker in held
-        if (_is_cn(ticker) and cn_open) or (not _is_cn(ticker) and us_open)
+        if (_is_cn(ticker) and cn_open) or (not _is_cn(ticker) and us_extended_open)
     ]
     max_quote_age = float(os.environ.get("QUANT_MAX_QUOTE_AGE_SECONDS", "180"))
     validation = validate_required_quotes(
@@ -716,6 +723,9 @@ def update_equity_snapshots(
         for ticker, quote in quote_metadata.items():
             if quote.price and quote.price > 0:
                 prices[ticker] = float(quote.price)
+    allow_trades = not (dry_run or no_trades)
+    if allow_trades and us_extended_open and not us_regular_open:
+        LOG.info("US extended-hours tick: protective sells disabled; snapshots only")
     execution_quotes = {
         ticker: {
             "price": quote.price,
@@ -724,6 +734,7 @@ def update_equity_snapshots(
         }
         for ticker, quote in quote_metadata.items()
         if ticker in valid_live
+        and (_is_cn(ticker) or us_regular_open)
     }
     LOG.info(
         "Fetched fresh tradable quotes for %d/%d tickers in %.1fs",
@@ -735,10 +746,10 @@ def update_equity_snapshots(
     # guarantees no transaction or audit-event writes in that mode.
     stop_candidates = check_stop_losses(
         conn, execution_quotes,
-        execute=not (dry_run or no_trades),
+        execute=allow_trades,
         db_path=db_path,
     )
-    stop_executed = [] if (dry_run or no_trades) else stop_candidates
+    stop_executed = [] if not allow_trades else stop_candidates
     if dry_run:
         conn.close()
         LOG.info(
@@ -848,7 +859,7 @@ def update_equity_snapshots(
 
     # Durable success heartbeat is written only after every active held ticker
     # had a fresh tradable quote and all snapshots committed.
-    for market, is_open in (("US", us_open), ("CN", cn_open)):
+    for market, is_open in (("US", us_extended_open), ("CN", cn_open)):
         if not is_open:
             continue
         market_held = [t for t in held if _is_cn(t) == (market == "CN")]

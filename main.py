@@ -248,29 +248,14 @@ def is_market_hours() -> bool:
 
 
 def is_us_rth() -> bool:
-    """US Regular Trading Hours only: 09:30-16:00 ET, Mon-Fri.
+    """True only while the NYSE/Nasdaq regular equity session is open.
 
-    Used by Q-accounts to skip the pre-market window (04:00-09:30 ET):
-    daily-retrained Qlib scores are based on yesterday's close, so entering
-    at pre-market (thin liquidity, wide spreads, gap-driven prices) gives
-    away 5-15bps of alpha. RTH waits for the official 09:30 open where
-    fills are tighter.
-
-    DST-aware via ZoneInfo (handles ET ↔ UTC offset shift twice a year).
+    Uses the exchange calendar rather than a weekday/time approximation, so
+    holidays, DST and special closes (half-days) fail closed correctly.
     """
-    if _ET is None:
-        # Fallback: simplified UTC bounds covering both EDT (13:30-20:00 UTC)
-        # and EST (14:30-21:00 UTC). Slightly conservative on EST side.
-        now = datetime.now(timezone.utc)
-        if now.weekday() >= 5:
-            return False
-        m = now.hour * 60 + now.minute
-        return 13 * 60 + 30 <= m < 21 * 60
-    now_et = datetime.now(_ET)
-    if now_et.weekday() >= 5:
-        return False
-    m = now_et.hour * 60 + now_et.minute
-    return 9 * 60 + 30 <= m < 16 * 60
+    from data.us_market_calendar import is_us_regular_session
+
+    return is_us_regular_session(_utc_now())
 
 
 # CN A-share session: 09:30-11:30 + 13:00-15:00 Asia/Shanghai, Mon-Fri.
@@ -292,7 +277,9 @@ def is_market_hours_cn() -> bool:
 
 
 def is_market_hours_for(market: str) -> bool:
-    return is_market_hours() if market == "US" else is_market_hours_cn()
+    # US execution is regular-session only. Extended-hours collection remains
+    # available through update_prices --no-trades.
+    return is_us_rth() if market == "US" else is_market_hours_cn()
 
 
 # ---------------------------------------------------------------------------

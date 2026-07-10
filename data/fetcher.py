@@ -374,33 +374,36 @@ class DataFetcher:
             # and provider epoch when available; otherwise regular-market fields.
             try:
                 info = yf.Ticker(ticker).info
-                candidates = (
+                candidates = []
+                for price_key, time_key in (
                     ("preMarketPrice", "preMarketTime"),
                     ("postMarketPrice", "postMarketTime"),
                     ("regularMarketPrice", "regularMarketTime"),
-                )
-                for price_key, time_key in candidates:
+                ):
                     price = info.get(price_key)
                     source_epoch = info.get(time_key)
                     if price and float(price) > 0 and source_epoch:
-                        return ticker, RealtimeQuote(
-                            ticker=ticker,
-                            price=float(price),
-                            source="yfinance_quote_metadata",
-                            source_timestamp=datetime.fromtimestamp(
-                                float(source_epoch), tz=timezone.utc
-                            ),
-                            received_at=received_at,
-                            tradable=True,
-                            prev_close=(
-                                float(info["regularMarketPreviousClose"])
-                                if info.get("regularMarketPreviousClose") else None
-                            ),
-                            volume=(
-                                float(info["regularMarketVolume"])
-                                if info.get("regularMarketVolume") is not None else None
-                            ),
-                        )
+                        candidates.append((float(source_epoch), float(price)))
+                if candidates:
+                    source_epoch, price = max(candidates, key=lambda item: item[0])
+                    return ticker, RealtimeQuote(
+                        ticker=ticker,
+                        price=price,
+                        source="yfinance_quote_metadata",
+                        source_timestamp=datetime.fromtimestamp(
+                            source_epoch, tz=timezone.utc
+                        ),
+                        received_at=received_at,
+                        tradable=True,
+                        prev_close=(
+                            float(info["regularMarketPreviousClose"])
+                            if info.get("regularMarketPreviousClose") else None
+                        ),
+                        volume=(
+                            float(info["regularMarketVolume"])
+                            if info.get("regularMarketVolume") is not None else None
+                        ),
+                    )
             except Exception:
                 pass
             # 3) Legacy display-only fallback. FastInfo has no source epoch.

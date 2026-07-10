@@ -81,6 +81,7 @@ def test_dry_run_fetches_and_reports_but_leaves_database_byte_identical(tmp_path
     before_counts = _table_counts(db)
 
     monkeypatch.setattr(update_prices, "_is_us_market_hours_now", lambda: True)
+    monkeypatch.setattr(update_prices, "_is_us_regular_session_now", lambda: True)
     monkeypatch.setattr(update_prices, "_is_cn_market_hours_now", lambda: False)
     now = update_prices._utc_now()
     monkeypatch.setattr(
@@ -111,6 +112,7 @@ def test_no_trades_updates_snapshots_without_selling(tmp_path, monkeypatch):
     before_counts = _table_counts(db)
 
     monkeypatch.setattr(update_prices, "_is_us_market_hours_now", lambda: True)
+    monkeypatch.setattr(update_prices, "_is_us_regular_session_now", lambda: True)
     monkeypatch.setattr(update_prices, "_is_cn_market_hours_now", lambda: False)
     now = update_prices._utc_now()
     monkeypatch.setattr(
@@ -144,6 +146,7 @@ def test_no_trades_routes_risk_regime_to_selected_database(tmp_path, monkeypatch
     _seed_account(db)
     now = update_prices._utc_now()
     monkeypatch.setattr(update_prices, "_is_us_market_hours_now", lambda: True)
+    monkeypatch.setattr(update_prices, "_is_us_regular_session_now", lambda: True)
     monkeypatch.setattr(update_prices, "_is_cn_market_hours_now", lambda: False)
     monkeypatch.setattr(
         update_prices,

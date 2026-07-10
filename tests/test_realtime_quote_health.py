@@ -48,8 +48,10 @@ def test_us_quote_metadata_uses_yahoo_provider_timestamp_when_finnhub_unavailabl
         info = {
             "preMarketPrice": 124.5,
             "preMarketTime": now_epoch,
+            "postMarketPrice": 130.0,
+            "postMarketTime": now_epoch - 7200,
             "regularMarketPrice": 123.0,
-            "regularMarketTime": now_epoch - 3600,
+            "regularMarketTime": now_epoch + 60,
             "regularMarketPreviousClose": 122.0,
             "regularMarketVolume": 1000,
         }
@@ -61,9 +63,9 @@ def test_us_quote_metadata_uses_yahoo_provider_timestamp_when_finnhub_unavailabl
 
     quote = fetcher.get_realtime_quote_metadata(["AAPL"])["AAPL"]
 
-    assert quote.price == 124.5
+    assert quote.price == 123.0
     assert quote.source == "yfinance_quote_metadata"
-    assert quote.source_timestamp == datetime.fromtimestamp(now_epoch, tz=timezone.utc)
+    assert quote.source_timestamp == datetime.fromtimestamp(now_epoch + 60, tz=timezone.utc)
     assert quote.tradable is True
     assert quote.prev_close == 122.0
 
