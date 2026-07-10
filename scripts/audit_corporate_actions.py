@@ -128,6 +128,69 @@ def load_relevant_tickers(con: sqlite3.Connection, markets: set[str], focus_acco
     return sorted(out)
 
 
+def _iter_action_series(raw: Any, preferred_column: str):
+    """Yield ``(index, value)`` from yfinance Series/DataFrame variants.
+
+    Recent yfinance releases sometimes return a one-column DataFrame whose
+    column label (``Stock Splits``/``Dividends``) is itself encountered by naive
+    ``Series.items`` assumptions. Normalize explicitly so an API shape change
+    cannot turn every split into a DateParseError.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, pd.DataFrame):
+        if raw.empty:
+            return []
+        if preferred_column in raw.columns:
+            series = raw[preferred_column]
+        elif len(raw.columns) == 1:
+            series = raw.iloc[:, 0]
+        else:
+            raise ValueError(
+                f"ambiguous action frame columns: {list(map(str, raw.columns))}"
+            )
+    elif isinstance(raw, pd.Series):
+        series = raw
+    else:
+        series = pd.Series(raw)
+    return list(series.items())
+
+
+def _fetch_yahoo_chart_events(ticker: str, start: str, end: str) -> list[Action] | None:
+    """Independent Yahoo chart endpoint fallback for yfinance object failures."""
+    import urllib.parse
+    import urllib.request
+    start_epoch = int(pd.Timestamp(start, tz="UTC").timestamp())
+    end_epoch = int((pd.Timestamp(end, tz="UTC") + pd.Timedelta(days=1)).timestamp())
+    symbol = urllib.parse.quote(ticker, safe="")
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        f"?period1={start_epoch}&period2={end_epoch}&interval=1d&events=div%2Csplits"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        payload = json.load(urllib.request.urlopen(req, timeout=15))
+        result = (payload.get("chart", {}).get("result") or [None])[0]
+        if not result:
+            return None
+    except Exception:
+        return None
+    actions: list[Action] = []
+    events = result.get("events") or {}
+    for event in (events.get("splits") or {}).values():
+        d = datetime.fromtimestamp(int(event["date"]), tz=timezone.utc).strftime("%Y-%m-%d")
+        ratio = float(event.get("numerator", 0)) / float(event.get("denominator", 1))
+        actions.append(Action(ticker=ticker, market="US", ex_date=d, action_type="split",
+                              ratio=ratio, description=event.get("splitRatio", ""),
+                              source="yahoo.chart.events", raw=json.dumps(event)))
+    for event in (events.get("dividends") or {}).values():
+        d = datetime.fromtimestamp(int(event["date"]), tz=timezone.utc).strftime("%Y-%m-%d")
+        actions.append(Action(ticker=ticker, market="US", ex_date=d, action_type="cash_dividend",
+                              cash_per_share=float(event["amount"]), description="chart dividend",
+                              source="yahoo.chart.events", raw=json.dumps(event)))
+    return actions
+
+
 def fetch_us_actions(ticker: str, start: str, end: str) -> list[Action]:
     import yfinance as yf
 
@@ -136,36 +199,34 @@ def fetch_us_actions(ticker: str, start: str, end: str) -> list[Action]:
     # Splits
     try:
         splits = tk.splits
-        if splits is not None and len(splits):
-            for idx, val in splits.items():
-                d = pd.to_datetime(idx).strftime("%Y-%m-%d")
-                if start <= d <= end:
-                    ratio = float(val)
-                    if ratio and math.isfinite(ratio) and abs(ratio - 1.0) > 1e-9:
-                        actions.append(Action(
-                            ticker=ticker, market="US", ex_date=d, action_type="split",
-                            ratio=ratio, description=f"split {ratio}:1", source="yfinance.splits",
-                            raw=json.dumps({"date": d, "ratio": ratio}, ensure_ascii=False),
-                        ))
+        for idx, val in _iter_action_series(splits, "Stock Splits"):
+            d = pd.to_datetime(idx).strftime("%Y-%m-%d")
+            if start <= d <= end:
+                ratio = float(val)
+                if ratio and math.isfinite(ratio) and abs(ratio - 1.0) > 1e-9:
+                    actions.append(Action(
+                        ticker=ticker, market="US", ex_date=d, action_type="split",
+                        ratio=ratio, description=f"split {ratio}:1", source="yfinance.splits",
+                        raw=json.dumps({"date": d, "ratio": ratio}, ensure_ascii=False),
+                    ))
     except Exception as e:
         actions.append(Action(ticker=ticker, market="US", ex_date="", action_type="fetch_error", description=repr(e), source="yfinance.splits"))
 
     # Dividends are cash actions, not share-count actions. Include for context.
     try:
         divs = tk.dividends
-        if divs is not None and len(divs):
-            for idx, val in divs.items():
-                d = pd.to_datetime(idx).strftime("%Y-%m-%d")
-                if start <= d <= end:
-                    amount = float(val)
-                    if amount and math.isfinite(amount):
-                        actions.append(Action(
-                            ticker=ticker, market="US", ex_date=d, action_type="cash_dividend",
-                            cash_per_share=amount, description=f"cash dividend {amount}", source="yfinance.dividends",
-                            raw=json.dumps({"date": d, "amount": amount}, ensure_ascii=False),
-                        ))
-    except Exception:
-        pass
+        for idx, val in _iter_action_series(divs, "Dividends"):
+            d = pd.to_datetime(idx).strftime("%Y-%m-%d")
+            if start <= d <= end:
+                amount = float(val)
+                if amount and math.isfinite(amount):
+                    actions.append(Action(
+                        ticker=ticker, market="US", ex_date=d, action_type="cash_dividend",
+                        cash_per_share=amount, description=f"cash dividend {amount}", source="yfinance.dividends",
+                        raw=json.dumps({"date": d, "amount": amount}, ensure_ascii=False),
+                    ))
+    except Exception as e:
+        actions.append(Action(ticker=ticker, market="US", ex_date="", action_type="fetch_error", description=repr(e), source="yfinance.dividends"))
     return actions
 
 
@@ -176,8 +237,38 @@ def fetch_cn_actions(ticker: str, start: str, end: str) -> list[Action]:
     actions: list[Action] = []
     try:
         df = ak.stock_fhps_detail_em(symbol=code)
-    except Exception as e:
-        return [Action(ticker=ticker, market="CN", ex_date="", action_type="fetch_error", description=repr(e), source="akshare.stock_fhps_detail_em")]
+    except Exception as primary_error:
+        # Eastmoney intermittently returns None/shape errors for STAR names.
+        # Independent THS data can prove an equity has no implemented action;
+        # index tickers have no issuer corporate actions by definition.
+        if code in {"000300", "000001", "399001", "399006", "000016", "000905"}:
+            return []
+        try:
+            ths = ak.stock_fhps_detail_ths(symbol=code)
+        except Exception as fallback_error:
+            return [Action(
+                ticker=ticker, market="CN", ex_date="", action_type="fetch_error",
+                description=f"primary={primary_error!r}; fallback={fallback_error!r}",
+                source="akshare.stock_fhps_detail_em+ths",
+            )]
+        if ths is None or ths.empty:
+            return []
+        # THS fallback is sufficient to classify no-action rows. Parsing complex
+        # implemented plans remains fail-closed until Eastmoney recovers.
+        relevant = ths[
+            ths["A股除权除息日"].notna()
+            & ths["A股除权除息日"].astype(str).map(
+                lambda value: bool((d := date_str(value)) and start <= d <= end)
+            )
+        ]
+        if relevant.empty:
+            return []
+        return [Action(
+            ticker=ticker, market="CN", ex_date="", action_type="fetch_error",
+            description="THS reports implemented actions but primary structured ratio source failed",
+            source="akshare.stock_fhps_detail_ths",
+            raw=relevant.to_json(force_ascii=False, date_format="iso"),
+        )]
     if df is None or df.empty:
         return []
     for _, row in df.iterrows():
@@ -334,10 +425,16 @@ def run_audit(markets: set[str], focus_accounts: set[str] | None, start: str, en
     fetch_errors: list[dict[str, Any]] = []
 
     for i, (market, ticker) in enumerate(tickers, 1):
-        key = f"{market}:{ticker}:{start}:{end}"
+        # Version the cache by parser contract. Never let provider/API-shape
+        # failures cached by older code survive after the parser is fixed.
+        key = f"v2:{market}:{ticker}:{start}:{end}"
         if key in cache:
             acts = [Action(**a) for a in cache[key]]
+            if any(a.action_type == "fetch_error" for a in acts):
+                acts = None
         else:
+            acts = None
+        if acts is None:
             print(f"[{i}/{len(tickers)}] fetch {market} {ticker}", flush=True)
             if market == "US":
                 acts = fetch_us_actions(ticker, start, end)

@@ -391,6 +391,25 @@ def test_corporate_action_yfinance_dataframe_shape_is_normalized(monkeypatch):
     ]
 
 
+def test_corporate_action_us_fetch_failure_remains_explicit(monkeypatch):
+    import yfinance as yf
+    from scripts.audit_corporate_actions import fetch_us_actions
+
+    class BrokenTicker:
+        @property
+        def splits(self):
+            raise RuntimeError("split provider failed")
+
+        @property
+        def dividends(self):
+            raise RuntimeError("dividend provider failed")
+
+    monkeypatch.setattr(yf, "Ticker", lambda _ticker: BrokenTicker())
+    actions = fetch_us_actions("TEST", "2026-07-01", "2026-07-10")
+
+    assert [a.action_type for a in actions] == ["fetch_error", "fetch_error"]
+
+
 def test_corporate_action_summary_passes_without_open_share_actions_or_fetch_errors():
     from scripts.corporate_action_check import evaluate_audit_result
 
