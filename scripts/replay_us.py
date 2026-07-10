@@ -32,12 +32,14 @@ import math
 import argparse
 import sqlite3
 import logging
+from pathlib import Path
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
 
-PROJECT_ROOT = os.path.expanduser("~/quant-trading")
-sys.path.insert(0, PROJECT_ROOT)
+PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 import numpy as np
 import pandas as pd

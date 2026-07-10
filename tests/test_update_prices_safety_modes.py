@@ -1,6 +1,13 @@
+import importlib.util
 import sqlite3
+from pathlib import Path
 
-from scripts import update_prices
+
+MODULE_PATH = Path(__file__).parents[1] / "scripts" / "update_prices.py"
+SPEC = importlib.util.spec_from_file_location("hardening_update_prices", MODULE_PATH)
+assert SPEC and SPEC.loader
+update_prices = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(update_prices)
 
 
 def _seed_account(db_path):
