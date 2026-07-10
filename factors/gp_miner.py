@@ -320,7 +320,7 @@ def _prepare_dataset(
         if len(combined) < 5:
             continue
         frame = combined[list(cols) + ["target"]].copy()
-        frame["_date"] = pd.to_datetime(frame.index, utc=True)
+        frame["_date"] = pd.to_datetime(frame.index, utc=True).normalize()
         frame["_ticker"] = str(ticker)
         rows.append(frame)
     if not rows:
@@ -373,8 +373,15 @@ class GPAlphaMiner:
         )
         if len(X) < 20:
             return []
-        split = max(10, int(len(X) * 0.8))
-        if len(X) - split < 10:
+        split_target = max(10, int(len(X) * 0.8))
+        if len(X) - split_target < 10:
+            return []
+        # Never split a cross-section across train/OOS. Move the boundary to
+        # the first row of the next global date so one market date belongs to
+        # exactly one side of the holdout.
+        split_date = dates[split_target]
+        split = int(np.searchsorted(dates, split_date, side="left"))
+        if split < 10 or len(X) - split < 10:
             return []
         X_train, y_train = X[:split], y[:split]
         X_oos, y_oos = X[split:], y[split:]

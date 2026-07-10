@@ -1236,6 +1236,22 @@ class QuantSystem:
                 raise RuntimeError(
                     f"prepared fast-cycle market mismatch: {prepared.get('market')} != {self.market}"
                 )
+            prepared_at = prepared.get("prepared_at")
+            if prepared_at is not None:
+                try:
+                    prepared_dt = datetime.fromisoformat(
+                        str(prepared_at).replace("Z", "+00:00")
+                    )
+                    if prepared_dt.tzinfo is None:
+                        prepared_dt = prepared_dt.replace(tzinfo=timezone.utc)
+                    age = (_utc_now() - prepared_dt.astimezone(timezone.utc)).total_seconds()
+                except (TypeError, ValueError):
+                    raise RuntimeError("prepared fast-cycle artifact has invalid prepared_at")
+                max_age = float(os.environ.get("QUANT_FAST_PREPARED_MAX_AGE_SECONDS", "180"))
+                if age < -30 or age > max_age:
+                    raise RuntimeError(
+                        f"prepared fast-cycle artifact stale: age={age:.1f}s max={max_age:.1f}s"
+                    )
             quote_tickers = set(prepared.get("tickers") or [])
             self._prepared_alpha_signals = prepared.get("prepared_alpha_signals") or {}
             self._prepared_gp_signals = prepared.get("prepared_gp_signals") or {}
@@ -1258,6 +1274,13 @@ class QuantSystem:
                     self.market, prepare_seconds,
                 )
                 return None
+        held = self._active_holding_tickers()
+        missing_held = sorted(held - quote_tickers)
+        if missing_held:
+            raise RuntimeError(
+                "prepared fast-cycle artifact missing active holdings: "
+                + ",".join(missing_held[:20])
+            )
         getter = getattr(self.fetcher, "get_realtime_quote_metadata", None)
         if getter is None:
             # Compatibility for tests/offline custom fetchers. Production
@@ -1275,7 +1298,6 @@ class QuantSystem:
             }
         else:
             quotes = getter(sorted(quote_tickers))
-        held = self._active_holding_tickers()
         # Every quote that can reach a buy/sell path must be positive, fresh,
         # timestamped, and tradable. Validating only held names still allowed a
         # stale/untradable candidate quote to create a new position.

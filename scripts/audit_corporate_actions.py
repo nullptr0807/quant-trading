@@ -227,6 +227,10 @@ def fetch_us_actions(ticker: str, start: str, end: str) -> list[Action]:
                     ))
     except Exception as e:
         actions.append(Action(ticker=ticker, market="US", ex_date="", action_type="fetch_error", description=repr(e), source="yfinance.dividends"))
+    if actions and all(action.action_type == "fetch_error" for action in actions):
+        fallback = _fetch_yahoo_chart_events(ticker, start, end)
+        if fallback is not None:
+            return fallback
     return actions
 
 

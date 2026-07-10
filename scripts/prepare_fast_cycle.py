@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +27,7 @@ def main() -> int:
     tmp = output.with_suffix(output.suffix + ".tmp")
     tmp.write_text(json.dumps({
         "market": args.market,
+        "prepared_at": datetime.now(timezone.utc).isoformat(),
         "tickers": tickers,
         "prepared_alpha_signals": system._prepared_alpha_signals,
         "prepared_gp_signals": system._prepared_gp_signals,

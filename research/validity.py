@@ -21,18 +21,32 @@ def ensure_point_in_time_universe(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='universe_membership'"
     ).fetchone()
     covered_dates = 0
+    window_days = 0
     if table:
-        covered_dates = int(conn.execute(
-            "SELECT COUNT(DISTINCT date) FROM universe_membership "
-            "WHERE market=? AND date BETWEEN ? AND ?",
+        rows = conn.execute(
+            "SELECT date,COUNT(*) FROM universe_membership "
+            "WHERE market=? AND date BETWEEN ? AND ? GROUP BY date ORDER BY date",
             (market, start_date, end_date),
-        ).fetchone()[0])
-    if not table or covered_dates == 0:
+        ).fetchall()
+        covered_dates = len(rows)
+        window_days = int(conn.execute(
+            "SELECT COUNT(DISTINCT substr(datetime,1,10)) FROM prices "
+            "WHERE interval='1d' AND substr(datetime,1,10) BETWEEN ? AND ?",
+            (start_date, end_date),
+        ).fetchone()[0]) if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='prices'"
+        ).fetchone() else 0
+        complete = covered_dates > 0 and (window_days == 0 or covered_dates >= window_days)
+    else:
+        complete = False
+    if not table or not complete:
         result = {
             "valid_for_capital_allocation": False,
             "reason": "missing_point_in_time_universe",
             "market": market,
             "window": [start_date, end_date],
+            "membership_dates": covered_dates,
+            "required_trading_dates": window_days,
         }
         if not allow_survivorship_biased:
             raise ResearchValidityError(str(result))

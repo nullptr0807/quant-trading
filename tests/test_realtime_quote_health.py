@@ -194,6 +194,52 @@ def test_fast_cycle_fails_closed_for_missing_or_untradable_held_quote(tmp_path, 
         system.run_fast_live_cycle()
 
 
+def test_fast_cycle_rejects_stale_prepared_artifact(tmp_path, monkeypatch):
+    from tests.test_persisted_live_cycle import _bare_system
+
+    system = _bare_system(tmp_path, universe=("AAA",))
+    artifact = tmp_path / "prepared.json"
+    artifact.write_text(__import__("json").dumps({
+        "market": "US",
+        "prepared_at": "2026-07-10T13:00:00+00:00",
+        "tickers": ["AAA", "SPY"],
+        "prepared_alpha_signals": {},
+        "prepared_gp_signals": {},
+        "prepared_qlib_scores": {},
+    }))
+    monkeypatch.setattr("main.is_market_hours_for", lambda market: True)
+    monkeypatch.setattr(
+        "main._utc_now",
+        lambda: datetime(2026, 7, 10, 14, 0, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(RuntimeError, match="artifact stale"):
+        system.run_fast_live_cycle(str(artifact))
+
+
+def test_fast_cycle_rejects_prepared_artifact_with_missing_held_ticker(
+    tmp_path, monkeypatch
+):
+    from tests.test_persisted_live_cycle import _bare_system
+    from trading.account import _Position
+
+    system = _bare_system(tmp_path, universe=("AAA",))
+    account = system.engine.create_account("A01", initial_cash=10_000)
+    account._positions["HELD"] = _Position(shares=1, avg_cost=10, total_cost=10)
+    artifact = tmp_path / "prepared.json"
+    artifact.write_text(__import__("json").dumps({
+        "market": "US",
+        "tickers": ["AAA", "SPY"],
+        "prepared_alpha_signals": {},
+        "prepared_gp_signals": {},
+        "prepared_qlib_scores": {},
+    }))
+    monkeypatch.setattr("main.is_market_hours_for", lambda market: True)
+
+    with pytest.raises(RuntimeError, match="missing active holdings"):
+        system.run_fast_live_cycle(str(artifact))
+
+
 def test_fast_cycle_rejects_untradable_candidate_quote_before_buy(tmp_path, monkeypatch):
     from data.quotes import RealtimeQuote
     from tests.test_persisted_live_cycle import _bare_system

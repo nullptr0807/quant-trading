@@ -405,9 +405,38 @@ def test_corporate_action_us_fetch_failure_remains_explicit(monkeypatch):
             raise RuntimeError("dividend provider failed")
 
     monkeypatch.setattr(yf, "Ticker", lambda _ticker: BrokenTicker())
+    monkeypatch.setattr(
+        "scripts.audit_corporate_actions._fetch_yahoo_chart_events",
+        lambda *args: None,
+    )
     actions = fetch_us_actions("TEST", "2026-07-01", "2026-07-10")
 
     assert [a.action_type for a in actions] == ["fetch_error", "fetch_error"]
+
+
+def test_corporate_action_uses_chart_fallback_when_yfinance_both_paths_fail(monkeypatch):
+    import yfinance as yf
+    from scripts import audit_corporate_actions as audit
+
+    class BrokenTicker:
+        @property
+        def splits(self):
+            raise RuntimeError("split provider failed")
+
+        @property
+        def dividends(self):
+            raise RuntimeError("dividend provider failed")
+
+    fallback = [audit.Action(
+        ticker="TEST", market="US", ex_date="2026-07-02",
+        action_type="split", ratio=2.0, source="yahoo.chart.events",
+    )]
+    monkeypatch.setattr(yf, "Ticker", lambda _ticker: BrokenTicker())
+    monkeypatch.setattr(audit, "_fetch_yahoo_chart_events", lambda *args: fallback)
+
+    actions = audit.fetch_us_actions("TEST", "2026-07-01", "2026-07-10")
+
+    assert actions == fallback
 
 
 def test_corporate_action_summary_passes_without_open_share_actions_or_fetch_errors():
