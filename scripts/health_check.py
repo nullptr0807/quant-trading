@@ -210,6 +210,70 @@ def check_price_1d_health(
     return issues
 
 
+def _runtime_session_open(now: datetime) -> dict[str, bool]:
+    from zoneinfo import ZoneInfo
+    cn = now.astimezone(ZoneInfo("Asia/Shanghai"))
+    us = now.astimezone(ZoneInfo("America/New_York"))
+    cm = cn.hour * 60 + cn.minute
+    um = us.hour * 60 + us.minute
+    return {
+        "CN": cn.weekday() < 5 and (
+            9 * 60 + 30 <= cm < 11 * 60 + 30 or 13 * 60 <= cm < 15 * 60
+        ),
+        "US": us.weekday() < 5 and 4 * 60 <= um < 20 * 60,
+    }
+
+
+def check_live_runtime_health(
+    con: sqlite3.Connection,
+    *,
+    now: datetime,
+    session_open: dict[str, bool],
+    max_heartbeat_age_seconds: float = 180,
+    max_snapshot_age_seconds: float = 180,
+) -> list[dict]:
+    """Fail closed when an open market has stale updater heartbeat/snapshots."""
+    now = _normalize_utc(now)
+    issues: list[dict] = []
+    for market in ("US", "CN"):
+        if not session_open.get(market, False):
+            continue
+        row = None
+        if _table_exists(con, "operational_health"):
+            row = con.execute(
+                "SELECT success_at FROM operational_health "
+                "WHERE component='update_prices' AND market=? AND status='ok'",
+                (market,),
+            ).fetchone()
+        success_at = _parse_datetime(row[0]) if row else None
+        heartbeat_age = (
+            (now - success_at).total_seconds() if success_at else float("inf")
+        )
+        if heartbeat_age > max_heartbeat_age_seconds:
+            issues.append({
+                "severity": "critical", "check": "update_prices_heartbeat",
+                "market": market, "age_seconds": heartbeat_age,
+                "maximum": max_heartbeat_age_seconds,
+            })
+        snap = None
+        if _table_exists(con, "accounts") and _table_exists(con, "account_meta"):
+            snap = con.execute(
+                "SELECT MAX(a.timestamp) FROM accounts a JOIN account_meta m "
+                "ON m.account_id=a.name AND m.market=a.market "
+                "WHERE a.market=? AND COALESCE(m.status,'active')='active'",
+                (market,),
+            ).fetchone()
+        snap_at = _parse_datetime(snap[0]) if snap and snap[0] else None
+        snap_age = (now - snap_at).total_seconds() if snap_at else float("inf")
+        if snap_age > max_snapshot_age_seconds:
+            issues.append({
+                "severity": "critical", "check": "equity_snapshot_freshness",
+                "market": market, "age_seconds": snap_age,
+                "maximum": max_snapshot_age_seconds,
+            })
+    return issues
+
+
 def check_schema(con: sqlite3.Connection) -> list[dict]:
     """Validate safety-critical DB schema invariants."""
     issues: list[dict] = []
@@ -756,6 +820,10 @@ def main() -> int:
         issues.extend(check_alpha20(con))
         issues.extend(check_model_factor_freshness(con))
         issues.extend(check_snapshot_diff(con))
+        now_runtime = datetime.now(timezone.utc)
+        issues.extend(check_live_runtime_health(
+            con, now=now_runtime, session_open=_runtime_session_open(now_runtime)
+        ))
         if not args.skip_price_health:
             from config.settings import CN_UNIVERSE, STOCK_UNIVERSE
             from data.fetcher import latest_completed_session_date

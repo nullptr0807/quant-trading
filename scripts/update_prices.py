@@ -33,15 +33,18 @@ import sys
 import sqlite3
 import time
 from datetime import datetime, timezone
+from typing import Mapping
 
 # Make sibling packages importable when run as module or script
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from accounts.strategies import STRATEGIES  # noqa: E402
 from accounts.gp_strategies import active_gp_strategies_for_market  # noqa: E402
+from accounts.qlib_strategies import QLIB_STRATEGIES  # noqa: E402
 from config.settings import ACCOUNT_PREFIX  # noqa: E402
 from trading.costs import CNCosts, MoomooAUCosts  # noqa: E402
 from data.cn_fetcher import get_fetcher_for  # noqa: E402
+from data.quotes import RealtimeQuote, prices_from_quotes, validate_required_quotes  # noqa: E402
 
 LOG = logging.getLogger("update_prices")
 logging.basicConfig(
@@ -57,12 +60,26 @@ DB_PATH = os.path.join(
 STOP_LOSS_BY_ACCT: dict[str, float] = {}
 for _s in STRATEGIES:
     STOP_LOSS_BY_ACCT[_s.id] = _s.stop_loss
+    STOP_LOSS_BY_ACCT[f"C{_s.id}"] = _s.stop_loss
+for _q in QLIB_STRATEGIES:
+    STOP_LOSS_BY_ACCT[_q.id] = _q.stop_loss
+    STOP_LOSS_BY_ACCT[f"C{_q.id}"] = _q.stop_loss
 for _g in active_gp_strategies_for_market("US"):
     STOP_LOSS_BY_ACCT[_g.id] = _g.stop_loss
 for _g in active_gp_strategies_for_market("CN"):
     STOP_LOSS_BY_ACCT[f"{ACCOUNT_PREFIX.get('CN', '')}{_g.id}"] = _g.stop_loss
 
 _COST_MODELS = {"US": MoomooAUCosts(), "CN": CNCosts()}
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# Backwards-compatible name used by stop-loss tests and deterministic repair
+# tooling. All runtime timestamps flow through one patchable clock.
+def _now_utc() -> datetime:
+    return _utc_now()
 
 
 def _costs_for_market(market: str):
@@ -123,6 +140,26 @@ def _fetcher_for(market: str):
         f = get_fetcher_for(market)
         _FETCHERS[market] = f
     return f
+
+
+def fetch_quote_metadata(tickers: list[str]) -> dict[str, RealtimeQuote]:
+    if not tickers:
+        return {}
+    us = [t for t in tickers if not _is_cn(t)]
+    cn = [t for t in tickers if _is_cn(t)]
+    out: dict[str, RealtimeQuote] = {}
+    for market, names in (("US", us), ("CN", cn)):
+        if not names:
+            continue
+        fetcher = _fetcher_for(market)
+        getter = getattr(fetcher, "get_realtime_quote_metadata", None)
+        if getter is None:
+            continue
+        try:
+            out.update(getter(names))
+        except Exception as exc:
+            LOG.warning("%s realtime metadata fetch failed: %s", market, exc)
+    return out
 
 
 def fetch_quotes(tickers: list[str]) -> dict[str, float]:
@@ -264,23 +301,108 @@ def _insert_trade_event(
     )
 
 
+def _insert_guard_event(cur: sqlite3.Cursor, *, now_iso: str, market: str,
+                        account: str, ticker: str, reason: str, detail: dict) -> None:
+    import json
+    payload = {"reason": reason, "source": "update_prices.execution_guard", **detail}
+    cur.execute(
+        "INSERT INTO events (ts,category,severity,account,ticker,title,detail,market) "
+        "VALUES (?,'guard','warning',?,?,?,?,?)",
+        (
+            now_iso, account, ticker,
+            f"⛔ {account}/{ticker} sell blocked: {reason}",
+            json.dumps(payload, ensure_ascii=False), market,
+        ),
+    )
+
+
+def _cn_sellable_shares(cur: sqlite3.Cursor, account: str, ticker: str,
+                        now: datetime) -> float:
+    """FIFO-replay durable trades and return yesterday-or-earlier CN shares."""
+    from zoneinfo import ZoneInfo
+    rows = cur.execute(
+        "SELECT side,shares,timestamp FROM trades WHERE account=? AND market='CN' "
+        "AND ticker=? ORDER BY timestamp,id",
+        (account, ticker),
+    ).fetchall()
+    lots: list[dict] = []
+    for row in rows:
+        qty = float(row["shares"] or 0)
+        if str(row["side"]).lower() == "buy":
+            lots.append({"shares": qty, "bought_at": str(row["timestamp"])})
+        elif str(row["side"]).lower() == "sell":
+            remaining = qty
+            kept = []
+            for lot in lots:
+                avail = float(lot["shares"])
+                used = min(avail, remaining)
+                avail -= used
+                remaining -= used
+                if avail > 1e-9:
+                    kept.append({**lot, "shares": avail})
+            lots = kept
+    today = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
+    settled = 0.0
+    for lot in lots:
+        try:
+            bought = datetime.fromisoformat(lot["bought_at"].replace("Z", "+00:00"))
+            if bought.tzinfo is None:
+                bought = bought.replace(tzinfo=timezone.utc)
+            if bought.astimezone(ZoneInfo("Asia/Shanghai")).date() < today:
+                settled += float(lot["shares"])
+        except Exception:
+            continue
+    return settled
+
+
+def _price_and_execution_detail(value) -> tuple[float | None, dict]:
+    if isinstance(value, dict):
+        try:
+            return float(value.get("price")), value
+        except (TypeError, ValueError):
+            return None, value
+    try:
+        return float(value), {}
+    except (TypeError, ValueError):
+        return None, {}
+
+
+def _cn_execution_block_reason(detail: dict) -> str | None:
+    if not all(key in detail for key in ("prev_close", "volume")):
+        return "execution_state_unknown"
+    try:
+        price = float(detail["price"])
+        prev_close = float(detail["prev_close"])
+        volume = float(detail["volume"])
+    except (TypeError, ValueError):
+        return "execution_state_unknown"
+    if volume <= 0:
+        return "cn_suspended_or_no_volume"
+    # Conservative uniform 10% rule. A future board-specific limit table may
+    # widen this, but must never make a known limit-down sell executable.
+    if prev_close > 0 and price <= prev_close * 0.90 + 1e-9:
+        return "cn_limit_down"
+    return None
+
+
 def check_stop_losses(
     conn: sqlite3.Connection,
-    prices: dict[str, float],
+    prices: Mapping[str, object],
     *,
     execute: bool = True,
 ) -> list[dict]:
     """Scan all positions and return triggered protective sells.
 
-    With ``execute=True`` (live mode), each trigger is committed atomically.
-    With ``execute=False`` (dry-run/no-trades), the same trigger logic runs but
-    no cash, position, trade, event, or transaction state is mutated.
+    Live mode commits each legal trigger atomically. Safety modes pass
+    ``execute=False`` to run the same T+1/limit/trigger logic without mutating
+    cash, positions, trades, events, or transaction state.
     """
     if not _is_market_hours_now():
         LOG.info("Outside US extended-hours window — stop-loss check skipped")
         return []
     cur = conn.cursor()
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now = _now_utc()
+    now_iso = now.isoformat()
     executed: list[dict] = []
 
     # Skip retired accounts entirely — frozen positions, no protective sells.
@@ -314,9 +436,11 @@ def check_stop_losses(
         if stop_loss is None:
             # Benchmark / unknown account — no stop loss
             continue
-        px = prices.get(ticker)
-        if not px:
+        raw_quote = prices.get(ticker)
+        px, quote_detail = _price_and_execution_detail(raw_quote)
+        if not px or px <= 0:
             continue
+        quote_detail = {"price": px, **quote_detail}
         pnl_pct = (px - avg_cost) / avg_cost
 
         triggered_reason = None
@@ -361,6 +485,32 @@ def check_stop_losses(
         if triggered_reason is None:
             continue
 
+        if acct_market == "CN":
+            settled = min(float(shares), _cn_sellable_shares(cur, acct, ticker, now))
+            if settled <= 0:
+                if execute:
+                    _insert_guard_event(
+                        cur, now_iso=now_iso, market="CN", account=acct,
+                        ticker=ticker, reason="cn_t_plus_one",
+                        detail={"held_shares": shares, "sellable_shares": settled},
+                    )
+                    conn.commit()
+                continue
+            # Structured quotes carry execution-state fields. Legacy scalar
+            # quotes remain compatible, but cannot claim halt/limit knowledge.
+            if isinstance(raw_quote, dict):
+                execution_reason = _cn_execution_block_reason(quote_detail)
+                if execution_reason:
+                    if execute:
+                        _insert_guard_event(
+                            cur, now_iso=now_iso, market="CN", account=acct,
+                            ticker=ticker, reason=execution_reason, detail=quote_detail,
+                        )
+                        conn.commit()
+                    continue
+            shares = settled
+            pnl_dollar = None  # recomputed below for the executable quantity
+
         planned = {
             "account": acct, "ticker": ticker, "shares": shares,
             "price": px, "avg_cost": avg_cost, "pnl_pct": pnl_pct * 100,
@@ -370,10 +520,9 @@ def check_stop_losses(
         if not execute:
             executed.append(planned)
             LOG.warning(
-                "%s WOULD EXECUTE [%s/%s] %s: %.0f sh @ %s%.2f (cost %s%.2f, %s)",
+                "%s WOULD EXECUTE [%s/%s] %s: %.0f sh @ %s%.2f (%s)",
                 triggered_reason.upper(), acct_market, acct, ticker, shares,
-                _currency_symbol(acct_market), px, _currency_symbol(acct_market), avg_cost,
-                triggered_msg,
+                _currency_symbol(acct_market), px, triggered_msg,
             )
             continue
 
@@ -401,11 +550,16 @@ def check_stop_losses(
             )
 
             cur.execute(
-                "DELETE FROM positions WHERE account=? AND ticker=? AND market=?",
-                (acct, ticker, acct_market),
+                "UPDATE positions SET shares=shares-?, total_cost=total_cost-?, "
+                "updated_at=? WHERE account=? AND ticker=? AND market=?",
+                (shares, avg_cost * shares, now_iso, acct, ticker, acct_market),
             )
             if cur.rowcount != 1:
-                raise RuntimeError(f"expected to delete 1 position row, deleted {cur.rowcount}")
+                raise RuntimeError(f"expected to update 1 position row, updated {cur.rowcount}")
+            cur.execute(
+                "DELETE FROM positions WHERE account=? AND ticker=? AND market=? AND shares<=1e-9",
+                (acct, ticker, acct_market),
+            )
 
             cur.execute(
                 "INSERT INTO trades (account, ticker, side, shares, price, cost, slippage, timestamp, market) "
@@ -457,15 +611,15 @@ def update_equity_snapshots(
 ) -> dict:
     """Refresh quotes and optionally snapshots/trades.
 
-    ``dry_run`` is strictly read-only: it fetches quotes and evaluates stop
-    triggers but writes no database state. ``no_trades`` allows snapshot/price
-    writes while suppressing all protective sells. Live trading requires both
-    flags to be false.
+    ``dry_run`` is strictly read-only. ``no_trades`` writes snapshots but
+    suppresses every protective sell. Live execution requires both false.
     """
     if dry_run and no_trades:
         raise ValueError("--dry-run and --no-trades are mutually exclusive")
     if dry_run:
-        conn = sqlite3.connect(f"file:{os.path.abspath(db_path)}?mode=ro", uri=True, timeout=30)
+        conn = sqlite3.connect(
+            f"file:{os.path.abspath(db_path)}?mode=ro", uri=True, timeout=30
+        )
     else:
         conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
@@ -512,37 +666,53 @@ def update_equity_snapshots(
         LOG.info("No open-market active positions found — nothing to update.")
         conn.close()
         return {
-            "dry_run": dry_run,
-            "no_trades": no_trades,
-            "accounts_updated": 0,
-            "tickers": 0,
-            "would_stop_losses": 0,
-            "stop_losses": 0,
+            "dry_run": dry_run, "no_trades": no_trades,
+            "accounts_updated": 0, "tickers": 0,
+            "would_stop_losses": 0, "stop_losses": 0,
         }
 
     t0 = time.time()
-    prices = fetch_quotes(held)
-    dt_fetch = time.time() - t0
-    LOG.info(
-        "Fetched realtime quotes for %d/%d tickers in %.1fs",
-        len(prices), len(held), dt_fetch,
+    now = _utc_now()
+    quote_metadata = fetch_quote_metadata(held)
+    # Force mode refreshes closed markets for repair/display only. Strict quote
+    # freshness/tradability applies to markets that are actually open now.
+    required_live = [
+        ticker for ticker in held
+        if (_is_cn(ticker) and cn_open) or (not _is_cn(ticker) and us_open)
+    ]
+    validation = validate_required_quotes(
+        quote_metadata, required_live, now=now,
+        max_age_seconds=float(os.environ.get("QUANT_MAX_QUOTE_AGE_SECONDS", "180")),
     )
-    if not prices:
-        LOG.warning("No realtime prices — skipping.")
+    dt_fetch = time.time() - t0
+    if not validation["ok"]:
         conn.close()
-        return {
-            "dry_run": dry_run,
-            "no_trades": no_trades,
-            "accounts_updated": 0,
-            "tickers": len(held),
-            "prices_fetched": 0,
-            "would_stop_losses": 0,
-            "stop_losses": 0,
+        raise RuntimeError(f"quote validation failed: {validation}")
+    prices = prices_from_quotes(quote_metadata)
+    # Closed-market force-refresh quotes without a provider timestamp remain
+    # display-only; include their positive prices but never use them for trades.
+    if force_update:
+        for ticker, quote in quote_metadata.items():
+            if quote.price and quote.price > 0:
+                prices[ticker] = float(quote.price)
+    execution_quotes = {
+        ticker: {
+            "price": quote.price,
+            "prev_close": quote.prev_close,
+            "volume": quote.volume,
         }
+        for ticker, quote in quote_metadata.items()
+    }
+    LOG.info(
+        "Fetched fresh tradable quotes for %d/%d tickers in %.1fs",
+        validation["valid"], validation["expected"], dt_fetch,
+    )
 
-    # 1. Stop-loss check FIRST (may remove positions / change cash)
+    # 1. Stop-loss check FIRST. CN needs prev-close/volume metadata. Safety
+    # modes call the same decision path with execute=False; the helper itself
+    # guarantees no transaction or audit-event writes in that mode.
     stop_candidates = check_stop_losses(
-        conn, prices, execute=not (dry_run or no_trades)
+        conn, execution_quotes, execute=not (dry_run or no_trades)
     )
     stop_executed = [] if (dry_run or no_trades) else stop_candidates
     if dry_run:
@@ -552,15 +722,18 @@ def update_equity_snapshots(
             len(prices), len(stop_candidates),
         )
         return {
-            "dry_run": True,
-            "no_trades": False,
-            "accounts_updated": 0,
-            "tickers": len(held),
+            "dry_run": True, "no_trades": False,
+            "accounts_updated": 0, "tickers": len(held),
             "prices_fetched": len(prices),
-            "would_stop_losses": len(stop_candidates),
-            "stop_losses": 0,
+            "held_coverage": validation["coverage"],
+            "would_stop_losses": len(stop_candidates), "stop_losses": 0,
             "fetch_seconds": round(dt_fetch, 2),
         }
+    if no_trades:
+        LOG.info(
+            "No-trades mode: suppressed %d otherwise executable protective sells",
+            len(stop_candidates),
+        )
     if stop_executed:
         conn.commit()  # persist before equity recomputation
         # Fire-and-forget Telegram alert (don't block equity update on failure)
@@ -647,6 +820,37 @@ def update_equity_snapshots(
 
     conn.commit()
 
+    # Durable success heartbeat is written only after every active held ticker
+    # had a fresh tradable quote and all snapshots committed.
+    for market, is_open in (("US", us_open), ("CN", cn_open)):
+        if not is_open:
+            continue
+        market_held = [t for t in held if _is_cn(t) == (market == "CN")]
+        if not market_held:
+            continue
+        market_validation = validate_required_quotes(
+            quote_metadata, market_held, now=now,
+            max_age_seconds=float(os.environ.get("QUANT_MAX_QUOTE_AGE_SECONDS", "180")),
+        )
+        market_oldest = market_validation.get("oldest_source_timestamp")
+        market_details = {
+            "coverage": market_validation["coverage"],
+            "expected": market_validation["expected"],
+            "valid": market_validation["valid"],
+            "fetch_seconds": round(dt_fetch, 2),
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO operational_health "
+            "(component,market,status,success_at,source_timestamp,details) "
+            "VALUES ('update_prices',?,'ok',?,?,?)",
+            (
+                market, now.isoformat(),
+                market_oldest.isoformat() if market_oldest else None,
+                __import__("json").dumps(market_details, ensure_ascii=False),
+            ),
+        )
+    conn.commit()
+
     # Risk-regime evaluation: compute portfolio drawdown, auto-arm/disarm
     # the trailing stop. Best-effort — never block snapshot updates on this.
     try:
@@ -668,6 +872,7 @@ def update_equity_snapshots(
         "accounts_updated": updated,
         "tickers": len(held),
         "prices_fetched": len(prices),
+        "held_coverage": validation["coverage"],
         "would_stop_losses": len(stop_candidates),
         "stop_losses": len(stop_executed),
         "fetch_seconds": round(dt_fetch, 2),

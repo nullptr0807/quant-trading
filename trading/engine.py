@@ -19,12 +19,14 @@ class TradingEngine:
         stop_loss_pct: float = -0.03,      # -3% stop loss trigger
         costs: MoomooAUCosts | None = None,
         trade_callback=None,              # called with (account, trade_dict) after each trade
+        clock=None,
     ):
         self.max_position_pct = max_position_pct
         self.stop_loss_pct = stop_loss_pct
         self.costs = costs or MoomooAUCosts()
         self.accounts: dict[str, VirtualAccount] = {}
         self.trade_callback = trade_callback
+        self.clock = clock
 
     def _lot_size(self) -> int:
         """Minimum board lot for new buy orders.
@@ -78,7 +80,9 @@ class TradingEngine:
         }
 
     def create_account(self, name: str, initial_cash: float = 1000.0) -> VirtualAccount:
-        acct = VirtualAccount(initial_cash=initial_cash, costs=self.costs)
+        acct = VirtualAccount(
+            initial_cash=initial_cash, costs=self.costs, clock=self.clock
+        )
         self.accounts[name] = acct
         return acct
 
@@ -149,6 +153,12 @@ class TradingEngine:
             result = self.execute_trade(account_name, ticker, "buy", shares, price)
 
         elif side == "sell":
+            sellable = acct.get_sellable_shares(
+                ticker, as_of=self.clock() if self.clock else None
+            )
+            shares = min(float(shares), sellable)
+            if shares <= 0:
+                return None
             result = self.execute_trade(
                 account_name, ticker, "sell", shares, price, reason=reason
             )

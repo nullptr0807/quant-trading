@@ -209,6 +209,24 @@ def init_db(db_path: str | None = None):
     c.execute("CREATE INDEX IF NOT EXISTS idx_trades_market_ts ON trades(market, timestamp)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_events_market_ts ON events(market, ts)")
 
+    c.execute("""CREATE TABLE IF NOT EXISTS operational_health (
+        component TEXT NOT NULL,
+        market TEXT NOT NULL,
+        status TEXT NOT NULL,
+        success_at TEXT NOT NULL,
+        source_timestamp TEXT,
+        details TEXT,
+        PRIMARY KEY(component, market)
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS account_meta (
+        account_id TEXT PRIMARY KEY,
+        strategy_name TEXT DEFAULT '', description TEXT DEFAULT '',
+        "group" TEXT DEFAULT '', factors TEXT DEFAULT '',
+        initial_cash REAL DEFAULT 10000, created_at TEXT,
+        status TEXT DEFAULT 'active', market TEXT NOT NULL DEFAULT 'US',
+        retired_at TEXT, retire_reason TEXT
+    )""")
+
     conn.commit()
     conn.close()
 
@@ -625,6 +643,43 @@ class DataStore:
         ).fetchall()
         conn.close()
         return [{"ticker": r[0], "shares": r[1], "avg_cost": r[2], "total_cost": r[3]} for r in rows]
+
+    def load_trade_lots(self, account: str, market: str = "US") -> dict[str, list[dict]]:
+        """Reconstruct currently-held acquisition lots from the durable trade log.
+
+        FIFO replay is conservative for CN T+1.  If dirty history cannot explain
+        the current position, callers must fail closed rather than invent a buy
+        date that would make shares sellable.
+        """
+        conn = self._conn()
+        try:
+            rows = conn.execute(
+                "SELECT ticker,side,shares,timestamp FROM trades "
+                "WHERE account=? AND market=? ORDER BY timestamp,id",
+                (account, market),
+            ).fetchall()
+        finally:
+            conn.close()
+        lots: dict[str, list[dict]] = {}
+        for ticker, side, raw_shares, timestamp in rows:
+            shares = float(raw_shares or 0)
+            queue = lots.setdefault(str(ticker), [])
+            if str(side).lower() == "buy":
+                queue.append({"shares": shares, "bought_at": str(timestamp)})
+                continue
+            if str(side).lower() != "sell":
+                continue
+            remaining = shares
+            kept = []
+            for lot in queue:
+                qty = float(lot["shares"])
+                used = min(qty, remaining)
+                qty -= used
+                remaining -= used
+                if qty > 1e-9:
+                    kept.append({**lot, "shares": qty})
+            lots[str(ticker)] = kept
+        return lots
 
     # ── Factor Values ──────────────────────────────────────────────────────
 

@@ -367,6 +367,30 @@ def test_corporate_action_summary_fails_closed(summary, expected_check):
     assert expected_check in {i["check"] for i in result["issues"]}
 
 
+def test_corporate_action_yfinance_dataframe_shape_is_normalized(monkeypatch):
+    import pandas as pd
+    import yfinance as yf
+    from scripts.audit_corporate_actions import fetch_us_actions
+
+    class DummyTicker:
+        splits = pd.DataFrame(
+            {"Stock Splits": [4.0]},
+            index=pd.to_datetime(["2026-07-02 09:30:00-04:00"]),
+        )
+        dividends = pd.DataFrame(
+            {"Dividends": [0.25]},
+            index=pd.to_datetime(["2026-07-03 09:30:00-04:00"]),
+        )
+
+    monkeypatch.setattr(yf, "Ticker", lambda _ticker: DummyTicker())
+    actions = fetch_us_actions("TEST", "2026-07-01", "2026-07-10")
+
+    assert [(a.action_type, a.ratio, a.cash_per_share) for a in actions] == [
+        ("split", 4.0, None),
+        ("cash_dividend", None, 0.25),
+    ]
+
+
 def test_corporate_action_summary_passes_without_open_share_actions_or_fetch_errors():
     from scripts.corporate_action_check import evaluate_audit_result
 

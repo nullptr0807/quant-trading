@@ -31,6 +31,11 @@ def _seed_account(db_path):
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, category TEXT, severity TEXT,
                 account TEXT, ticker TEXT, title TEXT, detail TEXT, market TEXT
             );
+            CREATE TABLE operational_health (
+                component TEXT, market TEXT, status TEXT, success_at TEXT,
+                source_timestamp TEXT, details TEXT,
+                PRIMARY KEY (component, market)
+            );
             CREATE TABLE positions_history (
                 account TEXT, ticker TEXT, market_price REAL, timestamp TEXT
             );
@@ -70,7 +75,17 @@ def test_dry_run_fetches_and_reports_but_leaves_database_byte_identical(tmp_path
 
     monkeypatch.setattr(update_prices, "_is_us_market_hours_now", lambda: True)
     monkeypatch.setattr(update_prices, "_is_cn_market_hours_now", lambda: False)
-    monkeypatch.setattr(update_prices, "fetch_quotes", lambda tickers: {"AAPL": 90.0})
+    now = update_prices._utc_now()
+    monkeypatch.setattr(
+        update_prices,
+        "fetch_quote_metadata",
+        lambda tickers: {
+            "AAPL": __import__("data.quotes", fromlist=["RealtimeQuote"]).RealtimeQuote(
+                ticker="AAPL", price=90.0, source="test",
+                source_timestamp=now, received_at=now, tradable=True,
+            )
+        },
+    )
     monkeypatch.setitem(update_prices.STOP_LOSS_BY_ACCT, "A01", 0.05)
 
     stats = update_prices.update_equity_snapshots(str(db), dry_run=True)
@@ -90,7 +105,17 @@ def test_no_trades_updates_snapshots_without_selling(tmp_path, monkeypatch):
 
     monkeypatch.setattr(update_prices, "_is_us_market_hours_now", lambda: True)
     monkeypatch.setattr(update_prices, "_is_cn_market_hours_now", lambda: False)
-    monkeypatch.setattr(update_prices, "fetch_quotes", lambda tickers: {"AAPL": 90.0})
+    now = update_prices._utc_now()
+    monkeypatch.setattr(
+        update_prices,
+        "fetch_quote_metadata",
+        lambda tickers: {
+            "AAPL": __import__("data.quotes", fromlist=["RealtimeQuote"]).RealtimeQuote(
+                ticker="AAPL", price=90.0, source="test",
+                source_timestamp=now, received_at=now, tradable=True,
+            )
+        },
+    )
     monkeypatch.setitem(update_prices.STOP_LOSS_BY_ACCT, "A01", 0.05)
 
     stats = update_prices.update_equity_snapshots(str(db), no_trades=True)

@@ -39,6 +39,7 @@ from accounts.strategies import STRATEGIES
 from accounts.gp_strategies import active_gp_strategies_for_market
 from accounts.qlib_strategies import QLIB_STRATEGIES
 from factors.gp_miner import GPAlphaMiner, FEATURE_COLS
+from data.quotes import prices_from_quotes, validate_required_quotes
 from factors.factor_miner_gp import FactorMinerGPBackend
 from dataclasses import replace as _dc_replace
 
@@ -270,6 +271,10 @@ def is_us_rth() -> bool:
 # (_CST / _ET are defined at the top of this section.)
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def is_market_hours_cn() -> bool:
     if _CST is None:
         return False
@@ -393,6 +398,7 @@ class QuantSystem:
         self._last_data_fetch = None
         self._last_report = None
         self._realtime_prices = {}  # {ticker: float} latest real-time prices
+        self._realtime_quote_details = {}
 
         # 自适应换仓状态
         self._adaptive_enabled = ADAPTIVE_REBALANCE.get("enabled", False)
@@ -575,6 +581,40 @@ class QuantSystem:
             conn.close()
 
     # -- State persistence ----------------------------------------------------
+    def _execute_live_signal(
+        self, account: str, ticker: str, side: str, shares: float, price: float,
+        current_prices: dict[str, float], *, reason: str = "signal",
+    ):
+        """Apply production execution-state guards before mutating the paper book."""
+        if self.market == "CN":
+            detail = getattr(self, "_realtime_quote_details", {}).get(ticker)
+            block = None
+            if not isinstance(detail, dict):
+                block = "execution_state_unknown"
+            else:
+                try:
+                    prev_close = float(detail["prev_close"])
+                    volume = float(detail["volume"])
+                    quote_price = float(detail.get("price", price))
+                    if volume <= 0:
+                        block = "cn_suspended_or_no_volume"
+                    elif side == "sell" and quote_price <= prev_close * 0.90 + 1e-9:
+                        block = "cn_limit_down"
+                    elif side == "buy" and quote_price >= prev_close * 1.10 - 1e-9:
+                        block = "cn_limit_up"
+                except (KeyError, TypeError, ValueError):
+                    block = "execution_state_unknown"
+            if block:
+                emit_event(
+                    "guard", f"⛔ {account}/{ticker} blocked: {block}",
+                    severity="warning", account=account, ticker=ticker,
+                    detail={"reason": block, "quote": detail}, market=self.market,
+                )
+                return None
+        return self.engine.execute_signal(
+            account, ticker, side, shares, price, current_prices, reason=reason
+        )
+
     def _on_trade(self, account_name: str, trade: dict):
         """Atomically persist a trade, its event, and the resulting account state."""
         side = trade["side"]
@@ -648,14 +688,30 @@ class QuantSystem:
             acct.cash = state["cash"]
             acct.initial_cash = state["initial_cash"]
 
-            # Restore positions
+            # Restore positions. CN T+1 acquisition lots are reconstructed from
+            # the durable trade log; mismatches fail closed (zero sellable) rather
+            # than inventing settlement dates.
             positions = self.store.load_positions(acct_id, market=self.market)
+            trade_lots = (
+                self.store.load_trade_lots(acct_id, market=self.market)
+                if self.market == "CN" else {}
+            )
             for p in positions:
                 from trading.account import _Position
+                lots = trade_lots.get(p["ticker"]) if self.market == "CN" else None
+                if self.market == "CN":
+                    explained = sum(float(lot.get("shares", 0)) for lot in (lots or []))
+                    if abs(explained - float(p["shares"])) > 1e-6:
+                        log.error(
+                            "[%s/%s] T+1 lot replay mismatch for %s: positions=%s trades=%s; fail-closed",
+                            self.market, acct_id, p["ticker"], p["shares"], explained,
+                        )
+                        lots = []
                 acct._positions[p["ticker"]] = _Position(
                     shares=p["shares"],
                     avg_cost=p["avg_cost"],
                     total_cost=p["total_cost"],
+                    lots=lots,
                 )
             restored += 1
             log.info("  Restored %s: $%.2f cash, %d positions",
@@ -1200,18 +1256,45 @@ class QuantSystem:
                     self.market, prepare_seconds,
                 )
                 return None
-        self._realtime_prices = self._fetch_realtime_prices_for(quote_tickers)
-        if not self._realtime_prices:
-            log.error("[%s] fast live cycle aborted: no bounded realtime quotes", self.market)
-            return None
-        if dry_run:
-            held = self._active_holding_tickers()
-            missing_held = sorted(held - set(self._realtime_prices))
-            if missing_held:
-                raise RuntimeError(
-                    "fast dry-run missing quotes for held tickers: "
-                    + ",".join(missing_held[:20])
+        getter = getattr(self.fetcher, "get_realtime_quote_metadata", None)
+        if getter is None:
+            # Compatibility for tests/offline custom fetchers. Production
+            # DataFetcher/CNDataFetcher always expose metadata and therefore use
+            # strict timestamp/tradability validation.
+            raw_prices = self.fetcher.get_realtime_quotes(sorted(quote_tickers))
+            from data.quotes import RealtimeQuote
+            now = _utc_now()
+            quotes = {
+                ticker: RealtimeQuote(
+                    ticker=ticker, price=price, source="legacy_custom_fetcher",
+                    source_timestamp=now, received_at=now, tradable=True,
                 )
+                for ticker, price in raw_prices.items()
+            }
+        else:
+            quotes = getter(sorted(quote_tickers))
+        held = self._active_holding_tickers()
+        # Every quote that can reach a buy/sell path must be positive, fresh,
+        # timestamped, and tradable. Validating only held names still allowed a
+        # stale/untradable candidate quote to create a new position.
+        validation = validate_required_quotes(
+            quotes, quote_tickers, now=_utc_now(),
+            max_age_seconds=float(os.environ.get("QUANT_MAX_QUOTE_AGE_SECONDS", "180")),
+        )
+        if not validation["ok"]:
+            raise RuntimeError(f"fast-cycle quote validation failed: {validation}")
+        self._realtime_prices = prices_from_quotes(quotes)
+        self._realtime_quote_details = {
+            ticker: {
+                "price": quote.price,
+                "prev_close": quote.prev_close,
+                "volume": quote.volume,
+            }
+            for ticker, quote in quotes.items()
+        }
+        if not self._realtime_prices:
+            raise RuntimeError(f"[{self.market}] fast live cycle: no bounded realtime quotes")
+        if dry_run:
             log.info(
                 "Fast live dry-run [%s] OK: prepared=%d quoted=%d held=%d; no trades/state writes",
                 self.market, len(quote_tickers), len(self._realtime_prices), len(held),
@@ -1718,7 +1801,7 @@ class QuantSystem:
                 if pnl_pct <= -gp_strat.stop_loss:
                     log.info("[%s] GP Stop loss %s: %.1f%%", gp_strat.id, ticker, pnl_pct * 100)
                     try:
-                        self.engine.execute_signal(gp_strat.id, ticker, "sell", shares, price, current_prices, reason="stop_loss")
+                        self._execute_live_signal(gp_strat.id, ticker, "sell", shares, price, current_prices, reason="stop_loss")
                     except TradePersistenceError:
                         raise
                     except Exception as e:
@@ -1731,7 +1814,7 @@ class QuantSystem:
                              gp_strat.id, ticker, cc.get("min_hold_days", 0))
                     continue
                 try:
-                    self.engine.execute_signal(gp_strat.id, ticker, "sell", shares, price, current_prices)
+                    self._execute_live_signal(gp_strat.id, ticker, "sell", shares, price, current_prices)
                     log.info("[%s] GP Sold %s x%.0f @ $%.2f", gp_strat.id, ticker, shares, price)
                 except TradePersistenceError:
                     raise
@@ -1775,7 +1858,7 @@ class QuantSystem:
                     )
                 continue
             try:
-                result = self.engine.execute_signal(gp_strat.id, ticker, "buy", shares, price, current_prices)
+                result = self._execute_live_signal(gp_strat.id, ticker, "buy", shares, price, current_prices)
                 if result:
                     if held <= 0:
                         active_count += 1
@@ -2034,7 +2117,7 @@ class QuantSystem:
                 if pnl_pct <= -q_strat.stop_loss:
                     log.info("[%s] Qlib stop loss %s: %.1f%%", q_strat.id, ticker, pnl_pct * 100)
                     try:
-                        self.engine.execute_signal(
+                        self._execute_live_signal(
                             q_strat.id, ticker, "sell", shares, price, current_prices,
                             reason="stop_loss",
                         )
@@ -2049,7 +2132,7 @@ class QuantSystem:
                              q_strat.id, ticker, cc.get("min_hold_days", 0))
                     continue
                 try:
-                    self.engine.execute_signal(
+                    self._execute_live_signal(
                         q_strat.id, ticker, "sell", shares, price, current_prices,
                     )
                     log.info("[%s] Qlib sold %s x%.0f @ $%.2f", q_strat.id, ticker, shares, price)
@@ -2095,7 +2178,7 @@ class QuantSystem:
                     )
                 continue
             try:
-                result = self.engine.execute_signal(
+                result = self._execute_live_signal(
                     q_strat.id, ticker, "buy", shares, price, current_prices,
                 )
                 if result:
@@ -2289,7 +2372,7 @@ class QuantSystem:
                 if pnl_pct <= strat.stop_loss * -1:
                     log.info("[%s] Stop loss %s: %.1f%%", strat.id, ticker, pnl_pct * 100)
                     try:
-                        self.engine.execute_signal(
+                        self._execute_live_signal(
                             strat.id, ticker, "sell", shares, price, current_prices,
                             reason="stop_loss",
                         )
@@ -2306,7 +2389,7 @@ class QuantSystem:
                              strat.id, ticker, cc.get("min_hold_days", 0))
                     continue
                 try:
-                    self.engine.execute_signal(
+                    self._execute_live_signal(
                         strat.id, ticker, "sell", shares, price, current_prices
                     )
                     log.info("[%s] Sold %s x%.0f @ $%.2f", strat.id, ticker, shares, price)
@@ -2363,7 +2446,7 @@ class QuantSystem:
                 continue
 
             try:
-                result = self.engine.execute_signal(
+                result = self._execute_live_signal(
                     strat.id, ticker, "buy", shares, price, current_prices
                 )
                 if result:

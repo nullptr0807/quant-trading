@@ -17,10 +17,12 @@ import re
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from data.store import DataStore
+from data.quotes import RealtimeQuote, prices_from_quotes
 
 log = logging.getLogger("quant.cn")
 
@@ -266,6 +268,11 @@ class CNDataFetcher:
           name,current,prev_close,current,high,low,...
         Prefer field[3] for normal stocks; fall back to field[1] for indices.
         """
+        parsed = CNDataFetcher._parse_sina_quote(payload)
+        return parsed["price"] if parsed else None
+
+    @staticmethod
+    def _parse_sina_quote(payload: str) -> dict | None:
         if not payload:
             return None
         fields = payload.split(",")
@@ -277,10 +284,23 @@ class CNDataFetcher:
             except Exception:
                 continue
             if px > 0:
-                return px
+                date_text = fields[30].strip() if len(fields) > 30 else ""
+                time_text = fields[31].strip() if len(fields) > 31 else ""
+                return {
+                    "price": px,
+                    "prev_close": (
+                        float(fields[2]) if len(fields) > 2 and fields[2] else None
+                    ),
+                    "volume": (
+                        float(fields[8]) if len(fields) > 8 and fields[8] else None
+                    ),
+                    "date": date_text,
+                    "time": time_text,
+                }
         return None
 
-    def _fetch_sina_batch(self, tickers: list[str], timeout_s: float = 8.0) -> dict[str, float]:
+    def _fetch_sina_quote_metadata(self, tickers: list[str],
+                                   timeout_s: float = 8.0) -> dict[str, RealtimeQuote]:
         """Fetch CN realtime quotes in one HTTP call via hq.sinajs.cn.
 
         This replaces the old one-akshare-call-per-ticker realtime path. For the
@@ -305,36 +325,48 @@ class CNDataFetcher:
             log.warning("CN Sina batch quote failed: %s", e)
             return {}
 
-        out: dict[str, float] = {}
+        out: dict[str, RealtimeQuote] = {}
+        received_at = datetime.now(timezone.utc)
         for ticker, symbol in zip(tickers, symbols):
             m = re.search(rf'var hq_str_{re.escape(symbol)}="([^"]*)";', text)
             if not m:
                 continue
-            px = self._parse_sina_price(m.group(1))
-            if px is not None:
-                out[ticker] = px
+            parsed = self._parse_sina_quote(m.group(1))
+            if not parsed:
+                continue
+            source_timestamp = None
+            if parsed.get("date") and parsed.get("time"):
+                try:
+                    source_timestamp = datetime.strptime(
+                        f"{parsed['date']} {parsed['time']}", "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=ZoneInfo("Asia/Shanghai")).astimezone(timezone.utc)
+                except ValueError:
+                    source_timestamp = None
+            out[ticker] = RealtimeQuote(
+                ticker=ticker, price=float(parsed["price"]), source="sina",
+                source_timestamp=source_timestamp, received_at=received_at,
+                tradable=source_timestamp is not None,
+                prev_close=parsed.get("prev_close"), volume=parsed.get("volume"),
+            )
         if out:
             log.info("Fetched CN realtime via Sina batch for %d/%d tickers", len(out), len(tickers))
         return out
 
-    def get_realtime_quotes(self, tickers: list[str]) -> dict[str, float]:
-        """Fetch latest realtime price per CN ticker.
-
-        yfinance can't quote .SH/.SZ symbols. Primary path is Sina's batch quote
-        endpoint (`hq.sinajs.cn/list=...`), which returns all held tickers in one
-        request and avoids the old per-ticker akshare minute-bar timeout problem.
-        Missing names fall back to akshare's 1-minute bar path with a bounded
-        total timeout.
-
-        Returns {ticker: price}; tickers we could not quote are absent.
-        """
+    def get_realtime_quote_metadata(self, tickers: list[str]) -> dict[str, RealtimeQuote]:
         if not tickers:
             return {}
-
-        # Preserve caller order while de-duping so SQL/Dashboard joins remain
-        # deterministic and the batch URL stays compact.
         tickers = list(dict.fromkeys(tickers))
-        out = self._fetch_sina_batch(tickers)
+        out = self._fetch_sina_quote_metadata(tickers)
+        # Timestamp-less fallback prices are display-only and deliberately
+        # omitted from metadata trading paths; fail-closed callers will reject
+        # missing coverage rather than trade on unverifiable bars.
+        return out
+
+    def get_realtime_quotes(self, tickers: list[str]) -> dict[str, float]:
+        """Compatibility API returning prices, with legacy AkShare fallback."""
+        metadata = self.get_realtime_quote_metadata(tickers)
+        out = prices_from_quotes(metadata)
+        tickers = list(dict.fromkeys(tickers))
         missing = [tk for tk in tickers if tk not in out]
         if not missing:
             return out

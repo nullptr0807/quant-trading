@@ -14,6 +14,7 @@ import finnhub
 import pandas as pd
 
 from data.store import DataStore
+from data.quotes import RealtimeQuote, prices_from_quotes
 
 log = logging.getLogger("quant")
 
@@ -336,47 +337,72 @@ class DataFetcher:
 
     # ── Realtime quotes (yfinance fast_info → finnhub fallback) ─────────────
 
-    def get_realtime_quotes(self, tickers: list[str]) -> dict[str, float]:
-        """Fetch latest realtime price per ticker (US market).
+    def get_realtime_quote_metadata(self, tickers: list[str]) -> dict[str, RealtimeQuote]:
+        """Fetch US quotes while preserving the provider's source timestamp.
 
-        Strategy: yfinance Ticker.fast_info.lastPrice (works pre/post market)
-        with parallel fan-out, falls back to Finnhub quote for any miss.
-        Returns {ticker: price}; tickers we could not quote are absent.
-
-        This is the single source of truth for US realtime quotes — both
-        main.py's hourly cycle and scripts/update_prices.py's per-minute
-        watchdog go through here so equity values stay consistent.
+        Finnhub exposes the required source timestamp as ``q.t``.  Prefer it
+        over yfinance's timestamp-less ``fast_info`` so live trading can reject
+        stale quotes.  ``fast_info`` remains a compatibility fallback, but is
+        explicitly non-tradable because freshness cannot be proven.
         """
         if not tickers:
             return {}
         from concurrent.futures import ThreadPoolExecutor
 
-        def _one(ticker: str) -> tuple[str, float | None]:
-            # 1) yfinance fast_info (covers pre/post market)
-            try:
-                px = yf.Ticker(ticker).fast_info.get("lastPrice")
-                if px and px > 0:
-                    return ticker, float(px)
-            except Exception:
-                pass
-            # 2) Finnhub fallback
+        def _one(ticker: str) -> tuple[str, RealtimeQuote | None]:
+            received_at = _utc_now()
+            # 1) Finnhub: authoritative source time for fail-closed consumers.
             try:
                 q = self.finnhub_client.quote(ticker)
-                c = q.get("c")
-                if c and c > 0:
-                    return ticker, float(c)
+                price = q.get("c")
+                source_epoch = q.get("t")
+                if price and float(price) > 0 and source_epoch:
+                    source_timestamp = datetime.fromtimestamp(
+                        float(source_epoch), tz=timezone.utc
+                    )
+                    return ticker, RealtimeQuote(
+                        ticker=ticker,
+                        price=float(price),
+                        source="finnhub",
+                        source_timestamp=source_timestamp,
+                        received_at=received_at,
+                        tradable=True,
+                    )
+            except Exception:
+                pass
+            # 2) Legacy compatibility fallback.  Price is usable for display,
+            # but not for a fail-closed trade/snapshot because no source time is
+            # available from FastInfo.
+            try:
+                price = yf.Ticker(ticker).fast_info.get("lastPrice")
+                if price and float(price) > 0:
+                    return ticker, RealtimeQuote(
+                        ticker=ticker,
+                        price=float(price),
+                        source="yfinance_fast_info",
+                        source_timestamp=None,
+                        received_at=received_at,
+                        tradable=False,
+                    )
             except Exception:
                 pass
             return ticker, None
 
-        out: dict[str, float] = {}
+        out: dict[str, RealtimeQuote] = {}
         with ThreadPoolExecutor(max_workers=16) as ex:
-            for tk, px in ex.map(_one, tickers):
-                if px is not None:
-                    out[tk] = px
+            for ticker, quote in ex.map(_one, tickers):
+                if quote is not None:
+                    out[ticker] = quote
         if out:
-            log.info("Fetched realtime quotes for %d/%d US tickers", len(out), len(tickers))
+            log.info(
+                "Fetched realtime quote metadata for %d/%d US tickers",
+                len(out), len(tickers),
+            )
         return out
+
+    def get_realtime_quotes(self, tickers: list[str]) -> dict[str, float]:
+        """Compatibility API returning only ``{ticker: price}``."""
+        return prices_from_quotes(self.get_realtime_quote_metadata(tickers))
 
     def get_extended_hours_quote(self, ticker: str) -> dict:
         """Get pre/after market quote from finnhub."""

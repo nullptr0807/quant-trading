@@ -3,6 +3,8 @@
 from __future__ import annotations
 import copy
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from .costs import MoomooAUCosts
 
 
@@ -11,15 +13,18 @@ class _Position:
     shares: float = 0.0
     avg_cost: float = 0.0  # per-share average cost basis (includes fees)
     total_cost: float = 0.0
+    lots: list[dict] | None = None  # CN T+1 acquisition lots
 
 
 class VirtualAccount:
     """Paper trading account starting with $1000."""
 
-    def __init__(self, initial_cash: float = 1000.0, costs: MoomooAUCosts | None = None):
+    def __init__(self, initial_cash: float = 1000.0,
+                 costs: MoomooAUCosts | None = None, *, clock=None):
         self.initial_cash = initial_cash
         self.cash = initial_cash
         self.costs = costs or MoomooAUCosts()
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._positions: dict[str, _Position] = {}
         self.trade_log: list[dict] = []
 
@@ -51,6 +56,13 @@ class VirtualAccount:
         pos.total_cost += total_outlay
         pos.shares += shares
         pos.avg_cost = pos.total_cost / pos.shares
+        if getattr(self.costs, "lot_size", 1) > 1:
+            if pos.lots is None:
+                pos.lots = []
+            pos.lots.append({
+                "shares": float(shares),
+                "bought_at": self._clock().isoformat(),
+            })
 
         trade = {"side": "buy", "ticker": ticker, "shares": shares,
                  "price": price, **fees}
@@ -75,9 +87,21 @@ class VirtualAccount:
         pnl_dollar = proceeds - cost_basis
         pnl_pct = (pnl_dollar / cost_basis) if cost_basis > 0 else 0.0
 
-        # Reduce position, keep avg_cost the same
+        # Reduce position, keep avg_cost the same. CN sells consume oldest
+        # settled lots first; execute_signal has already capped quantity.
         pos.total_cost -= avg_cost * shares
         pos.shares -= shares
+        if pos.lots is not None:
+            remaining = float(shares)
+            kept = []
+            for lot in pos.lots:
+                qty = float(lot.get("shares", 0) or 0)
+                used = min(qty, remaining)
+                qty -= used
+                remaining -= used
+                if qty > 1e-9:
+                    kept.append({**lot, "shares": qty})
+            pos.lots = kept
         if pos.shares < 1e-9:
             del self._positions[ticker]
 
@@ -87,6 +111,38 @@ class VirtualAccount:
                  "reason": reason, **fees}
         self.trade_log.append(trade)
         return trade
+
+    def get_sellable_shares(self, ticker: str, *, as_of: datetime | None = None) -> float:
+        """Return legally sellable shares (A-share T+1; US immediate)."""
+        pos = self._positions.get(ticker)
+        if not pos:
+            return 0.0
+        if getattr(self.costs, "lot_size", 1) <= 1:
+            return float(pos.shares)
+        if pos.lots is None:
+            # Legacy manually-restored CN positions predate durable lot tracking.
+            # Treat as settled only when the caller deliberately constructed the
+            # account in memory; production restore always supplies [] on an
+            # unexplained ledger, preserving fail-closed semantics.
+            return float(pos.shares)
+        now = as_of or self._clock()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        today = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        settled = 0.0
+        for lot in pos.lots:
+            try:
+                bought = datetime.fromisoformat(
+                    str(lot["bought_at"]).replace("Z", "+00:00")
+                )
+                if bought.tzinfo is None:
+                    bought = bought.replace(tzinfo=timezone.utc)
+                bought_day = bought.astimezone(ZoneInfo("Asia/Shanghai")).date()
+            except Exception:
+                continue
+            if bought_day < today:
+                settled += float(lot.get("shares", 0) or 0)
+        return min(float(pos.shares), settled)
 
     def get_positions(self) -> dict[str, float]:
         """Return {ticker: shares} for all open positions."""
