@@ -26,6 +26,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from trading.costs import CNCosts, MoomooAUCosts  # noqa: E402
 from config.security_master import canonical_ticker  # noqa: E402
+from data.us_market_calendar import is_us_regular_session  # noqa: E402
 
 _CN_SUFFIXES = (".SH", ".SZ", ".BJ")
 
@@ -552,6 +553,19 @@ def history_curve_audit(
     if not rows:
         return []
     is_cn_history = market == "CN"
+    if market == "US":
+        # The persisted raw 5m cache is an RTH audit source. Yahoo quote
+        # metadata may produce sparse pre/post snapshots that have no matching
+        # historical bar; treating those expected gaps as audit failures creates
+        # systematic noise. Audit RTH rows only, while current-ledger and latest
+        # snapshot checks continue to cover the full account state.
+        rows = [
+            row for row in rows
+            if (parse_ts(str(row["timestamp"])) is not None
+                and is_us_regular_session(parse_ts(str(row["timestamp"]))))
+        ]
+        if not rows:
+            return []
     raw_price_warning = Issue(
         "warning", account, "history_curve_prices",
         "historical equity audit skipped where raw execution-price coverage is insufficient; adjusted prices were not used as fallback",
