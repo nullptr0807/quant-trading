@@ -39,7 +39,7 @@ STOCK_UNIVERSE = [
 
     # Communication (48)
     "ASTS", "CHTR", "CMCSA", "DIS", "DJT", "DV", "EA", "FOX", "FOXA", "FWONA",
-    "FWONK", "GLIBA", "GLIBK", "GOOG", "GOOGL", "GTM", "IAC", "IRDM", "LBRDA", "LBRDK",
+    "FWONK", "GLIBA", "GLIBK", "GOOG", "GOOGL", "GTM", "PPLI", "IRDM", "LBRDA", "LBRDK",
     "LBTYA", "LBTYK", "LYV", "META", "MSGS", "MTCH", "NFLX", "NIQ", "NWS", "NWSA",
     "NXST", "NYT", "OMC", "PINS", "RBLX", "RDDT", "ROKU", "SIRI", "SPOT", "T",
     "TIGO", "TKO", "TMUS", "TTD", "TTWO", "VSNT", "VZ", "WBD",

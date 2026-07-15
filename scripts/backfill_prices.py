@@ -11,8 +11,10 @@ import os
 import argparse
 import logging
 import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-PROJECT_ROOT = os.path.expanduser("~/quant-trading")
+PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 sys.path.insert(0, PROJECT_ROOT)
 
 logging.basicConfig(
@@ -44,27 +46,68 @@ def _held_tickers_for_market(market: str) -> list[str]:
         return []
 
 
+def _ledger_tickers_for_market(market: str, days: int) -> list[str]:
+    """Return the bounded ticker set needed to replay recent live ledgers.
+
+    Current holdings cover positions opened before the window. Recent trades
+    add symbols sold during the window, which are still needed to value earlier
+    snapshots. Benchmarks are added by ``backfill``.
+    """
+    import sqlite3
+    try:
+        from data.store import DB_PATH
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, days) + 1)).isoformat()
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            """
+            SELECT DISTINCT ticker FROM (
+                SELECT p.ticker AS ticker
+                FROM positions p
+                LEFT JOIN account_meta m ON m.account_id=p.account
+                WHERE p.market=? AND p.shares>0
+                  AND COALESCE(m.status,'active')!='retired'
+                UNION
+                SELECT t.ticker AS ticker
+                FROM trades t
+                LEFT JOIN account_meta m ON m.account_id=t.account
+                WHERE t.market=? AND t.timestamp>=?
+                  AND COALESCE(m.status,'active')!='retired'
+            ) ORDER BY ticker
+            """,
+            (market, market, cutoff),
+        ).fetchall()
+        conn.close()
+        from config.security_master import canonical_ticker
+        now = datetime.now(timezone.utc)
+        return sorted({canonical_ticker(r[0], market, now) for r in rows})
+    except Exception as e:
+        log.warning("Could not load ledger tickers for %s: %s", market, e)
+        return _held_tickers_for_market(market)
+
+
 def _dedupe(seq):
     return list(dict.fromkeys(seq))
 
 
-def backfill(interval: str, days: int, batch_size: int = 50, market: str = "US", price_mode: str = "adjusted"):
+def backfill(interval: str, days: int, batch_size: int = 50, market: str = "US", price_mode: str = "adjusted", scope: str = "universe"):
     if market == "CN":
         from config.settings import CN_UNIVERSE, BENCHMARKS_BY_MARKET
         from data.cn_fetcher import CNDataFetcher
         bench_tickers = [bm["ticker"] for bm in BENCHMARKS_BY_MARKET["CN"]]
-        tickers = _dedupe(list(CN_UNIVERSE) + _held_tickers_for_market("CN") + bench_tickers)
+        base = _ledger_tickers_for_market("CN", days) if scope == "ledger" else list(CN_UNIVERSE) + _held_tickers_for_market("CN")
+        tickers = _dedupe(base + bench_tickers)
         fetcher = CNDataFetcher()
         # akshare/sina rate limits — smaller batches help
         batch_size = min(batch_size, 30)
     else:
         from config.settings import STOCK_UNIVERSE
         from data.fetcher import DataFetcher
-        tickers = _dedupe(list(STOCK_UNIVERSE) + _held_tickers_for_market("US") + ["QQQ", "SPY"])
+        base = _ledger_tickers_for_market("US", days) if scope == "ledger" else list(STOCK_UNIVERSE) + _held_tickers_for_market("US")
+        tickers = _dedupe(base + ["QQQ", "SPY"])
         fetcher = DataFetcher()
 
-    log.info("Backfilling [%s] %d tickers, interval=%s, days=%d, price_mode=%s",
-             market, len(tickers), interval, days, price_mode)
+    log.info("Backfilling [%s] %d tickers, interval=%s, days=%d, price_mode=%s, scope=%s",
+             market, len(tickers), interval, days, price_mode, scope)
     t0 = time.time()
 
     total_rows = 0
@@ -98,6 +141,8 @@ def main():
                    help="Which market's universe to backfill (default US)")
     p.add_argument("--price-mode", default="adjusted", choices=["adjusted", "raw", "both"],
                    help="adjusted/qfq research prices, raw execution prices, or both")
+    p.add_argument("--scope", default="universe", choices=["universe", "ledger"],
+                   help="full research universe or bounded current/recent ledger tickers")
     p.add_argument("--all", action="store_true",
                    help="Backfill 1h (90d) + 1d (400d). For CN: 1d only (no intraday hist).")
     args = p.parse_args()
@@ -106,13 +151,13 @@ def main():
     for mode in modes:
         if args.all:
             if args.market == "CN":
-                backfill("1d", max(400, args.days), args.batch_size, market="CN", price_mode=mode)
+                backfill("1d", max(400, args.days), args.batch_size, market="CN", price_mode=mode, scope=args.scope)
             else:
-                backfill("5m", 60, args.batch_size, market="US", price_mode=mode)
-                backfill("1h", 90, args.batch_size, market="US", price_mode=mode)
-                backfill("1d", 400, args.batch_size, market="US", price_mode=mode)
+                backfill("5m", 60, args.batch_size, market="US", price_mode=mode, scope=args.scope)
+                backfill("1h", 90, args.batch_size, market="US", price_mode=mode, scope=args.scope)
+                backfill("1d", 400, args.batch_size, market="US", price_mode=mode, scope=args.scope)
         else:
-            backfill(args.interval, args.days, args.batch_size, market=args.market, price_mode=mode)
+            backfill(args.interval, args.days, args.batch_size, market=args.market, price_mode=mode, scope=args.scope)
 
 
 if __name__ == "__main__":

@@ -20,11 +20,12 @@ from pathlib import Path
 from typing import Any
 
 DB_PATH = Path.home() / "quant-trading" / "data" / "trading.db"
-PROJECT_ROOT = DB_PATH.parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from trading.costs import CNCosts, MoomooAUCosts  # noqa: E402
+from config.security_master import canonical_ticker  # noqa: E402
 
 _CN_SUFFIXES = (".SH", ".SZ", ".BJ")
 
@@ -161,7 +162,7 @@ def replay_account(
 
     for r in rows:
         side = str(r["side"]).lower()
-        ticker = str(r["ticker"])
+        ticker = canonical_ticker(str(r["ticker"]), market, str(r["timestamp"]))
         shares = float(r["shares"])
         price = float(r["price"])
         fees = costs.calculate(side, shares, price) if side in ("buy", "sell") else None
@@ -378,7 +379,7 @@ def _replay_series(
     def apply_trade(r: sqlite3.Row):
         nonlocal cash
         side = str(r["side"]).lower()
-        ticker = str(r["ticker"])
+        ticker = canonical_ticker(str(r["ticker"]), market, str(r["timestamp"]))
         shares = float(r["shares"])
         price = float(r["price"])
         fees = costs.calculate(side, shares, price) if side in ("buy", "sell") else None
