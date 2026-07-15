@@ -848,7 +848,23 @@ def check_account(
     prev_snap, last_snap = previous_and_last_cash_for_day(conn, account, market, day_start, day_end)
     daily_expected_delta = -replay.buys_notional_day + replay.sells_notional_day - replay.fees_day - replay.slippage_day
     daily_actual_delta = None
-    if prev_snap and last_snap and replay.trade_count_day:
+    has_day_snapshot = bool(
+        last_snap and day_start <= str(last_snap["timestamp"]) < day_end
+    )
+    if replay.trade_count_day and not has_day_snapshot:
+        issues.append(
+            Issue(
+                "warning", account, "daily_snapshot_missing",
+                "trades occurred but no account snapshot was persisted during the trading day",
+                {
+                    "trades_day": replay.trade_count_day,
+                    "day_start": day_start,
+                    "day_end": day_end,
+                    "last_snapshot": last_snap["timestamp"] if last_snap else None,
+                },
+            )
+        )
+    elif prev_snap and last_snap and replay.trade_count_day:
         daily_actual_delta = float(last_snap["cash"]) - float(prev_snap["cash"])
         delta_diff = daily_actual_delta - daily_expected_delta
         if abs(delta_diff) > args.cashflow_tolerance:
