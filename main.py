@@ -579,6 +579,15 @@ class QuantSystem:
         current_prices: dict[str, float], *, reason: str = "signal",
     ):
         """Apply production execution-state guards before mutating the paper book."""
+        from config.security_master import ticker_lifecycle_block_reason
+        symbol_block = ticker_lifecycle_block_reason(ticker, self.market, _utc_now())
+        if symbol_block:
+            emit_event(
+                "guard", f"⛔ {account}/{ticker} blocked: {symbol_block}",
+                severity="critical", account=account, ticker=ticker,
+                detail={"reason": symbol_block}, market=self.market,
+            )
+            return None
         if self.market == "CN":
             detail = getattr(self, "_realtime_quote_details", {}).get(ticker)
             block = None

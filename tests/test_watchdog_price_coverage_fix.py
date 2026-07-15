@@ -47,10 +47,80 @@ def test_us_universe_uses_current_people_inc_symbol():
 
 
 def test_iac_symbol_change_is_effective_only_from_sec_change_date():
-    from config.security_master import canonical_ticker
+    from config.security_master import canonical_ticker, ticker_lifecycle_block_reason
 
     assert canonical_ticker("IAC", "US", "2026-06-02T23:59:59+00:00") == "IAC"
     assert canonical_ticker("IAC", "US", "2026-06-03T00:00:00+00:00") == "PPLI"
+    assert ticker_lifecycle_block_reason("IAC", "US", "2026-07-10T14:00:00+00:00") == "symbol_changed_to_PPLI"
+    assert ticker_lifecycle_block_reason("PPLI", "US", "2026-07-10T14:00:00+00:00") is None
+
+
+def test_main_execution_gate_rejects_old_symbol_even_with_a_price(monkeypatch):
+    import main
+
+    events = []
+    monkeypatch.setattr(main, "emit_event", lambda *a, **k: events.append((a, k)))
+
+    class Engine:
+        def execute_signal(self, *args, **kwargs):
+            raise AssertionError("inactive symbol reached execution engine")
+
+    system = object.__new__(main.QuantSystem)
+    system.market = "US"
+    system.engine = Engine()  # type: ignore[assignment]
+
+    result = main.QuantSystem._execute_live_signal(
+        system, "F15", "IAC", "sell", 54, 42.24, {"IAC": 42.24}
+    )
+    assert result is None
+    assert events and events[0][1]["detail"]["reason"] == "symbol_changed_to_PPLI"
+
+
+def test_stop_loss_gate_rejects_old_symbol_even_with_fresh_quote(tmp_path, monkeypatch):
+    import scripts.update_prices as updater
+    from data.store import DataStore
+
+    db = tmp_path / "trading.db"
+    DataStore(str(db))
+    with sqlite3.connect(db) as con:
+        con.execute("INSERT INTO account_meta(account_id,market,status) VALUES ('F15','US','active')")
+        con.execute(
+            """INSERT INTO account_state(account,cash,initial_cash,updated_at,market)
+               VALUES ('F15',5000,10000,'2026-07-10T14:00:00+00:00','US')"""
+        )
+        con.execute(
+            """INSERT INTO positions(account,ticker,shares,avg_cost,total_cost,current_price,market)
+               VALUES ('F15','IAC',54,42.28,2283.12,42.24,'US')"""
+        )
+    monkeypatch.setattr(updater, "_is_market_hours_now", lambda: True)
+    monkeypatch.setattr(updater, "_is_market_open_for", lambda market: True)
+    monkeypatch.setattr(updater, "STOP_LOSS_BY_ACCT", {"F15": 0.01})
+    monkeypatch.setattr(
+        updater, "_now_utc",
+        lambda: datetime(2026, 7, 10, 14, 0, tzinfo=timezone.utc),
+    )
+    with sqlite3.connect(db) as con:
+        con.row_factory = sqlite3.Row
+        assert updater.check_stop_losses(con, {"IAC": 1.0}, db_path=str(db)) == []
+    with sqlite3.connect(db) as con:
+        assert con.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 0
+        detail = con.execute("SELECT detail FROM events WHERE ticker='IAC' AND category='guard'").fetchone()[0]
+        assert "symbol_changed_to_PPLI" in detail
+
+
+def test_history_price_lookup_rejects_stale_intraday_bar():
+    from scripts.ledger_watchdog import _price_at_meta
+
+    bar_ts = datetime.fromisoformat("2026-07-10T14:00:00+00:00").timestamp()
+    history = {"AAPL": [(bar_ts, 100.0, "5m")]}
+    assert _price_at_meta(
+        history, "AAPL", "2026-07-10T14:10:00+00:00",
+        max_age_by_interval={"5m": 600.0},
+    ) == (100.0, "5m")
+    assert _price_at_meta(
+        history, "AAPL", "2026-07-10T14:10:01+00:00",
+        max_age_by_interval={"5m": 600.0},
+    ) is None
 
 
 def test_symbol_migration_is_dry_run_by_default_and_audited_on_apply(tmp_path):

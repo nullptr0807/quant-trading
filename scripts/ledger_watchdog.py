@@ -498,7 +498,12 @@ def _load_price_history(
     return out
 
 
-def _price_at_meta(history: dict[str, list[tuple[float, float, str]]], ticker: str, ts: str) -> tuple[float, str] | None:
+def _price_at_meta(
+    history: dict[str, list[tuple[float, float, str]]],
+    ticker: str,
+    ts: str,
+    max_age_by_interval: dict[str, float] | None = None,
+) -> tuple[float, str] | None:
     rows = history.get(ticker) or []
     if not rows:
         return None
@@ -509,7 +514,11 @@ def _price_at_meta(history: dict[str, list[tuple[float, float, str]]], ticker: s
     idx = bisect_right(keys, dt.timestamp()) - 1
     if idx < 0:
         return None
-    return rows[idx][1], rows[idx][2]
+    price_ts, price, interval = rows[idx]
+    max_age = (max_age_by_interval or {}).get(interval)
+    if max_age is not None and dt.timestamp() - price_ts > max_age:
+        return None
+    return price, interval
 
 
 def _price_at(history: dict[str, list[tuple[float, float, str]]], ticker: str, ts: str) -> float | None:
@@ -589,7 +598,10 @@ def history_curve_audit(
         eq = cash
         missing = []
         for ticker, ppos in pos.items():
-            price_meta = _price_at_meta(price_hist, ticker, str(row["timestamp"]))
+            price_meta = _price_at_meta(
+                price_hist, ticker, str(row["timestamp"]),
+                max_age_by_interval={"5m": 600.0, "15m": 1800.0, "30m": 3600.0},
+            )
             if price_meta is None:
                 missing.append(ticker)
                 continue

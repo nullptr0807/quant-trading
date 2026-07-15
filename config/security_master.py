@@ -27,3 +27,10 @@ def canonical_ticker(ticker: str, market: str, at: str | datetime) -> str:
     if change and _parse_utc(at) >= _parse_utc(change["effective_at"]):
         return str(change["new_ticker"])
     return str(ticker)
+
+
+def ticker_lifecycle_block_reason(ticker: str, market: str, at: str | datetime) -> str | None:
+    change = SYMBOL_CHANGES.get((str(market).upper(), str(ticker).upper()))
+    if change and _parse_utc(at) >= _parse_utc(change["effective_at"]):
+        return f"symbol_changed_to_{change['new_ticker']}"
+    return None

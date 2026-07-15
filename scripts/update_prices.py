@@ -445,6 +445,16 @@ def check_stop_losses(
         acct_market = market_by_acct.get(acct, "US")
         if not _is_market_open_for(acct_market):
             continue
+        from config.security_master import ticker_lifecycle_block_reason
+        symbol_block = ticker_lifecycle_block_reason(ticker, acct_market, now)
+        if symbol_block:
+            if execute:
+                _insert_guard_event(
+                    cur, now_iso=now_iso, market=acct_market, account=acct,
+                    ticker=ticker, reason=symbol_block, detail={"reason": symbol_block},
+                )
+                conn.commit()
+            continue
         if shares <= 0 or avg_cost <= 0:
             continue
         stop_loss = STOP_LOSS_BY_ACCT.get(acct)
