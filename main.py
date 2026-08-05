@@ -369,6 +369,7 @@ class QuantSystem:
         self._factor_miner_mined = FactorMinerGPBackend.load_factors()   # F-family {account_id: [factor_list]}
         self._per_account_mined = {**self._legacy_gp_mined, **self._factor_miner_mined}
         self._gp_mining_done = len(self._per_account_mined) > 0
+        self._publish_gp_runtime_statuses()
 
         # Reports — only US sends Telegram. CN runs silent (per spec).
         if market == "US":
@@ -1557,6 +1558,38 @@ class QuantSystem:
     def _active_mined_count(cls, factors: list[dict] | None) -> int:
         return sum(1 for f in (factors or []) if cls._is_active_mined_factor(f))
 
+    def _publish_gp_runtime_statuses(self) -> None:
+        """Expose factor readiness without abusing lifecycle ``status``.
+
+        A mining failure remains an active experiment but is explicitly
+        non-tradeable in account_meta so the dashboard and health checks do not
+        present a permanent cash account as a running strategy.
+        """
+        setter = getattr(self.store, "set_account_runtime_status", None)
+        if setter is None:
+            return
+        for strategy in self.gp_strategies:
+            factors = list(self._per_account_mined.get(strategy.id) or [])
+            active = self._active_mined_count(factors)
+            marker = next(
+                (f for f in factors if f.get("status") == "mining_failed"), None
+            )
+            if marker:
+                setter(
+                    strategy.id, self.market, "non_tradeable",
+                    str(marker.get("reason") or "NO_ADMISSIBLE_FACTOR"), marker,
+                )
+            elif active:
+                setter(
+                    strategy.id, self.market, "ready", None,
+                    {"active_factors": active},
+                )
+            else:
+                setter(
+                    strategy.id, self.market, "non_tradeable", "empty_config",
+                    {"active_factors": 0},
+                )
+
     @staticmethod
     def _factor_miner_failure_marker(gp_strat, reason: str, retry_after_hours: int = 24) -> dict:
         now = datetime.now(timezone.utc)
@@ -1692,7 +1725,10 @@ class QuantSystem:
                          len(self._legacy_gp_mined), len(self._factor_miner_mined))
             else:
                 log.warning("GP mining produced no valid factors")
+                self._publish_gp_runtime_statuses()
                 return
+
+        self._publish_gp_runtime_statuses()
 
         # Compute GP factors for current data, per account. FactorMiner-style
         # terminals include nested 20-day windows, so use an application window
@@ -2090,14 +2126,24 @@ class QuantSystem:
                 conn.close()
                 return []
             placeholders = ",".join("?" * len(uni_list))
+            min_coverage = max(1, int(len(uni_list) * 0.80 + 0.999999))
             row = conn.execute(
-                f"SELECT MAX(date) FROM factor_values "
-                f"WHERE factor_name=? AND ticker IN ({placeholders})",
-                (factor_name, *uni_list),
+                f"SELECT date,COUNT(DISTINCT ticker) AS covered FROM factor_values "
+                f"WHERE factor_group='qlib' AND factor_name=? AND value IS NOT NULL "
+                f"AND ticker IN ({placeholders}) GROUP BY date "
+                f"HAVING COUNT(DISTINCT ticker)>=? ORDER BY date DESC LIMIT 1",
+                (factor_name, *uni_list, min_coverage),
             ).fetchone()
             latest = row[0] if row else None
             if not latest:
                 conn.close()
+                self._emit_persisted_signal_gate(
+                    account_id=q_id, factor_group="qlib", reason="coverage",
+                    factor_date=None, latest_price_date=None,
+                    covered_tickers=0, universe_size=len(uni_list), coverage=0.0,
+                    required_coverage=0.80, lag_days=None,
+                    max_lag_days=3 if self.market == "CN" else 2,
+                )
                 return []
 
             # Safety gate: never trade Q accounts on stale ML scores.  The date

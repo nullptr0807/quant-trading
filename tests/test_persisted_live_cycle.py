@@ -303,7 +303,25 @@ def test_fast_trade_phase_reuses_prepared_gp_and_qlib_signals(tmp_path, monkeypa
     assert system._trade_qlib_account(q, {"AAA": 10.0, "BBB": 10.0}) is True
 
 
-def test_qlib_coverage_gate_rejects_sparse_latest_scores(tmp_path, monkeypatch):
+def test_qlib_coverage_gate_uses_latest_complete_date_not_sparse_tail(tmp_path, monkeypatch):
+    system = _bare_system(tmp_path)
+    _insert_prices_and_factors(
+        system,
+        rows=[
+            (ticker, "2026-07-08", "qlib_Q01_score", float(i), "qlib")
+            for i, ticker in enumerate(system.universe)
+        ] + [("AAA", "2026-07-09", "qlib_Q01_score", 99.0, "qlib")],
+    )
+    emitted = []
+    monkeypatch.setattr("main.emit_event", lambda *args, **kwargs: emitted.append((args, kwargs)))
+
+    scored = system._load_qlib_scores("Q01")
+    assert len(scored) == len(system.universe)
+    assert scored[0][0] == "DDD"
+    assert emitted == []
+
+
+def test_qlib_coverage_gate_rejects_when_no_complete_date_exists(tmp_path, monkeypatch):
     system = _bare_system(tmp_path)
     _insert_prices_and_factors(
         system,

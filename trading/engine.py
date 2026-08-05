@@ -17,12 +17,18 @@ class TradingEngine:
         self,
         max_position_pct: float = 0.30,   # max 30% equity in one position
         stop_loss_pct: float = -0.03,      # -3% stop loss trigger
+        max_gross_exposure_pct: float = 0.98,
+        min_cash_reserve_pct: float = 0.02,
         costs: MoomooAUCosts | None = None,
         trade_callback=None,              # called with (account, trade_dict) after each trade
         clock=None,
     ):
         self.max_position_pct = max_position_pct
         self.stop_loss_pct = stop_loss_pct
+        self.max_gross_exposure_pct = max(0.0, min(1.0, max_gross_exposure_pct))
+        self.min_cash_reserve_pct = max(0.0, min(1.0, min_cash_reserve_pct))
+        if self.max_gross_exposure_pct + self.min_cash_reserve_pct > 1.000001:
+            raise ValueError("gross exposure and cash reserve limits are inconsistent")
         self.costs = costs or MoomooAUCosts()
         self.accounts: dict[str, VirtualAccount] = {}
         self.trade_callback = trade_callback
@@ -137,19 +143,30 @@ class TradingEngine:
             if equity <= 0:
                 return None
             exec_price = self.costs.slippage(price, "buy")
-            proposed_value = shares * exec_price
-            # Include existing position value
             pos = acct.get_positions().get(ticker, 0)
             existing_value = pos * current_prices.get(ticker, exec_price)
-            total_position = existing_value + proposed_value
-            if total_position / equity > self.max_position_pct:
-                # Reduce shares to fit limit
-                max_value = self.max_position_pct * equity - existing_value
-                if max_value <= 0:
-                    return None
-                shares = self._round_buy_shares(max_value / exec_price)
-                if shares <= 0:
-                    return None
+            gross_existing = sum(
+                p.shares * current_prices.get(symbol, p.avg_cost)
+                for symbol, p in acct._positions.items() if p.shares > 0
+            )
+            position_budget = self.max_position_pct * equity - existing_value
+            gross_budget = self.max_gross_exposure_pct * equity - gross_existing
+            cash_budget = acct.cash - self.min_cash_reserve_pct * equity
+            max_new_value = min(position_budget, gross_budget, cash_budget)
+            if max_new_value <= 0:
+                return None
+            shares = min(shares, self._round_buy_shares(max_new_value / exec_price))
+            lot = self._lot_size()
+            while shares > 0:
+                fees = self.costs.calculate("buy", shares, price)
+                total_cost = shares * fees.get("exec_price", exec_price) + fees.get(
+                    "total_fees", fees.get("total", 0.0)
+                )
+                if total_cost <= cash_budget + 1e-9:
+                    break
+                shares = self._round_buy_shares(shares - lot)
+            if shares <= 0:
+                return None
             result = self.execute_trade(account_name, ticker, "buy", shares, price)
 
         elif side == "sell":
