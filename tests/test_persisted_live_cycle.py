@@ -314,6 +314,10 @@ def test_qlib_coverage_gate_uses_latest_complete_date_not_sparse_tail(tmp_path, 
     )
     emitted = []
     monkeypatch.setattr("main.emit_event", lambda *args, **kwargs: emitted.append((args, kwargs)))
+    monkeypatch.setattr(
+        "factors.qlib_checkpoint.checkpoint_ready_for_publication",
+        lambda *args, **kwargs: (True, "ok"),
+    )
 
     scored = system._load_qlib_scores("Q01")
     assert len(scored) == len(system.universe)

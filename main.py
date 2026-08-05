@@ -370,6 +370,7 @@ class QuantSystem:
         self._per_account_mined = {**self._legacy_gp_mined, **self._factor_miner_mined}
         self._gp_mining_done = len(self._per_account_mined) > 0
         self._publish_gp_runtime_statuses()
+        self._publish_qlib_runtime_statuses()
 
         # Reports — only US sends Telegram. CN runs silent (per spec).
         if market == "US":
@@ -1590,6 +1591,62 @@ class QuantSystem:
                     {"active_factors": 0},
                 )
 
+    def _publish_qlib_runtime_statuses(self) -> None:
+        """Mark Q accounts non-tradeable until scores and PIT checkpoint agree."""
+        import sqlite3
+        from factors.qlib_checkpoint import checkpoint_ready_for_publication
+        setter = getattr(self.store, "set_account_runtime_status", None)
+        universe = list(self.universe)
+        if setter is None or not universe:
+            return
+        marks = ','.join('?' for _ in universe)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            price_row = conn.execute(
+                f"SELECT MAX(substr(datetime,1,10)) FROM prices "
+                f"WHERE interval='1d' AND ticker IN ({marks})", universe,
+            ).fetchone()
+            latest_price = price_row[0] if price_row else None
+            for strategy in self.qlib_strategies:
+                prefix = ACCOUNT_PREFIX.get(self.market, '')
+                base = strategy.id[len(prefix):] if prefix and strategy.id.startswith(prefix) else strategy.id
+                required = max(1, int(len(universe) * .80 + .999999))
+                row = conn.execute(
+                    f"SELECT date,COUNT(DISTINCT ticker) FROM factor_values "
+                    f"WHERE factor_group='qlib' AND factor_name=? AND value IS NOT NULL "
+                    f"AND ticker IN ({marks}) GROUP BY date "
+                    f"HAVING COUNT(DISTINCT ticker)>=? ORDER BY date DESC LIMIT 1",
+                    (f'qlib_{base}_score', *universe, required),
+                ).fetchone()
+                reason = None
+                detail = {'latest_price_date': latest_price}
+                if not row:
+                    reason = 'qlib_score_coverage_incomplete'
+                else:
+                    score_date = str(row[0])[:10]
+                    detail.update({'score_date': score_date, 'covered_tickers': int(row[1])})
+                    if latest_price:
+                        lag = (
+                            datetime.fromisoformat(str(latest_price)[:10]).date()
+                            - datetime.fromisoformat(score_date).date()
+                        ).days
+                        detail['lag_days'] = lag
+                        if lag > (3 if self.market == 'CN' else 2):
+                            reason = 'qlib_scores_stale'
+                    if reason is None:
+                        ready, checkpoint_reason = checkpoint_ready_for_publication(
+                            base, score_date, self.market, len(universe)
+                        )
+                        if not ready:
+                            reason = checkpoint_reason
+                setter(
+                    strategy.id, self.market,
+                    'ready' if reason is None else 'non_tradeable',
+                    reason, detail,
+                )
+        finally:
+            conn.close()
+
     @staticmethod
     def _factor_miner_failure_marker(gp_strat, reason: str, retry_after_hours: int = 24) -> dict:
         now = datetime.now(timezone.utc)
@@ -2188,6 +2245,24 @@ class QuantSystem:
                         market=self.market,
                     )
                     return []
+
+            # A score publication is not live-ready until its exact-date model
+            # artifact, self-test and point-in-time universe proof are present.
+            from factors.qlib_checkpoint import checkpoint_ready_for_publication
+            checkpoint_ready, checkpoint_reason = checkpoint_ready_for_publication(
+                base_id, str(latest)[:10], self.market, len(uni_list)
+            )
+            if not checkpoint_ready:
+                conn.close()
+                self._emit_persisted_signal_gate(
+                    account_id=q_id, factor_group="qlib",
+                    reason=checkpoint_reason, factor_date=latest,
+                    latest_price_date=latest_price_date,
+                    covered_tickers=int(row[1]), universe_size=len(uni_list),
+                    coverage=float(row[1]) / len(uni_list), required_coverage=0.80,
+                    lag_days=None, max_lag_days=3 if self.market == "CN" else 2,
+                )
+                return []
 
             rows = conn.execute(
                 f"SELECT ticker, value FROM factor_values "

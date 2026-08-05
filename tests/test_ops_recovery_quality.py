@@ -129,6 +129,10 @@ def test_operational_wrappers_have_private_umask_and_backup_restore_gate():
         assert "umask 077" in text
     assert "run_module_force_exit.py" in (root / "scripts/refresh_factors_daily.sh").read_text()
     assert "run_module_force_exit.py" in (root / "scripts/backfill_prices_daily.sh").read_text()
+    qlib_wrapper = (root / "scripts/qlib_retrain_daily.sh").read_text()
+    assert "LOCK_TIMEOUT" in qlib_wrapper
+    assert "QLIB_TOTAL_TIMEOUT_SECONDS" in qlib_wrapper
+    assert "verify_qlib_scores" in qlib_wrapper
     backup = (root / "scripts/backup_trading_db.py").read_text()
     assert "source.backup" not in backup  # connection object is named src
     assert "src.backup(dst" in backup

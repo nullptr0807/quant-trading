@@ -275,6 +275,28 @@ def load_checkpoint(model_id: str, date: str, market: str = "US",
     return payload
 
 
+def checkpoint_ready_for_publication(model_id: str, date: str, market: str,
+                                     expected_universe_count: int) -> tuple[bool, str]:
+    """Cheap live gate: require payload, self-test sidecar and exact PIT proof."""
+    pkl_path, json_path = _checkpoint_paths(market, model_id, date)
+    if not pkl_path.exists() or pkl_path.stat().st_size <= 0:
+        return False, "checkpoint_payload_missing"
+    if not json_path.exists():
+        return False, "checkpoint_sidecar_missing"
+    try:
+        meta = json.loads(json_path.read_text())
+    except Exception:
+        return False, "checkpoint_sidecar_invalid"
+    extra = meta.get("extra") or {}
+    if extra.get("point_in_time_complete") is not True:
+        return False, "checkpoint_pit_incomplete"
+    if int(extra.get("universe_count") or 0) != int(expected_universe_count):
+        return False, "checkpoint_universe_count_mismatch"
+    if (meta.get("self_test") or {}).get("expected_score") is None:
+        return False, "checkpoint_self_test_missing"
+    return True, "ok"
+
+
 def _checkpoint_meta(model_id: str, date: str, market: str) -> dict:
     _, json_path = _checkpoint_paths(market, model_id, date)
     if not json_path.exists():

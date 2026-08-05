@@ -39,7 +39,21 @@ if [ "${QUANT_QLIB_ALREADY_LOCKED:-0}" != "1" ]; then
     if [ -n "$MODELS" ]; then
         lock_args+=(--models "$MODELS")
     fi
-    exec /usr/bin/flock -n "$LOCK" "${lock_args[@]}"
+    set +e
+    /usr/bin/flock -w "${QLIB_LOCK_WAIT_SECONDS:-5}" "$LOCK" "${lock_args[@]}"
+    rc=$?
+    set -e
+    if [ "$rc" -eq 1 ]; then
+        now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "===== Qlib retrain [$MARKET] LOCK_TIMEOUT $now =====" >> "$LOG_DIR/qlib_retrain.log"
+        python scripts/record_operational_health.py \
+            --component qlib_retrain --market "$MARKET" --status failed \
+            --scheduled-at "$now" --started-at "$now" --stopped-at "$now" \
+            --exit-code 75 --duration 0 --reason lock_timeout \
+            >> "$LOG_DIR/qlib_retrain.log" 2>&1 || true
+        exit 75
+    fi
+    exit "$rc"
 fi
 
 run_args=(--market "$MARKET" --model-timeout-seconds "${QLIB_MODEL_TIMEOUT_SECONDS:-10800}")
@@ -53,7 +67,8 @@ if [ -n "$MODELS" ]; then
 fi
 
 echo "===== Qlib retrain [$MARKET] start $(date -u +%Y-%m-%dT%H:%M:%SZ) args=${run_args[*]} =====" >> "$LOG_DIR/qlib_retrain.log"
-if python -m scripts.qlib_retrain "${run_args[@]}" >> "$LOG_DIR/qlib_retrain.log" 2>&1 \
+if /usr/bin/timeout --kill-after=60s "${QLIB_TOTAL_TIMEOUT_SECONDS:-14400}s" \
+      python -m scripts.qlib_retrain "${run_args[@]}" >> "$LOG_DIR/qlib_retrain.log" 2>&1 \
    && python -m scripts.verify_qlib_scores "${verify_args[@]}" >> "$LOG_DIR/qlib_retrain.log" 2>&1; then
     echo "===== Qlib retrain [$MARKET] OK    $(date -u +%Y-%m-%dT%H:%M:%SZ) =====" >> "$LOG_DIR/qlib_retrain.log"
 else

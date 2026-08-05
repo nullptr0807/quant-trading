@@ -50,6 +50,10 @@ def test_qlib_scores_load_when_fresh(tmp_path, monkeypatch):
     _make_db(db, score_date="2026-07-07", price_date="2026-07-07")
     emitted = []
     monkeypatch.setattr("main.emit_event", lambda *a, **k: emitted.append((a, k)))
+    monkeypatch.setattr(
+        "factors.qlib_checkpoint.checkpoint_ready_for_publication",
+        lambda *args, **kwargs: (True, "ok"),
+    )
 
     system = object.__new__(QuantSystem)
     system.market = "US"
@@ -58,6 +62,21 @@ def test_qlib_scores_load_when_fresh(tmp_path, monkeypatch):
 
     assert system._load_qlib_scores("Q01") == [("AAPL", 1.23)]
     assert emitted == []
+
+
+def test_qlib_scores_require_checkpoint_pit_publication(tmp_path, monkeypatch):
+    from main import QuantSystem
+    db=tmp_path/'checkpoint.db'
+    _make_db(db, score_date='2026-07-07', price_date='2026-07-07')
+    emitted=[]
+    monkeypatch.setattr('main.emit_event',lambda *a,**k: emitted.append((a,k)))
+    monkeypatch.setattr(
+        'factors.qlib_checkpoint.checkpoint_ready_for_publication',
+        lambda *args,**kwargs:(False,'checkpoint_pit_incomplete'),
+    )
+    system=object.__new__(QuantSystem);system.market='US';system.db_path=str(db);system.universe=['AAPL']
+    assert system._load_qlib_scores('Q01')==[]
+    assert emitted[0][1]['detail']['reason']=='checkpoint_pit_incomplete'
 
 
 def test_qlib_scores_stale_gate_skips_and_emits_event(tmp_path, monkeypatch):
