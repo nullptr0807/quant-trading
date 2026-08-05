@@ -3,9 +3,11 @@
 from __future__ import annotations
 import argparse
 import json
+import os
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from config.settings import UNIVERSES
@@ -90,6 +92,30 @@ def verify(db_path: str, market: str, min_coverage: float = 0.80, model_ids=None
         con.close()
 
 
+def write_publication_marker(result: dict) -> Path:
+    from factors.qlib_checkpoint import CHECKPOINT_ROOT
+    market=result['market'];date=result['date']
+    marker_path=CHECKPOINT_ROOT/market/f'publication-{date}.json'
+    marker_path.parent.mkdir(parents=True,exist_ok=True)
+    existing={}
+    if marker_path.exists():
+        try: existing=json.loads(marker_path.read_text())
+        except Exception: existing={}
+    records=dict(existing.get('models') or {})
+    for model,status in (result.get('checkpoints') or {}).items():
+        if status!='verified': continue
+        pkl=CHECKPOINT_ROOT/market/model/f'{date}.pkl'
+        sidecar=CHECKPOINT_ROOT/market/model/f'{date}.json'
+        ps,js=pkl.stat(),sidecar.stat()
+        records[model]={
+            'pkl_size':ps.st_size,'pkl_mtime_ns':ps.st_mtime_ns,
+            'json_size':js.st_size,'json_mtime_ns':js.st_mtime_ns,
+        }
+    doc={'market':market,'date':date,'verified_at':datetime.now(timezone.utc).isoformat(),'models':records}
+    tmp=marker_path.with_suffix('.tmp');tmp.write_text(json.dumps(doc,indent=2));os.chmod(tmp,0o600);tmp.replace(marker_path);os.chmod(marker_path,0o600)
+    return marker_path
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument('--db', default='data/trading.db')
@@ -99,7 +125,8 @@ def main() -> int:
     a = p.parse_args()
     models = [x.strip() for x in a.models.split(',') if x.strip()] or None
     result = verify(a.db, a.market, a.min_coverage, models)
-    print(f"QLIB_PUBLISH_OK market={result['market']} date={result['date']} coverage={result['coverage']}")
+    marker = write_publication_marker(result)
+    print(f"QLIB_PUBLISH_OK market={result['market']} date={result['date']} coverage={result['coverage']} marker={marker}")
     return 0
 
 if __name__ == '__main__':

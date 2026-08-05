@@ -55,3 +55,23 @@ def test_verify_qlib_rejects_checkpoint_without_pit_proof(tmp_path, monkeypatch)
     (folder/'2026-08-04.json').write_text('{"extra":{"point_in_time_complete":false}}')
     with pytest.raises(RuntimeError,match='checkpoint/PIT verification failed'):
         verify.verify(str(db),'US',min_coverage=1.0,model_ids=['Q01'])
+
+
+def test_publication_marker_binds_live_gate_to_verified_file_state(tmp_path, monkeypatch):
+    import factors.qlib_checkpoint as checkpoint
+    import scripts.verify_qlib_scores as verify
+    root=tmp_path/'checkpoints'
+    monkeypatch.setattr(checkpoint,'CHECKPOINT_ROOT',root)
+    folder=root/'US'/'Q01';folder.mkdir(parents=True)
+    pkl=folder/'2026-08-04.pkl';pkl.write_bytes(b'payload')
+    sidecar=folder/'2026-08-04.json';sidecar.write_text(
+        '{"self_test":{"expected_score":1},"extra":{"point_in_time_complete":true,"universe_count":2}}'
+    )
+    ready,reason=checkpoint.checkpoint_ready_for_publication('Q01','2026-08-04','US',2)
+    assert ready is False and reason=='checkpoint_publication_marker_missing'
+    verify.write_publication_marker({
+        'market':'US','date':'2026-08-04','checkpoints':{'Q01':'verified'}
+    })
+    assert checkpoint.checkpoint_ready_for_publication('Q01','2026-08-04','US',2)==(True,'ok')
+    pkl.write_bytes(b'changed')
+    assert checkpoint.checkpoint_ready_for_publication('Q01','2026-08-04','US',2)[0] is False

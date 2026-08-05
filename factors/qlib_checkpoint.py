@@ -81,6 +81,10 @@ class FrozenFeatureDataset:
         return self.features.copy()
 
 
+def _publication_marker_path(market: str, date: str) -> Path:
+    return CHECKPOINT_ROOT / market.upper() / f"publication-{str(date)[:10]}.json"
+
+
 def _checkpoint_dir(market: str, model_id: str) -> Path:
     return CHECKPOINT_ROOT / market.upper() / model_id
 
@@ -306,6 +310,22 @@ def checkpoint_ready_for_publication(model_id: str, date: str, market: str,
         return False, "checkpoint_universe_count_mismatch"
     if (meta.get("self_test") or {}).get("expected_score") is None:
         return False, "checkpoint_self_test_missing"
+    marker_path = _publication_marker_path(market, date)
+    try:
+        marker = json.loads(marker_path.read_text())
+        verified = (marker.get("models") or {})[model_id]
+        pkl_stat = pkl_path.stat()
+        json_stat = json_path.stat()
+        if int(verified.get("pkl_size", -1)) != pkl_stat.st_size:
+            return False, "checkpoint_changed_after_verification"
+        if int(verified.get("pkl_mtime_ns", -1)) != pkl_stat.st_mtime_ns:
+            return False, "checkpoint_changed_after_verification"
+        if int(verified.get("json_size", -1)) != json_stat.st_size:
+            return False, "checkpoint_changed_after_verification"
+        if int(verified.get("json_mtime_ns", -1)) != json_stat.st_mtime_ns:
+            return False, "checkpoint_changed_after_verification"
+    except Exception:
+        return False, "checkpoint_publication_marker_missing"
     return True, "ok"
 
 
