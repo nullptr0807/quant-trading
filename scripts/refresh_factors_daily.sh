@@ -13,4 +13,4 @@ mkdir -p "$(dirname "$LOG")"
 # A heartbeat marks scheduler invocation even when the market lock cannot be acquired.
 echo "FACTOR_HEARTBEAT market=$MARKET scheduled=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$LOG"
 exec bash "$ROOT/scripts/run_scheduled_job.sh" factor_refresh "$MARKET" "/tmp/quant_factor_refresh_${MARKET}.lock" 30 "$TIMEOUT" "$LOG" -- \
-  "$PYTHON" -m scripts.refresh_factors --market "$MARKET" "$@"
+  "$PYTHON" "$ROOT/scripts/run_module_force_exit.py" scripts.refresh_factors --market "$MARKET" "$@"

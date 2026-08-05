@@ -127,9 +127,28 @@ def test_operational_wrappers_have_private_umask_and_backup_restore_gate():
     for name in ("run_scheduled_job.sh", "refresh_factors_daily.sh", "backup_trading_db_daily.sh", "rotate_logs_daily.sh"):
         text = (root / "scripts" / name).read_text()
         assert "umask 077" in text
+    assert "run_module_force_exit.py" in (root / "scripts/refresh_factors_daily.sh").read_text()
+    assert "run_module_force_exit.py" in (root / "scripts/backfill_prices_daily.sh").read_text()
     backup = (root / "scripts/backup_trading_db.py").read_text()
     assert "source.backup" not in backup  # connection object is named src
     assert "src.backup(dst" in backup
     assert "zstd\", \"-t" in backup
     assert "_quick_check(restored)" in backup
+
+
+def test_force_exit_runner_does_not_wait_for_orphan_provider_thread(tmp_path):
+    module = tmp_path / "hanging_provider.py"
+    module.write_text(
+        "import threading,time\n"
+        "threading.Thread(target=lambda: time.sleep(30), daemon=False).start()\n"
+        "print('module_done', flush=True)\n"
+    )
+    root = Path(__file__).parents[1]
+    env = dict(__import__('os').environ, PYTHONPATH=str(tmp_path))
+    proc = subprocess.run(
+        [__import__('sys').executable, str(root / 'scripts/run_module_force_exit.py'), 'hanging_provider'],
+        capture_output=True, text=True, timeout=3, env=env,
+    )
+    assert proc.returncode == 0
+    assert 'module_done' in proc.stdout
 

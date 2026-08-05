@@ -24,7 +24,7 @@ fi
 start=$(date -u +%Y-%m-%dT%H:%M:%SZ); t0=$(date +%s)
 echo "===== Backfill [$MARKET/$INTERVAL/$PRICE_MODE/$SCOPE] start $start days=$DAYS =====" >>"$LOG"
 set +e
-/usr/bin/timeout --kill-after=30s "${TIMEOUT}s" "$PYTHON" -m scripts.backfill_prices --market "$MARKET" --interval "$INTERVAL" --days "$DAYS" --price-mode "$PRICE_MODE" --scope "$SCOPE" >>"$LOG" 2>&1
+/usr/bin/timeout --kill-after=30s "${TIMEOUT}s" "$PYTHON" "$ROOT/scripts/run_module_force_exit.py" scripts.backfill_prices --market "$MARKET" --interval "$INTERVAL" --days "$DAYS" --price-mode "$PRICE_MODE" --scope "$SCOPE" >>"$LOG" 2>&1
 rc=$?
 set -e
 end=$(date -u +%Y-%m-%dT%H:%M:%SZ); duration=$(($(date +%s)-t0))
