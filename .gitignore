@@ -40,6 +40,7 @@ data/*.db.bak*
 data/*.db-wal
 data/*.db-shm
 data/.price_write.lock
+data/health_alert_state.json
 data/backups/
 data/qlib_checkpoints/
 data/__pycache__/

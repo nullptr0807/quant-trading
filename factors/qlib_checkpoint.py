@@ -69,6 +69,18 @@ class CheckpointCoverageError(RuntimeError):
     """Checkpoint series is incomplete or lacks point-in-time semantics."""
 
 
+class FrozenFeatureDataset:
+    """Minimal Qlib Dataset interface backed by already-processed PIT features."""
+    def __init__(self, features):
+        self.features = features
+        self.segments = {"test": "test"}
+
+    def prepare(self, segments="test", col_set=None, data_key=None, **kwargs):
+        if isinstance(segments, (list, tuple)):
+            return [self.features.copy() for _ in segments]
+        return self.features.copy()
+
+
 def _checkpoint_dir(market: str, model_id: str) -> Path:
     return CHECKPOINT_ROOT / market.upper() / model_id
 
@@ -149,23 +161,16 @@ def save_checkpoint(spec, model, dataset, pred, market: str = "US",
     pkl_path, json_path = _checkpoint_paths(market, spec.id, date)
     pkl_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # ── Self-test fingerprint ────────────────────────────────────────────
-    # Take the first row of pred as ground truth. Future loaders can
-    # re-predict on the same bundle and verify the score within tolerance.
+    # ── Frozen processed features + self-test fingerprint ────────────────
     self_test = None
+    frozen_features = None
     try:
-        if pred is not None and len(pred) > 0:
+        frozen_features = dataset.prepare("test", col_set=["feature"])
+        if pred is not None and len(pred) > 0 and frozen_features is not None:
             first_idx = pred.index[0]
             first_score = float(pred.iloc[0, 0])
-            # Extract the test feature row that produced first_score so a
-            # standalone re-predict is deterministic.
-            try:
-                test_df = dataset.prepare("test", col_set=["feature"])
-                # test_df may be a DataFrame with MultiIndex matching pred index
-                feat_row = test_df.loc[first_idx]
-                feat_hash = _hash_dataframe(feat_row.to_frame().T)
-            except Exception:
-                feat_hash = "unavailable"
+            feat_row = frozen_features.loc[first_idx]
+            feat_hash = _hash_dataframe(feat_row.to_frame().T)
             self_test = {
                 "first_index": [str(x) for x in (first_idx if isinstance(first_idx, tuple) else (first_idx,))],
                 "feature_hash": feat_hash,
@@ -173,17 +178,19 @@ def save_checkpoint(spec, model, dataset, pred, market: str = "US",
                 "tolerance": DRIFT_TOLERANCE,
             }
     except Exception as e:
-        log.warning("[%s] self-test fingerprint failed: %s", spec.id, e)
+        log.warning("[%s] frozen feature/self-test capture failed: %s", spec.id, e)
 
-    # ── Bundle payload ───────────────────────────────────────────────────
-    # joblib dumps the entire {handler, model, dataset.segments} so a future
-    # process can do `pred = bundle['model'].predict(bundle['dataset'])`
-    # without re-fitting anything.
+    if frozen_features is None or self_test is None:
+        return {"error": "frozen feature/self-test capture failed", "saved": False}
+
+    # Store fitted/processed PIT feature values rather than a live DatasetH
+    # handler. Qlib handlers lose transient `_infer` frames when pickled, while
+    # the processed frame is immutable and replayable across processes.
     payload = {
         "spec_id": spec.id,
         "model_class": spec.model_class,
         "model": model,
-        "dataset": dataset,            # carries fitted handler + processors
+        "frozen_test_features": frozen_features,
         "feature_set": getattr(spec, "feature_set", "Alpha158"),
     }
     try:
@@ -252,8 +259,13 @@ def load_checkpoint(model_id: str, date: str, market: str = "US",
                     f"checkpoint {market}/{model_id}/{date} has no score self-test"
                 )
             if st and st.get("expected_score") is not None:
-                # Re-predict on the bundled dataset and grab first row
-                pred = payload["model"].predict(payload["dataset"])
+                # Re-predict from frozen, already-processed PIT features. Legacy
+                # DatasetH payloads are unsupported because their transient
+                # `_infer` frame is not reliably pickleable.
+                features = payload.get("frozen_test_features")
+                if features is None:
+                    raise CheckpointCoverageError("checkpoint has no frozen test features")
+                pred = payload["model"].predict(FrozenFeatureDataset(features))
                 if hasattr(pred, "to_frame"):
                     pred = pred.to_frame("score")
                 actual = float(pred.iloc[0, 0])
@@ -320,8 +332,8 @@ def _validate_pit_semantics(meta: dict, payload: dict, market: str) -> None:
         raise CheckpointCoverageError(
             "checkpoint does not prove processors were fitted by its as-of date"
         )
-    if "dataset" not in payload or "model" not in payload:
-        raise CheckpointCoverageError("checkpoint lacks frozen model/processor dataset")
+    if "frozen_test_features" not in payload or "model" not in payload:
+        raise CheckpointCoverageError("checkpoint lacks frozen model/processed PIT features")
     # A frozen model/processor is necessary but not sufficient: the checkpoint
     # must also prove that its instrument universe was point-in-time. Current
     # Russell membership cannot be presented as capital-allocation-valid for
@@ -387,7 +399,10 @@ def predict_checkpoint_scores(
     payload = load_checkpoint(model_id, as_of, market=market, verify=True)
     meta = _checkpoint_meta(model_id, as_of, market)
     _validate_pit_semantics(meta, payload, market)
-    pred = payload["model"].predict(payload["dataset"])
+    features = payload.get("frozen_test_features")
+    if features is None:
+        raise CheckpointCoverageError("checkpoint has no frozen test features")
+    pred = payload["model"].predict(FrozenFeatureDataset(features))
     if hasattr(pred, "to_frame"):
         pred = pred.to_frame("score")
     if not hasattr(pred, "index"):

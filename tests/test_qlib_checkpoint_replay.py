@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import joblib
 import pandas as pd
@@ -10,12 +11,14 @@ import pytest
 
 class FakeModel:
     def predict(self, dataset):
-        return dataset.prediction.copy()
+        return dataset.prepare().iloc[:, 0].copy()
 
 
-class FakeDataset:
-    def __init__(self, prediction):
-        self.prediction = prediction
+class FakeTrainingDataset:
+    def __init__(self, features):
+        self.features = features
+    def prepare(self, segment, col_set=None):
+        return self.features.copy()
 
 
 def _write_checkpoint(root: Path, market: str, model_id: str, day: str, *, score=0.25, complete=True):
@@ -25,8 +28,9 @@ def _write_checkpoint(root: Path, market: str, model_id: str, day: str, *, score
         [(pd.Timestamp(day), "AAA")], names=["datetime", "instrument"]
     )
     pred = pd.Series([score], index=idx)
+    frozen = pred.to_frame('feature_0')
     joblib.dump(
-        {"spec_id": model_id, "model": FakeModel(), "dataset": FakeDataset(pred), "processors_fitted": True},
+        {"spec_id": model_id, "model": FakeModel(), "frozen_test_features": frozen, "processors_fitted": True},
         base / f"{day}.pkl",
     )
     meta = {
@@ -39,6 +43,26 @@ def _write_checkpoint(root: Path, market: str, model_id: str, day: str, *, score
         "extra": {"point_in_time_complete": complete},
     }
     (base / f"{day}.json").write_text(json.dumps(meta))
+
+
+def test_save_checkpoint_freezes_processed_features_for_cross_process_replay(tmp_path, monkeypatch):
+    import factors.qlib_checkpoint as qc
+    monkeypatch.setattr(qc, 'CHECKPOINT_ROOT', tmp_path)
+    day='2026-07-09'
+    idx=pd.MultiIndex.from_tuples([(pd.Timestamp(day),'AAA')],names=['datetime','instrument'])
+    features=pd.DataFrame({'feature_0':[.75]},index=idx)
+    pred=pd.DataFrame({'score':[.75]},index=idx)
+    spec=SimpleNamespace(id='Q01',name='fake',model_class='Fake',feature_set='Alpha158')
+    meta=qc.save_checkpoint(
+        spec,FakeModel(),FakeTrainingDataset(features),pred,
+        market='US',date=day,train_window={'train':['2025-01-01','2026-07-01']},
+        extra_meta={'point_in_time_complete':True,'universe_count':1},
+    )
+    assert meta.get('saved') is not False
+    payload=qc.load_checkpoint('Q01',day,market='US',verify=True)
+    assert 'frozen_test_features' in payload and 'dataset' not in payload
+    scores,_=qc.predict_checkpoint_scores('Q01',as_of=day,execution_date='2026-07-10',market='US')
+    assert scores=={'AAA':.75}
 
 
 def test_daily_checkpoint_replay_scores_exact_asof_without_future_checkpoint(tmp_path, monkeypatch):

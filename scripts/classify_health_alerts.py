@@ -23,7 +23,7 @@ def process(result: dict, state_path: Path) -> dict:
         if kind=='continuing':
             next_counts[key]=int(counts.get(key,1))+1
             if next_counts[key] in {3,10,30}: notify.append(dict(item,occurrences=next_counts[key]))
-        elif kind=='new':
+        elif kind in {'new', 'escalated'}:
             next_counts[key]=1;notify.append(dict(item,occurrences=1))
         elif kind=='recovered':
             notify.append(item)

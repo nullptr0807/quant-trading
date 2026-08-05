@@ -615,11 +615,21 @@ def classify_issue_transitions(
     state = {key(issue): str(issue.get("severity", "warning")) for issue in current}
     transitions: list[dict] = []
     by_key = {key(issue): issue for issue in current}
+    severity_rank = {"info": 0, "warning": 1, "critical": 2}
     for issue_key, issue in by_key.items():
+        current_severity = str(issue.get("severity", "warning"))
+        previous_severity = previous.get(issue_key)
+        if previous_severity is None:
+            transition = "new"
+        elif severity_rank.get(current_severity, 1) > severity_rank.get(str(previous_severity), 1):
+            transition = "escalated"
+        else:
+            transition = "continuing"
         transitions.append({
             **issue,
             "issue_key": issue_key,
-            "transition": "continuing" if issue_key in previous else "new",
+            "previous_severity": previous_severity,
+            "transition": transition,
         })
     for issue_key, severity in previous.items():
         if issue_key not in state:
