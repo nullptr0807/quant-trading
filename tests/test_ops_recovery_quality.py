@@ -151,4 +151,3 @@ def test_force_exit_runner_does_not_wait_for_orphan_provider_thread(tmp_path):
     )
     assert proc.returncode == 0
     assert 'module_done' in proc.stdout
-

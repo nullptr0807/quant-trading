@@ -7,6 +7,29 @@ import pandas as pd
 import pytest
 
 
+def test_cn_daily_cache_read_includes_latest_midnight_bar(tmp_path):
+    from data.cn_fetcher import CNDataFetcher
+    from data.store import DataStore
+    from datetime import datetime, timedelta, timezone
+
+    store = DataStore(str(tmp_path / 'cn.db'))
+    today = datetime.now(timezone.utc).date()
+    rows = pd.DataFrame([
+        {
+            'ticker': '000001.SZ', 'datetime': (today - timedelta(days=i)).isoformat(),
+            'open': 10, 'high': 11, 'low': 9, 'close': 10, 'volume': 100,
+        }
+        for i in range(3)
+    ])
+    store.save_prices_bulk(rows, interval='1d')
+    fetcher = object.__new__(CNDataFetcher)
+    fetcher.store = store
+
+    result = fetcher.get_historical(['000001.SZ'], days=5, interval='1d')
+
+    assert today.isoformat() in set(pd.to_datetime(result['datetime']).dt.date.astype(str))
+
+
 @pytest.mark.parametrize(
     ("now", "expected"),
     [

@@ -38,6 +38,29 @@ QLIB_CN_DIR = os.path.expanduser("~/.qlib/qlib_data/cn_data")
 log = logging.getLogger("qlib_signal")
 
 
+def _checkpoint_universe_meta(market: str, prediction_date: str) -> dict:
+    """Prove the checkpoint's configured universe was snapshotted as-of T."""
+    from config.settings import UNIVERSES
+    expected = set(UNIVERSES[market.upper()])
+    con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    try:
+        rows = con.execute(
+            "SELECT ticker,universe_hash FROM universe_membership "
+            "WHERE market=? AND date=?",
+            (market.upper(), prediction_date),
+        ).fetchall()
+    finally:
+        con.close()
+    actual = {row[0] for row in rows}
+    hashes = {row[1] for row in rows}
+    return {
+        "point_in_time_complete": bool(expected) and actual == expected and len(hashes) == 1,
+        "universe_count": len(actual),
+        "configured_universe_count": len(expected),
+        "universe_hash": next(iter(hashes), None),
+    }
+
+
 # ─── XGBoost wrapper fix ─────────────────────────────────────────────────────
 # qlib's XGBModel pushes ALL __init__ kwargs into self._params and passes
 # them to xgb.train(self._params, ...) as booster params. But
@@ -588,11 +611,18 @@ def run_one_model(model_id: str, market: str = "US",
     if save_checkpoint:
         try:
             from factors.qlib_checkpoint import save_checkpoint as _save_ckpt
+            pred_dates = (
+                pred.index.get_level_values(0)
+                if hasattr(pred.index, "get_level_values") else pred.index
+            )
+            prediction_date = str(max(pred_dates))[:10]
+            universe_meta = _checkpoint_universe_meta(market, prediction_date)
             ckpt_meta = _save_ckpt(
                 spec=spec, model=model, dataset=dataset, pred=pred,
-                market=market,
+                market=market, date=prediction_date,
                 train_window=train_window,
                 elapsed_s=round(elapsed, 1),
+                extra_meta=universe_meta,
             )
             summary["checkpoint"] = {
                 "saved": ckpt_meta.get("saved", True) is not False,

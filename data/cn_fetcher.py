@@ -189,12 +189,19 @@ class CNDataFetcher:
         end = datetime.now(timezone.utc).replace(tzinfo=None)
         start = end - timedelta(days=days)
         s, e = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+        # DataStore.load_prices uses an exclusive end bound. Daily bars are
+        # stamped at midnight, so querying through today's date would otherwise
+        # silently drop the latest completed CN session.
+        load_e = (
+            (end + timedelta(days=1)).strftime("%Y-%m-%d")
+            if interval == "1d" else e
+        )
 
         if not tickers:
             return pd.DataFrame(columns=["datetime", "ticker", "open", "high", "low", "close", "volume"])
 
         if use_cache:
-            cached = self.store.load_prices(tickers, s, e, interval=interval, price_mode=price_mode)
+            cached = self.store.load_prices(tickers, s, load_e, interval=interval, price_mode=price_mode)
             cov = self.store.get_price_coverage(tickers, interval=interval, price_mode=price_mode)
             if interval == "1d":
                 expected = max(1, int(days * 0.5))   # ~50% trading days (CN: ~250/yr)
@@ -234,7 +241,7 @@ class CNDataFetcher:
             if frames:
                 merged = pd.concat(frames, ignore_index=True)
                 self.store.save_prices_bulk(merged, interval=interval, price_mode=price_mode)
-            final = self.store.load_prices(tickers, s, e, interval=interval, price_mode=price_mode)
+            final = self.store.load_prices(tickers, s, load_e, interval=interval, price_mode=price_mode)
             log.info("📦 [CN %s] %dd | CACHE %d (%d rows) | DOWNLOADED %d (%d rows) | TOTAL %d rows",
                      interval, days, hit, len(cached), dl_tickers, dl_rows, len(final))
             return final
