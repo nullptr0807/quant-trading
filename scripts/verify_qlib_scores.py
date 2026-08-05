@@ -2,6 +2,7 @@
 """Fail closed unless Qlib scores were published for the latest market date."""
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 import os
 import sqlite3
@@ -11,6 +12,27 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from config.settings import UNIVERSES
+
+
+def _sha256(path: Path) -> str:
+    digest=hashlib.sha256()
+    with path.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024*1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _checkpoint_probe(model: str, target: str, market: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [
+            sys.executable, '-c',
+            'import sys; from factors.qlib_checkpoint import load_checkpoint; '
+            'load_checkpoint(sys.argv[1],sys.argv[2],market=sys.argv[3],verify=True)',
+            model, target, market,
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True, text=True, timeout=600,
+    )
 
 
 def verify(db_path: str, market: str, min_coverage: float = 0.80, model_ids=None,
@@ -64,16 +86,7 @@ def verify(db_path: str, market: str, min_coverage: float = 0.80, model_ids=None
                         )
                     if not pkl.exists() or pkl.stat().st_size <= 0:
                         raise RuntimeError('checkpoint payload missing or empty')
-                    probe = subprocess.run(
-                        [
-                            sys.executable, '-c',
-                            'import sys; from factors.qlib_checkpoint import load_checkpoint; '
-                            'load_checkpoint(sys.argv[1],sys.argv[2],market=sys.argv[3],verify=True)',
-                            model, target, market,
-                        ],
-                        cwd=Path(__file__).resolve().parents[1],
-                        capture_output=True, text=True, timeout=600,
-                    )
+                    probe = _checkpoint_probe(model, target, market)
                     if probe.returncode != 0:
                         raise RuntimeError((probe.stdout + probe.stderr)[-1500:])
                     checkpoint_status[model] = 'verified'
@@ -106,10 +119,20 @@ def write_publication_marker(result: dict) -> Path:
         if status!='verified': continue
         pkl=CHECKPOINT_ROOT/market/model/f'{date}.pkl'
         sidecar=CHECKPOINT_ROOT/market/model/f'{date}.json'
+        pre={'pkl':_sha256(pkl),'json':_sha256(sidecar)}
+        probe=_checkpoint_probe(model,date,market)
+        if probe.returncode!=0:
+            raise RuntimeError(
+                f'publication marker refused unverified {market}/{model}/{date}: '
+                +(probe.stdout+probe.stderr)[-1500:]
+            )
+        post={'pkl':_sha256(pkl),'json':_sha256(sidecar)}
+        if pre!=post:
+            raise RuntimeError(f'checkpoint changed during verification: {market}/{model}/{date}')
         ps,js=pkl.stat(),sidecar.stat()
         records[model]={
-            'pkl_size':ps.st_size,'pkl_mtime_ns':ps.st_mtime_ns,
-            'json_size':js.st_size,'json_mtime_ns':js.st_mtime_ns,
+            'pkl_size':ps.st_size,'pkl_mtime_ns':ps.st_mtime_ns,'pkl_sha256':post['pkl'],
+            'json_size':js.st_size,'json_mtime_ns':js.st_mtime_ns,'json_sha256':post['json'],
         }
     doc={'market':market,'date':date,'verified_at':datetime.now(timezone.utc).isoformat(),'models':records}
     tmp=marker_path.with_suffix('.tmp');tmp.write_text(json.dumps(doc,indent=2));os.chmod(tmp,0o600);tmp.replace(marker_path);os.chmod(marker_path,0o600)

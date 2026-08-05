@@ -115,6 +115,14 @@ def _versions_snapshot() -> dict:
     return out
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _hash_dataframe(df) -> str:
     """Deterministic hash of a small DataFrame slice — used as self-test key.
 
@@ -324,6 +332,10 @@ def checkpoint_ready_for_publication(model_id: str, date: str, market: str,
             return False, "checkpoint_changed_after_verification"
         if int(verified.get("json_mtime_ns", -1)) != json_stat.st_mtime_ns:
             return False, "checkpoint_changed_after_verification"
+        if verified.get("pkl_sha256") != _sha256_file(pkl_path):
+            return False, "checkpoint_hash_mismatch"
+        if verified.get("json_sha256") != _sha256_file(json_path):
+            return False, "checkpoint_hash_mismatch"
     except Exception:
         return False, "checkpoint_publication_marker_missing"
     return True, "ok"

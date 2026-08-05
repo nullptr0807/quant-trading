@@ -1,4 +1,6 @@
+import os
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
@@ -69,9 +71,30 @@ def test_publication_marker_binds_live_gate_to_verified_file_state(tmp_path, mon
     )
     ready,reason=checkpoint.checkpoint_ready_for_publication('Q01','2026-08-04','US',2)
     assert ready is False and reason=='checkpoint_publication_marker_missing'
+    monkeypatch.setattr(
+        verify,'_checkpoint_probe',
+        lambda *args:SimpleNamespace(returncode=0,stdout='',stderr=''),
+    )
     verify.write_publication_marker({
         'market':'US','date':'2026-08-04','checkpoints':{'Q01':'verified'}
     })
     assert checkpoint.checkpoint_ready_for_publication('Q01','2026-08-04','US',2)==(True,'ok')
-    pkl.write_bytes(b'changed')
-    assert checkpoint.checkpoint_ready_for_publication('Q01','2026-08-04','US',2)[0] is False
+    before=pkl.stat();pkl.write_bytes(b'PAYLOAD')
+    os.utime(pkl,ns=(before.st_atime_ns,before.st_mtime_ns))
+    ready,reason=checkpoint.checkpoint_ready_for_publication('Q01','2026-08-04','US',2)
+    assert ready is False and reason=='checkpoint_hash_mismatch'
+
+
+def test_publication_marker_refuses_unloadable_payload(tmp_path, monkeypatch):
+    import factors.qlib_checkpoint as checkpoint
+    import scripts.verify_qlib_scores as verify
+    root=tmp_path/'checkpoints';monkeypatch.setattr(checkpoint,'CHECKPOINT_ROOT',root)
+    folder=root/'US'/'Q01';folder.mkdir(parents=True)
+    (folder/'2026-08-04.pkl').write_bytes(b'not-a-joblib-checkpoint')
+    (folder/'2026-08-04.json').write_text(
+        '{"self_test":{"expected_score":1},"extra":{"point_in_time_complete":true,"universe_count":2}}'
+    )
+    with pytest.raises(RuntimeError,match='refused unverified'):
+        verify.write_publication_marker({
+            'market':'US','date':'2026-08-04','checkpoints':{'Q01':'verified'}
+        })
