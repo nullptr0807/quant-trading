@@ -303,10 +303,10 @@ def test_fast_cycle_fails_closed_for_missing_or_untradable_held_quote(tmp_path, 
     monkeypatch.setattr(system, "run_qlib_trading_cycle", lambda: calls.append("qlib"))
     monkeypatch.setattr(system, "_save_all_state", lambda: calls.append("save"))
 
-    system.run_fast_live_cycle()
+    with pytest.raises(RuntimeError, match="untradable=.*HELD"):
+        system.run_fast_live_cycle()
 
-    assert "HELD" not in system._realtime_prices
-    assert calls == ["benchmarks", "alpha", "gp", "qlib", "save"]
+    assert calls == []
 
 
 def test_fast_cycle_rejects_prepared_artifact_without_timestamp(tmp_path, monkeypatch):
@@ -406,10 +406,10 @@ def test_fast_cycle_rejects_untradable_candidate_quote_before_buy(tmp_path, monk
     monkeypatch.setattr(system, "run_qlib_trading_cycle", lambda: calls.append("qlib"))
     monkeypatch.setattr(system, "_save_all_state", lambda: calls.append("save"))
 
-    system.run_fast_live_cycle()
+    with pytest.raises(RuntimeError, match="untradable=.*CANDIDATE"):
+        system.run_fast_live_cycle()
 
-    assert "CANDIDATE" not in system._realtime_prices
-    assert calls == ["benchmarks", "alpha", "gp", "qlib", "save"]
+    assert calls == []
 
 
 def test_health_check_flags_stale_heartbeat_and_snapshot_only_during_session():

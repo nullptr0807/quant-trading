@@ -203,14 +203,14 @@ def test_stop_loss_reads_trailing_regime_from_selected_database(tmp_path, monkey
     monkeypatch.setattr(
         risk_regime,
         "get_effective_trailing_stop",
-        lambda *, db_path: seen.append(db_path) or None,
+        lambda *, market, db_path: seen.append((market, db_path)) or None,
     )
 
     with sqlite3.connect(db) as con:
         con.row_factory = sqlite3.Row
         updater.check_stop_losses(con, {"300418.SZ": 105.0}, execute=False)
 
-    assert seen == [str(db)]
+    assert seen == [("US", str(db))]
 
 
 def test_update_prices_cb16_cf15_same_day_stop_loss_is_guard_not_trade(

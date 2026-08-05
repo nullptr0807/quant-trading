@@ -165,12 +165,12 @@ def test_no_trades_routes_risk_regime_to_selected_database(tmp_path, monkeypatch
     monkeypatch.setattr(
         risk_regime,
         "evaluate_and_update",
-        lambda *, db_path: seen.append(db_path) or {"transitioned": False},
+        lambda *, market, db_path: seen.append((market, db_path)) or {"transitioned": False},
     )
 
     update_prices.update_equity_snapshots(str(db), no_trades=True)
 
-    assert seen == [str(db)]
+    assert seen == [("US", str(db))]
     assert risk_regime.DB_PATH == original
 
 

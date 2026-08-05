@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from data.store import DataStore
+from data.quotes import RealtimeQuote
 from main import QuantSystem
 from trading.account import _Position
 from trading.engine import TradingEngine
@@ -193,9 +194,13 @@ def test_fast_cycle_skips_producers_and_quotes_only_prepared_bounded_tickers(
     calls = []
 
     class Fetcher:
-        def get_realtime_quotes(self, tickers):
+        def get_realtime_quote_metadata(self, tickers):
             requested.append(list(tickers))
-            return {ticker: 10.0 for ticker in tickers}
+            now = datetime.now(timezone.utc)
+            return {
+                ticker: RealtimeQuote(ticker, 10.0, "test", now, now, True)
+                for ticker in tickers
+            }
 
         def get_historical(self, *args, **kwargs):
             pytest.fail("fast cycle must not request historical data")
@@ -238,9 +243,13 @@ def test_fast_cycle_can_consume_prepared_artifact_without_reloading_factors(
     }))
     requested = []
     class Fetcher:
-        def get_realtime_quotes(self, tickers):
+        def get_realtime_quote_metadata(self, tickers):
             requested.append(list(tickers))
-            return {ticker: 10.0 for ticker in tickers}
+            now = datetime.now(timezone.utc)
+            return {
+                ticker: RealtimeQuote(ticker, 10.0, "test", now, now, True)
+                for ticker in tickers
+            }
     system.fetcher = Fetcher()
     monkeypatch.setattr("main.is_market_hours_for", lambda market: True)
     monkeypatch.setattr(

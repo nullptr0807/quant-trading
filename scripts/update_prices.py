@@ -480,7 +480,9 @@ def check_stop_losses(
         if triggered_reason is None:
             try:
                 from trading.risk_regime import get_effective_trailing_stop
-                trail_pct = get_effective_trailing_stop(db_path=db_path)
+                trail_pct = get_effective_trailing_stop(
+                    market=acct_market, db_path=db_path
+                )
             except Exception:
                 trail_pct = None
             if trail_pct is not None:
@@ -904,9 +906,19 @@ def update_equity_snapshots(
     # the trailing stop. Best-effort — never block snapshot updates on this.
     try:
         from trading import risk_regime
-        rr = risk_regime.evaluate_and_update(db_path=db_path)
-        if rr.get("transitioned"):
-            LOG.warning("Risk regime transition: %s", rr)
+        evaluated_markets = {
+            market_by_acct.get(acct, "US")
+            for acct in cash_by_acct
+            if acct not in retired_accts
+            and ((market_by_acct.get(acct, "US") == "US" and fetch_us)
+                 or (market_by_acct.get(acct, "US") == "CN" and fetch_cn))
+        }
+        for risk_market in sorted(evaluated_markets):
+            rr = risk_regime.evaluate_and_update(
+                market=risk_market, db_path=db_path
+            )
+            if rr.get("transitioned"):
+                LOG.warning("Risk regime transition: %s", rr)
     except Exception as e:
         LOG.warning("risk-regime evaluation failed: %s", e)
 

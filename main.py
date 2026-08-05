@@ -845,7 +845,7 @@ class QuantSystem:
         log.info("Saved state for %d accounts to DB", len(all_accounts))
 
     # -- Real-time prices ---------------------------------------------------
-    def _fetch_realtime_prices(self) -> dict[str, float]:
+    def _fetch_realtime_prices(self, *, strict_execution: bool = False) -> dict[str, float]:
         """Fetch real-time prices via the market-aware fetcher.
 
         US fetcher uses yfinance fast_info → Finnhub fallback; CN fetcher
@@ -868,13 +868,51 @@ class QuantSystem:
                     tickers.add(ticker)
         for bm in self.benchmarks:
             tickers.add(bm["ticker"])
+        requested = sorted(tickers)
+        getter = getattr(self.fetcher, "get_realtime_quote_metadata", None)
+        if getter is None:
+            if strict_execution:
+                raise RuntimeError(
+                    f"[{self.market}] execution quote gate requires metadata; "
+                    "legacy scalar quotes are display-only"
+                )
+            try:
+                return self.fetcher.get_realtime_quotes(requested)
+            except Exception as e:
+                log.warning("realtime quote fetch failed: %s", e)
+                return {}
         try:
-            prices = self.fetcher.get_realtime_quotes(sorted(tickers))
+            quotes = getter(requested)
         except Exception as e:
-            log.warning("realtime quote fetch failed: %s", e)
+            if strict_execution:
+                raise RuntimeError(
+                    f"[{self.market}] execution quote metadata fetch failed"
+                ) from e
+            log.warning("realtime quote metadata fetch failed: %s", e)
             return {}
+        prices = prices_from_quotes(quotes)
+        if strict_execution:
+            now = _utc_now()
+            max_age = float(os.environ.get("QUANT_MAX_QUOTE_AGE_SECONDS", "180"))
+            validation = validate_required_quotes(
+                quotes, requested, now=now, max_age_seconds=max_age
+            )
+            if not validation["ok"]:
+                raise RuntimeError(
+                    f"[{self.market}] execution quote gate failed: "
+                    f"missing={validation['missing']} invalid={validation['invalid']} "
+                    f"stale={validation['stale']} untradable={validation['untradable']}"
+                )
+            self._realtime_quote_details = {
+                ticker: {
+                    "price": quote.price,
+                    "prev_close": quote.prev_close,
+                    "volume": quote.volume,
+                }
+                for ticker, quote in quotes.items()
+            }
         if not prices:
-            log.warning("Failed to fetch any real-time prices, using historical close")
+            log.warning("Failed to fetch any real-time prices")
         return prices
 
     def _fetch_realtime_prices_for(self, tickers) -> dict[str, float]:
@@ -1292,19 +1330,10 @@ class QuantSystem:
             )
         getter = getattr(self.fetcher, "get_realtime_quote_metadata", None)
         if getter is None:
-            # Compatibility for tests/offline custom fetchers. Production
-            # DataFetcher/CNDataFetcher always expose metadata and therefore use
-            # strict timestamp/tradability validation.
-            raw_prices = self.fetcher.get_realtime_quotes(sorted(quote_tickers))
-            from data.quotes import RealtimeQuote
-            now = _utc_now()
-            quotes = {
-                ticker: RealtimeQuote(
-                    ticker=ticker, price=price, source="legacy_custom_fetcher",
-                    source_timestamp=now, received_at=now, tradable=True,
-                )
-                for ticker, price in raw_prices.items()
-            }
+            raise RuntimeError(
+                f"[{self.market}] fast live execution requires quote metadata; "
+                "legacy scalar quotes are display-only"
+            )
         else:
             quotes = getter(sorted(quote_tickers))
         # Every quote that can reach a buy/sell path must be positive, fresh,
@@ -1324,6 +1353,12 @@ class QuantSystem:
             log.warning(
                 "Fast-cycle quote gate blocked %d/%d tickers individually: %s",
                 len(blocked_tickers), len(quote_tickers), ",".join(blocked_tickers[:20]),
+            )
+        if not validation["ok"]:
+            raise RuntimeError(
+                f"[{self.market}] fast live execution quote gate failed: "
+                f"missing={validation['missing']} invalid={validation['invalid']} "
+                f"stale={validation['stale']} untradable={validation['untradable']}"
             )
         self._realtime_prices = {
             ticker: price
@@ -2738,7 +2773,7 @@ class QuantSystem:
         # auto-armed trailing stop never hides from view.
         try:
             from trading.risk_regime import status_line as _risk_status
-            lines.append(_risk_status())
+            lines.append(_risk_status(market=self.market, db_path=self.db_path))
         except Exception as _e:
             log.warning("risk_regime status_line unavailable: %s", _e)
         if total_n:
@@ -2883,9 +2918,10 @@ class QuantSystem:
         self.fetch_data()
         self.compute_factors()
         self.mine_gp_factors()
-        # Refresh real-time quotes so equity/PnL reflects intraday prices,
-        # not stale 1d close (which only updates after market close).
-        self._realtime_prices = self._fetch_realtime_prices()
+        # Metadata is mandatory for every price that can reach execution. This
+        # also prevents _get_current_prices() from silently trading a historical
+        # close when a live quote is missing.
+        self._realtime_prices = self._fetch_realtime_prices(strict_execution=True)
         self.initialize_benchmarks()
         self.run_trading_cycle()
         self.run_gp_trading_cycle()
@@ -2916,8 +2952,11 @@ class QuantSystem:
                         self.compute_factors()
                         self.mine_gp_factors()
 
-                    # 每个cycle都刷新实时价格（盘前/盘中/盘后）
-                    self._realtime_prices = self._fetch_realtime_prices()
+                    # Every loop execution uses the same strict metadata gate as
+                    # run_once; scalar or historical fallbacks are display-only.
+                    self._realtime_prices = self._fetch_realtime_prices(
+                        strict_execution=True
+                    )
 
                     # 更新持仓市价 + 写入positions_history快照
                     self._save_all_state()
