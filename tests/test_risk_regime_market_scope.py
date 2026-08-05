@@ -84,6 +84,30 @@ def test_legacy_singleton_migration_recomputes_instead_of_copying_armed(tmp_path
         assert market == "ALL"
 
 
+def test_recovery_streak_advances_once_per_date_not_once_per_tick(tmp_path, monkeypatch):
+    db = tmp_path / "db.sqlite"
+    DataStore(str(db))
+    now = datetime.now(timezone.utc)
+    with sqlite3.connect(db) as con:
+        con.execute("INSERT INTO account_meta(account_id,market,status) VALUES('U','US','active')")
+        con.executemany(
+            "INSERT INTO accounts(name,cash,equity,timestamp,market) VALUES('U',0,?,?,'US')",
+            [(100, (now - timedelta(days=2)).isoformat()),
+             (99, (now - timedelta(days=1)).isoformat())],
+        )
+    risk_regime.get_state(market="US", db_path=str(db))
+    with sqlite3.connect(db) as con:
+        con.execute("UPDATE risk_regime SET state='ARMED',recovery_streak=0 WHERE market='US'")
+    monkeypatch.setattr(risk_regime, "_send_telegram", lambda message: None)
+
+    first = risk_regime.evaluate_and_update(market="US", db_path=str(db))
+    second = risk_regime.evaluate_and_update(market="US", db_path=str(db))
+
+    assert first["recovery_streak"] == 1
+    assert second["recovery_streak"] == 1
+    assert second["state"] == "ARMED"
+
+
 def test_all_public_apis_require_market():
     with pytest.raises(TypeError):
         risk_regime.get_state()  # type: ignore[call-arg]

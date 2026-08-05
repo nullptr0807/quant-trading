@@ -193,6 +193,20 @@ def init_db(db_path: str | None = None):
     )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_fv_date ON factor_values(date)")
 
+    c.execute("""CREATE TABLE IF NOT EXISTS universe_membership (
+        market TEXT NOT NULL,
+        date TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        source TEXT NOT NULL,
+        universe_hash TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        PRIMARY KEY (market,date,ticker)
+    )""")
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_universe_membership_market_date "
+        "ON universe_membership(market,date,ticker)"
+    )
+
     # 自适应换仓状态
     c.execute("""CREATE TABLE IF NOT EXISTS adaptive_state (
         account TEXT PRIMARY KEY,

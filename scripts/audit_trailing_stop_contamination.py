@@ -11,7 +11,7 @@ import json
 import os
 
 import sqlite3
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
 from config import settings
@@ -52,11 +52,25 @@ def _counterfactual_state(conn: sqlite3.Connection, at: datetime) -> tuple[str, 
 
 
 def classify(db_path: str) -> list[dict]:
-    uri = f"file:{os.path.abspath(db_path)}?mode=ro"
+    """Classify all US trailing stops in one chronological pass.
+
+    The old implementation replayed the full 30-day snapshot window once per
+    event (O(events × snapshots)). This version streams snapshots once, updates
+    the intended daily state machine after each completed snapshot timestamp,
+    and classifies events against the state available before that event.
+    """
+    absolute = os.path.abspath(db_path)
+    wal = Path(absolute + "-wal")
+    if wal.exists() and wal.stat().st_size > 0:
+        raise RuntimeError(
+            "read-only audit requires a checkpointed database (non-empty WAL present)"
+        )
+    uri = f"file:{absolute}?mode=ro&immutable=1"
     conn = sqlite3.connect(uri, uri=True)
+    conn.execute("PRAGMA query_only=ON")
     conn.row_factory = sqlite3.Row
     try:
-        candidates = []
+        raw_events = []
         for event in conn.execute(
             "SELECT id,ts,account,ticker,detail FROM events "
             "WHERE category='trade' AND UPPER(market)='US' ORDER BY ts,id"
@@ -65,23 +79,83 @@ def classify(db_path: str) -> list[dict]:
                 detail = json.loads(event["detail"] or "{}")
             except (TypeError, json.JSONDecodeError):
                 continue
-            if detail.get("reason") != "trailing_stop":
+            if detail.get("reason") == "trailing_stop":
+                raw_events.append(event)
+        if not raw_events:
+            return []
+
+        trade_map = {}
+        for trade in conn.execute(
+            "SELECT id,account,ticker,timestamp FROM trades "
+            "WHERE side='sell' AND UPPER(market)='US' ORDER BY id"
+        ):
+            trade_map.setdefault(
+                (trade["account"], trade["ticker"], trade["timestamp"]), trade["id"]
+            )
+
+        first_at = _parse_ts(raw_events[0]["ts"])
+        last_at = _parse_ts(raw_events[-1]["ts"])
+        snapshots = iter(conn.execute(
+            "SELECT a.timestamp,a.name,a.equity FROM accounts a "
+            "JOIN account_meta m ON m.account_id=a.name AND UPPER(m.market)='US' "
+            "WHERE UPPER(a.market)='US' AND m.status='active' "
+            "AND a.timestamp>=? AND a.timestamp<? ORDER BY a.timestamp,a.name",
+            ((first_at - timedelta(days=30)).isoformat(), last_at.isoformat()),
+        ))
+        pending = next(snapshots, None)
+        latest: dict[str, float] = {}
+        daily_totals: dict[str, float] = {}
+        state, streak, last_recovery_day = "DISARMED", 0, None
+        last_dd = 0.0
+
+        def evaluate_snapshot_group(ts_text: str, rows: list[sqlite3.Row]) -> None:
+            nonlocal state, streak, last_recovery_day, last_dd
+            for row in rows:
+                if row["equity"] is not None and float(row["equity"]) > 0:
+                    latest[str(row["name"])] = float(row["equity"])
+            at = _parse_ts(ts_text)
+            day = at.date().isoformat()
+            if latest:
+                daily_totals[day] = sum(latest.values())
+            start = (at.date() - timedelta(days=30)).isoformat()
+            window = [total for d, total in daily_totals.items() if d >= start]
+            if not window:
+                return
+            peak = max(window)
+            last_dd = max(0.0, (peak - window[-1]) / peak) if peak > 0 else 0.0
+            if state == "DISARMED" and last_dd >= settings.AUTO_ARM_DD_PCT:
+                state, streak, last_recovery_day = "ARMED", 0, None
+            elif state == "ARMED":
+                if last_dd <= settings.AUTO_DISARM_DD_PCT:
+                    if last_recovery_day != day:
+                        streak += 1
+                        last_recovery_day = day
+                    if streak >= settings.AUTO_DISARM_DAYS:
+                        state, streak, last_recovery_day = "DISARMED", 0, None
+                else:
+                    streak, last_recovery_day = 0, None
+
+        results = []
+        for event in raw_events:
+            event_at = _parse_ts(event["ts"])
+            while pending is not None and _parse_ts(pending["timestamp"]) < event_at:
+                group_ts = pending["timestamp"]
+                group = [pending]
+                pending = next(snapshots, None)
+                while pending is not None and pending["timestamp"] == group_ts:
+                    group.append(pending)
+                    pending = next(snapshots, None)
+                evaluate_snapshot_group(group_ts, group)
+            trade_id = trade_map.get((event["account"], event["ticker"], event["ts"]))
+            if trade_id is None:
                 continue
-            trade = conn.execute(
-                "SELECT id FROM trades WHERE account=? AND ticker=? AND side='sell' "
-                "AND timestamp=? AND UPPER(market)='US' ORDER BY id LIMIT 1",
-                (event["account"], event["ticker"], event["ts"]),
-            ).fetchone()
-            if not trade:
-                continue
-            state, drawdown = _counterfactual_state(conn, _parse_ts(event["ts"]))
-            candidates.append({
-                "trade_id": trade["id"], "event_id": event["id"],
+            results.append({
+                "trade_id": trade_id, "event_id": event["id"],
                 "timestamp": event["ts"], "account": event["account"],
                 "ticker": event["ticker"], "counterfactual_state": state,
-                "us_only_drawdown": drawdown, "polluted": state != "ARMED",
+                "us_only_drawdown": last_dd, "polluted": state != "ARMED",
             })
-        return candidates
+        return results
     finally:
         conn.close()
 

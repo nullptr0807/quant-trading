@@ -28,6 +28,7 @@ def _create_table(conn: sqlite3.Connection) -> None:
             state TEXT NOT NULL CHECK (state IN ('DISARMED','ARMED')),
             armed_at TEXT,
             recovery_streak INTEGER NOT NULL DEFAULT 0,
+            last_recovery_date TEXT,
             last_drawdown REAL,
             last_check_at TEXT
         )
@@ -89,6 +90,9 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
         conn.commit()
         return
     _create_table(conn)
+    current_columns = {row[1] for row in conn.execute("PRAGMA table_info(risk_regime)")}
+    if "last_recovery_date" not in current_columns:
+        conn.execute("ALTER TABLE risk_regime ADD COLUMN last_recovery_date TEXT")
     conn.commit()
 
 
@@ -169,7 +173,7 @@ def get_state(
         )
         c.commit()
         row = c.execute(
-            "SELECT state,armed_at,recovery_streak,last_drawdown,last_check_at "
+            "SELECT state,armed_at,recovery_streak,last_drawdown,last_check_at,last_recovery_date "
             "FROM risk_regime WHERE market=?", (market,),
         ).fetchone()
     finally:
@@ -178,7 +182,7 @@ def get_state(
     return {
         "market": market, "state": row[0], "armed_at": row[1],
         "recovery_streak": row[2] or 0, "last_drawdown": row[3] or 0.0,
-        "last_check_at": row[4],
+        "last_check_at": row[4], "last_recovery_date": row[5],
     }
 
 
@@ -189,34 +193,40 @@ def evaluate_and_update(*, market: str, db_path: str = DB_PATH) -> dict:
         _ensure_table(conn)
         dd = _portfolio_drawdown(conn, market=market)
         now_iso = datetime.now(timezone.utc).isoformat()
+        check_date = now_iso[:10]
         current = get_state(market=market, conn=conn)
         old_state = current["state"]
         state = old_state
         streak = current["recovery_streak"]
+        last_recovery_date = current.get("last_recovery_date")
         message = None
         if state == "DISARMED" and dd >= settings.AUTO_ARM_DD_PCT:
-            state, streak = "ARMED", 0
+            state, streak, last_recovery_date = "ARMED", 0, None
             message = (
                 f"🚨 *RISK REGIME [{market}]: AUTO-ARMED*\n"
                 f"{market} drawdown {dd*100:.2f}% ≥ {settings.AUTO_ARM_DD_PCT*100:.1f}%."
             )
         elif state == "ARMED":
             if dd <= settings.AUTO_DISARM_DD_PCT:
-                streak += 1
+                # The updater calls this every minute. Recovery is measured in
+                # distinct UTC dates, never in ticks/minutes.
+                if last_recovery_date != check_date:
+                    streak += 1
+                    last_recovery_date = check_date
                 if streak >= settings.AUTO_DISARM_DAYS:
-                    state, streak = "DISARMED", 0
+                    state, streak, last_recovery_date = "DISARMED", 0, None
                     message = f"✅ *RISK REGIME [{market}]: AUTO-DISARMED*\nDrawdown {dd*100:.2f}%."
             else:
-                streak = 0
+                streak, last_recovery_date = 0, None
         if message:
             _record_event(conn, f"risk_regime_{state.lower()}", message, market=market)
         conn.execute("""
             UPDATE risk_regime SET state=?,armed_at=?,recovery_streak=?,
-                last_drawdown=?,last_check_at=? WHERE market=?
+                last_recovery_date=?,last_drawdown=?,last_check_at=? WHERE market=?
         """, (
             state,
             now_iso if state == "ARMED" and old_state == "DISARMED" else current["armed_at"],
-            streak, dd, now_iso, market,
+            streak, last_recovery_date, dd, now_iso, market,
         ))
         conn.commit()
         if message:

@@ -47,8 +47,14 @@ if [ -n "$MODELS" ]; then
     run_args+=(--models "$MODELS")
 fi
 
+verify_args=(--market "$MARKET")
+if [ -n "$MODELS" ]; then
+    verify_args+=(--models "$MODELS")
+fi
+
 echo "===== Qlib retrain [$MARKET] start $(date -u +%Y-%m-%dT%H:%M:%SZ) args=${run_args[*]} =====" >> "$LOG_DIR/qlib_retrain.log"
-if python -m scripts.qlib_retrain "${run_args[@]}" >> "$LOG_DIR/qlib_retrain.log" 2>&1; then
+if python -m scripts.qlib_retrain "${run_args[@]}" >> "$LOG_DIR/qlib_retrain.log" 2>&1 \
+   && python -m scripts.verify_qlib_scores "${verify_args[@]}" >> "$LOG_DIR/qlib_retrain.log" 2>&1; then
     echo "===== Qlib retrain [$MARKET] OK    $(date -u +%Y-%m-%dT%H:%M:%SZ) =====" >> "$LOG_DIR/qlib_retrain.log"
 else
     echo "===== Qlib retrain [$MARKET] FAIL  $(date -u +%Y-%m-%dT%H:%M:%SZ) =====" >> "$LOG_DIR/qlib_retrain.log"

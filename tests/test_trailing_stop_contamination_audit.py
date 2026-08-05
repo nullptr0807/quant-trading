@@ -35,9 +35,15 @@ def _seed(path):
     return trade_ts
 
 
+def _checkpoint(path):
+    with sqlite3.connect(path) as con:
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+
 def test_default_classification_is_read_only_and_marks_us_disarmed_fill(tmp_path):
     db = tmp_path / "db.sqlite"
     _seed(db)
+    _checkpoint(db)
     before = db.read_bytes()
 
     rows = _audit_module().classify(str(db))
@@ -52,6 +58,7 @@ def test_default_classification_is_read_only_and_marks_us_disarmed_fill(tmp_path
 def test_apply_requires_confirmation_backup_is_non_destructive_and_idempotent(tmp_path):
     db = tmp_path / "db.sqlite"
     _seed(db)
+    _checkpoint(db)
     rows = _audit_module().classify(str(db))
     backup = tmp_path / "backup.sqlite"
 
