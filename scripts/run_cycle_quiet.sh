@@ -24,7 +24,6 @@ TRADE_TIMEOUT_SECONDS=${QUANT_RUN_CYCLE_TIMEOUT_SECONDS:-120}
     >> /home/gexin/quant-trading/logs/cron.log 2>&1
 
 export QUANT_FAST_PREPARED_PATH="$PREPARED"
-exec /usr/bin/flock -n /tmp/quant_run_cycle.lock \
-    /usr/bin/timeout --kill-after=30s "${TRADE_TIMEOUT_SECONDS}s" \
-    "$PYTHON" main.py --fast-cycle --market "$MARKET" \
-    >> /home/gexin/quant-trading/logs/cron.log 2>&1
+ROOT=${QUANT_PROJECT_ROOT:-/home/gexin/quant-trading}
+exec bash "$ROOT/scripts/run_scheduled_job.sh" run_cycle_quiet "$MARKET" /tmp/quant_run_cycle.lock 0 "$TRADE_TIMEOUT_SECONDS" \
+    "$ROOT/logs/cron.log" -- "$PYTHON" main.py --fast-cycle --market "$MARKET"

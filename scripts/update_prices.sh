@@ -29,7 +29,6 @@ PYTHON=/home/gexin/quant-trading/venv/bin/python
 # both price updates and trading cycles. `timeout` kills the child and releases
 # the flock; the next cron tick can retry.
 TIMEOUT_SECONDS=${QUANT_UPDATE_TIMEOUT_SECONDS:-110}
-exec /usr/bin/flock -w 8 /tmp/quant_run_cycle.lock \
-    /usr/bin/timeout --kill-after=15s "${TIMEOUT_SECONDS}s" \
-    "$PYTHON" -m scripts.update_prices --live \
-    >> /home/gexin/quant-trading/logs/update_prices.log 2>&1
+ROOT=${QUANT_PROJECT_ROOT:-/home/gexin/quant-trading}
+exec bash "$ROOT/scripts/run_scheduled_job.sh" update_prices ALL /tmp/quant_run_cycle.lock 8 "$TIMEOUT_SECONDS" \
+    "$ROOT/logs/update_prices.log" -- "$PYTHON" -m scripts.update_prices --live

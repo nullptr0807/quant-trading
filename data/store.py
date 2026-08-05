@@ -2,6 +2,7 @@
 
 import sqlite3
 import json
+import math
 import os
 import time
 import logging
@@ -50,6 +51,38 @@ def _price_table(price_mode: str = "adjusted") -> str:
         return PRICE_MODE_TABLE[str(price_mode or "adjusted").lower()]
     except KeyError as exc:
         raise ValueError(f"unsupported price_mode={price_mode!r}; expected adjusted/qfq/raw") from exc
+
+
+def _price_quality_issue(row: tuple) -> tuple[str, str] | None:
+    """Return issue type/detail for impossible OHLC; never mutate raw input."""
+    try:
+        ticker, dt, _interval, open_, high, low, close, _volume = row
+        values = [float(open_), float(high), float(low), float(close)]
+        if not all(pd.notna(value) and math.isfinite(value) for value in values):
+            return "invalid_ohlc", "null/non-finite OHLC"
+        open_, high, low, close = values
+        if min(values) <= 0:
+            return "invalid_ohlc", "non-positive OHLC"
+        if high < max(open_, low, close) or low > min(open_, high, close):
+            return "invalid_ohlc", "high/low envelope invariant violated"
+    except (TypeError, ValueError):
+        return "invalid_ohlc", "non-numeric OHLC"
+    return None
+
+
+def _record_price_quality_issues(conn: sqlite3.Connection, rows: list[tuple], price_mode: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    issues = []
+    for row in rows:
+        issue = _price_quality_issue(row)
+        if issue:
+            issues.append((price_mode, row[0], row[1], row[2], issue[0], now, issue[1]))
+    if issues:
+        conn.executemany(
+            "INSERT OR REPLACE INTO price_quality_issues "
+            "(price_mode,ticker,datetime,interval,issue_type,detected_at,detail) VALUES (?,?,?,?,?,?,?)",
+            issues,
+        )
 
 
 def _connect(db_path: str | None = None) -> sqlite3.Connection:
@@ -224,7 +257,24 @@ def init_db(db_path: str | None = None):
         "group" TEXT DEFAULT '', factors TEXT DEFAULT '',
         initial_cash REAL DEFAULT 10000, created_at TEXT,
         status TEXT DEFAULT 'active', market TEXT NOT NULL DEFAULT 'US',
-        retired_at TEXT, retire_reason TEXT
+        retired_at TEXT, retire_reason TEXT,
+        runtime_status TEXT NOT NULL DEFAULT 'ready',
+        runtime_reason TEXT, runtime_detail TEXT, runtime_updated_at TEXT
+    )""")
+    meta_columns = {row[1] for row in c.execute("PRAGMA table_info(account_meta)")}
+    for name, ddl in (
+        ("runtime_status", "TEXT NOT NULL DEFAULT 'ready'"),
+        ("runtime_reason", "TEXT"), ("runtime_detail", "TEXT"),
+        ("runtime_updated_at", "TEXT"),
+    ):
+        if name not in meta_columns:
+            c.execute(f"ALTER TABLE account_meta ADD COLUMN {name} {ddl}")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS price_quality_issues (
+        price_mode TEXT NOT NULL, ticker TEXT NOT NULL, datetime TEXT NOT NULL,
+        interval TEXT NOT NULL, issue_type TEXT NOT NULL, detected_at TEXT NOT NULL,
+        detail TEXT,
+        PRIMARY KEY(price_mode,ticker,datetime,interval,issue_type)
     )""")
 
     conn.commit()
@@ -271,6 +321,7 @@ class DataStore:
                         f"INSERT OR REPLACE INTO {table} (ticker,datetime,interval,open,high,low,close,volume) "
                         "VALUES (?,?,?,?,?,?,?,?)", rows,
                     )
+                    _record_price_quality_issues(conn, rows, str(price_mode).lower())
                     conn.commit()
                     break
                 except sqlite3.OperationalError as e:
@@ -298,6 +349,7 @@ class DataStore:
                         f"INSERT OR REPLACE INTO {table} (ticker,datetime,interval,open,high,low,close,volume) "
                         "VALUES (?,?,?,?,?,?,?,?)", rows,
                     )
+                    _record_price_quality_issues(conn, rows, str(price_mode).lower())
                     conn.commit()
                     break
                 except sqlite3.OperationalError as e:
@@ -310,11 +362,13 @@ class DataStore:
     def load_prices(self, tickers: list[str], start: str, end: str,
                     interval: str = "1d",
                     skip_zero_volume: bool = True,
-                    price_mode: str = "adjusted") -> pd.DataFrame:
-        """Load cached prices from DB.
+                    price_mode: str = "adjusted",
+                    quality_mode: str = "research") -> pd.DataFrame:
+        """Load cached prices.
 
-        price_mode='adjusted' reads legacy research/qfq prices; price_mode='raw'
-        reads raw/unadjusted execution prices.
+        ``quality_mode='research'`` (default) quarantines impossible OHLC rows;
+        ``'audit'`` returns the original persisted rows unchanged.  Quarantine is
+        read-time only so provider evidence remains available for replay/audit.
         """
         if not tickers:
             return pd.DataFrame(columns=["datetime", "ticker", "open", "high", "low", "close", "volume"])
@@ -324,13 +378,26 @@ class DataStore:
         # Apply zero-volume filter only on guarded intraday intervals
         intraday_guarded = interval in ("1m", "2m", "5m", "15m", "30m")
         vol_clause = " AND COALESCE(volume,0) > 0" if (skip_zero_volume and intraday_guarded) else ""
+        if quality_mode not in {"research", "audit"}:
+            conn.close()
+            raise ValueError("quality_mode must be 'research' or 'audit'")
+        quality_clause = ""
+        if quality_mode == "research":
+            quality_clause = (
+                " AND NOT EXISTS (SELECT 1 FROM price_quality_issues q "
+                f"WHERE q.price_mode=? AND q.ticker={table}.ticker "
+                f"AND q.datetime={table}.datetime AND q.interval={table}.interval)"
+            )
         query = (
             f"SELECT ticker, datetime, open, high, low, close, volume FROM {table} "
             f"WHERE interval=? AND datetime>=? AND datetime<? AND ticker IN ({placeholders})"
-            f"{vol_clause} "
+            f"{vol_clause}{quality_clause} "
             f"ORDER BY ticker, datetime"
         )
-        df = pd.read_sql_query(query, conn, params=[interval, start, end, *tickers])
+        params = [interval, start, end, *tickers]
+        if quality_mode == "research":
+            params.append(str(price_mode).lower())
+        df = pd.read_sql_query(query, conn, params=params)
         conn.close()
         return df
 
@@ -348,6 +415,41 @@ class DataStore:
         ).fetchall()
         conn.close()
         return {r[0]: (r[1], r[2], r[3]) for r in rows}
+
+    def count_price_quality_issues(self, *, interval: str | None = None,
+                                   price_mode: str | None = None) -> dict[str, int]:
+        conn = self._conn()
+        clauses, params = [], []
+        if interval:
+            clauses.append("interval=?"); params.append(interval)
+        if price_mode:
+            clauses.append("price_mode=?"); params.append(str(price_mode).lower())
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = conn.execute(
+            "SELECT issue_type,COUNT(*) FROM price_quality_issues" + where + " GROUP BY issue_type",
+            params,
+        ).fetchall()
+        conn.close()
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def set_account_runtime_status(self, account: str, market: str, status: str,
+                                   reason: str | None = None,
+                                   detail: dict | None = None) -> None:
+        """Publish execution readiness separately from lifecycle ``status``."""
+        conn = self._conn()
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT OR IGNORE INTO account_meta (account_id,market,created_at) VALUES (?,?,?)",
+            (account, market, now),
+        )
+        conn.execute(
+            "UPDATE account_meta SET runtime_status=?,runtime_reason=?,runtime_detail=?,runtime_updated_at=? "
+            "WHERE account_id=? AND market=?",
+            (status, reason, json.dumps(detail, ensure_ascii=False) if detail is not None else None,
+             now, account, market),
+        )
+        conn.commit()
+        conn.close()
 
     # ── Trades ──────────────────────────────────────────────────────────────
 

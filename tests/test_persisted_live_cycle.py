@@ -338,6 +338,8 @@ def test_run_cycle_wrappers_use_fast_cycle_and_explicit_us_market():
         assert "--fast-cycle --market" in text
         assert '"$MARKET"' in text
         assert "scripts.prepare_fast_cycle" in text
-        assert text.index("scripts.prepare_fast_cycle") < text.index("/usr/bin/flock")
+        assert "run_scheduled_job.sh" in text
+        scheduler = (root / "scripts/run_scheduled_job.sh").read_text()
+        assert "/usr/bin/flock" in scheduler
         assert "QUANT_FAST_PREPARED_PATH" in text
         assert "main.py --cycle-no-report" not in text

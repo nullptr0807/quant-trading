@@ -13,6 +13,20 @@ SYMBOL_CHANGES = {
     },
 }
 
+# Audit findings with insufficient evidence for a safe identifier mapping.  They
+# remain readable in historical prices/trades, but candidate selection and the
+# execution layer block new buys from the audit effective date.  A replacement
+# must never be guessed from a similar company name/ticker.
+SECURITY_LIFECYCLE = {
+    ("US", ticker): {
+        "status": "temporarily_unavailable",
+        "effective_at": "2026-07-10T00:00:00+00:00",
+        "replacement_ticker": None,
+        "evidence": "2026-07 universe/provider audit; mapping evidence pending review",
+    }
+    for ticker in ("APLS", "BK", "BLD", "CTRA", "CWEN-A", "JHG", "MASI", "NSA")
+}
+
 
 def _parse_utc(value: str | datetime) -> datetime:
     if isinstance(value, datetime):
@@ -30,7 +44,11 @@ def canonical_ticker(ticker: str, market: str, at: str | datetime) -> str:
 
 
 def ticker_lifecycle_block_reason(ticker: str, market: str, at: str | datetime) -> str | None:
-    change = SYMBOL_CHANGES.get((str(market).upper(), str(ticker).upper()))
+    key = (str(market).upper(), str(ticker).upper())
+    change = SYMBOL_CHANGES.get(key)
     if change and _parse_utc(at) >= _parse_utc(change["effective_at"]):
         return f"symbol_changed_to_{change['new_ticker']}"
+    lifecycle = SECURITY_LIFECYCLE.get(key)
+    if lifecycle and _parse_utc(at) >= _parse_utc(lifecycle["effective_at"]):
+        return str(lifecycle["status"])
     return None

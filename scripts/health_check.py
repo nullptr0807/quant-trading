@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -24,8 +25,9 @@ ROLL20_FACTORS = [
 ]
 BACKFILL_LOG = PROJECT_ROOT / "logs" / "backfill.log"
 _BACKFILL_WRAPPER_RE = re.compile(
-    r"^===== Backfill \[(?P<market>US|CN)/(?P<interval>[^/\]]+)/(?P<price_mode>[^\]]+)\] "
-    r"(?P<event>start|OK|FAIL) (?P<timestamp>\S+)(?: .*?exit=(?P<exit_code>\d+))? =====$"
+    r"^===== Backfill \[(?P<market>US|CN)/(?P<interval>[^/\]]+)/(?P<price_mode>[^/\]]+)"
+    r"(?:/(?P<scope>[^\]]+))?\] "
+    r"(?P<event>start|OK|FAIL) (?P<timestamp>\S+)(?: .*?)?(?:exit=(?P<exit_code>\d+))?(?: .*?)? =====$"
 )
 _LEGACY_BACKFILL_START_RE = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:,\d+)? \[INFO\] "
@@ -210,17 +212,20 @@ def check_price_1d_health(
     return issues
 
 
-def _runtime_session_open(now: datetime) -> dict[str, bool]:
+def _runtime_session_open(now: datetime) -> dict[str, str | bool]:
     from zoneinfo import ZoneInfo
     cn = now.astimezone(ZoneInfo("Asia/Shanghai"))
     us = now.astimezone(ZoneInfo("America/New_York"))
     cm = cn.hour * 60 + cn.minute
     um = us.hour * 60 + us.minute
+    cn_open = cn.weekday() < 5 and (
+        9 * 60 + 30 <= cm < 11 * 60 + 30 or 13 * 60 <= cm < 15 * 60
+    )
+    us_extended = us.weekday() < 5 and 4 * 60 <= um < 20 * 60
+    us_rth = us.weekday() < 5 and 9 * 60 + 30 <= um < 16 * 60
     return {
-        "CN": cn.weekday() < 5 and (
-            9 * 60 + 30 <= cm < 11 * 60 + 30 or 13 * 60 <= cm < 15 * 60
-        ),
-        "US": us.weekday() < 5 and 4 * 60 <= um < 20 * 60,
+        "CN": "rth" if cn_open else False,
+        "US": "rth" if us_rth else ("extended" if us_extended else False),
     }
 
 
@@ -228,7 +233,7 @@ def check_live_runtime_health(
     con: sqlite3.Connection,
     *,
     now: datetime,
-    session_open: dict[str, bool],
+    session_open: dict[str, str | bool],
     max_heartbeat_age_seconds: float = 180,
     max_snapshot_age_seconds: float = 180,
 ) -> list[dict]:
@@ -236,8 +241,12 @@ def check_live_runtime_health(
     now = _normalize_utc(now)
     issues: list[dict] = []
     for market in ("US", "CN"):
-        if not session_open.get(market, False):
+        phase = session_open.get(market, False)
+        if not phase:
             continue
+        extended_only = phase == "extended"
+        severity = "warning" if extended_only else "critical"
+        health_status = "degraded" if extended_only else "failed"
         row = None
         if _table_exists(con, "operational_health"):
             row = con.execute(
@@ -251,8 +260,9 @@ def check_live_runtime_health(
         )
         if heartbeat_age > max_heartbeat_age_seconds:
             issues.append({
-                "severity": "critical", "check": "update_prices_heartbeat",
-                "market": market, "age_seconds": heartbeat_age,
+                "severity": severity, "check": "update_prices_heartbeat",
+                "market": market, "session": phase, "status": health_status,
+                "age_seconds": heartbeat_age,
                 "maximum": max_heartbeat_age_seconds,
             })
         snap = None
@@ -267,8 +277,9 @@ def check_live_runtime_health(
         snap_age = (now - snap_at).total_seconds() if snap_at else float("inf")
         if snap_age > max_snapshot_age_seconds:
             issues.append({
-                "severity": "critical", "check": "equity_snapshot_freshness",
-                "market": market, "age_seconds": snap_age,
+                "severity": severity, "check": "equity_snapshot_freshness",
+                "market": market, "session": phase, "status": health_status,
+                "age_seconds": snap_age,
                 "maximum": max_snapshot_age_seconds,
             })
     return issues
@@ -593,6 +604,32 @@ def check_cn_quotes(min_coverage: float = 0.95) -> list[dict]:
     return issues
 
 
+def classify_issue_transitions(
+    previous: dict[str, str], current: list[dict]
+) -> tuple[list[dict], dict[str, str]]:
+    """Classify alert state without turning every health run into red-noise spam."""
+    def key(issue: dict) -> str:
+        scope = issue.get("scope") or issue.get("market") or issue.get("account") or "global"
+        return f"{issue.get('check', 'unknown')}:{scope}"
+
+    state = {key(issue): str(issue.get("severity", "warning")) for issue in current}
+    transitions: list[dict] = []
+    by_key = {key(issue): issue for issue in current}
+    for issue_key, issue in by_key.items():
+        transitions.append({
+            **issue,
+            "issue_key": issue_key,
+            "transition": "continuing" if issue_key in previous else "new",
+        })
+    for issue_key, severity in previous.items():
+        if issue_key not in state:
+            transitions.append({
+                "issue_key": issue_key, "severity": severity,
+                "transition": "recovered", "check": issue_key.split(":", 1)[0],
+            })
+    return transitions, state
+
+
 def parse_backfill_log_events(text: str) -> list[dict]:
     """Parse wrapper and legacy backfill lifecycle lines without filesystem I/O."""
     events: list[dict] = []
@@ -604,6 +641,7 @@ def parse_backfill_log_events(text: str) -> list[dict]:
             item = match.groupdict()
             item["event"] = item["event"].lower()
             item["price_mode"] = item["price_mode"].lower()
+            item["scope"] = (item.get("scope") or "universe").lower()
             item["exit_code"] = int(item["exit_code"]) if item.get("exit_code") else None
             item["timestamp"] = _parse_datetime(item["timestamp"])
             events.append(item)
@@ -614,6 +652,7 @@ def parse_backfill_log_events(text: str) -> list[dict]:
             item.update({
                 "event": "start",
                 "price_mode": (item.get("price_mode") or "adjusted").lower(),
+                "scope": "universe",
                 "exit_code": None,
                 "timestamp": _parse_datetime(item["timestamp"]),
             })
@@ -623,7 +662,7 @@ def parse_backfill_log_events(text: str) -> list[dict]:
         match = _LEGACY_BACKFILL_OK_RE.match(line)
         if match and pending_legacy:
             events.append({
-                **{k: pending_legacy[k] for k in ("market", "interval", "price_mode")},
+                **{k: pending_legacy[k] for k in ("market", "interval", "price_mode", "scope")},
                 "event": "ok",
                 "timestamp": _parse_datetime(match.group("timestamp")),
                 "exit_code": 0,
@@ -641,12 +680,15 @@ def evaluate_backfill_log_events(
 ) -> list[dict]:
     """Classify stale/failed/incomplete backfill lifecycle events."""
     now = _normalize_utc(now)
-    latest: dict[tuple[str, str, str], dict[str, datetime | None]] = {}
+    latest: dict[tuple[str, str, str, str], dict[str, datetime | None]] = {}
     for event in events:
         ts = event.get("timestamp")
         if not isinstance(ts, datetime):
             continue
-        key = (str(event["market"]), str(event["interval"]), str(event["price_mode"]))
+        key = (
+            str(event["market"]), str(event["interval"]),
+            str(event["price_mode"]), str(event.get("scope") or "universe"),
+        )
         state = latest.setdefault(key, {"start": None, "success": None, "failure": None})
         kind = str(event.get("event", "")).lower()
         if kind == "start":
@@ -657,7 +699,7 @@ def evaluate_backfill_log_events(
             state["failure"] = max(ts, state["failure"]) if state["failure"] else ts
 
     issues: list[dict] = []
-    for (market, interval, price_mode), state in sorted(latest.items()):
+    for (market, interval, price_mode, scope), state in sorted(latest.items()):
         start = state["start"]
         success = state["success"]
         failure = state["failure"]
@@ -669,6 +711,7 @@ def evaluate_backfill_log_events(
                 "market": market,
                 "interval": interval,
                 "price_mode": price_mode,
+                "scope": scope,
                 "failure_at": failure.isoformat(),
             })
             continue
@@ -682,6 +725,7 @@ def evaluate_backfill_log_events(
                     "market": market,
                     "interval": interval,
                     "price_mode": price_mode,
+                    "scope": scope,
                     "started_at": start.isoformat(),
                     "age_seconds": round(age, 1),
                 })
@@ -696,6 +740,7 @@ def evaluate_backfill_log_events(
                     "market": market,
                     "interval": interval,
                     "price_mode": price_mode,
+                    "scope": scope,
                     "last_success_at": success.isoformat(),
                     "age_seconds": round(age, 1),
                 })
@@ -791,6 +836,32 @@ def check_backfill_runtime(
     return issues
 
 
+def check_disk_usage(path: Path = PROJECT_ROOT) -> list[dict]:
+    usage = shutil.disk_usage(path)
+    pct = 100.0 * usage.used / usage.total if usage.total else 100.0
+    if pct < 75:
+        return []
+    severity = "critical" if pct >= 90 else ("error" if pct >= 85 else "warning")
+    return [{
+        "severity": severity, "check": "disk_usage", "scope": str(path),
+        "used_pct": round(pct, 2), "thresholds": [75, 85, 90],
+        "free_bytes": usage.free,
+    }]
+
+
+def check_ohlc_quality(con: sqlite3.Connection) -> list[dict]:
+    if not _table_exists(con, "price_quality_issues"):
+        return []
+    rows = con.execute(
+        "SELECT price_mode,interval,issue_type,COUNT(*) n FROM price_quality_issues "
+        "GROUP BY price_mode,interval,issue_type"
+    ).fetchall()
+    return [{
+        "severity": "warning", "check": "ohlc_quarantine", "scope": "research_read",
+        "price_mode": row[0], "interval": row[1], "issue_type": row[2], "count": row[3],
+    } for row in rows]
+
+
 def run_ledger(market: str) -> list[dict]:
     cmd = [sys.executable, str(PROJECT_ROOT / "scripts" / "ledger_watchdog.py"), "--market", market, "--history-days", "0", "--quiet-ok", "--fail-on-critical"]
     proc = subprocess.run(cmd, cwd=PROJECT_ROOT, text=True, capture_output=True, timeout=180)
@@ -820,6 +891,7 @@ def main() -> int:
         issues.extend(check_alpha20(con))
         issues.extend(check_model_factor_freshness(con))
         issues.extend(check_snapshot_diff(con))
+        issues.extend(check_ohlc_quality(con))
         now_runtime = datetime.now(timezone.utc)
         issues.extend(check_live_runtime_health(
             con, now=now_runtime, session_open=_runtime_session_open(now_runtime)
@@ -838,6 +910,7 @@ def main() -> int:
                 universe_by_market={"US": STOCK_UNIVERSE, "CN": CN_UNIVERSE},
                 target_dates=targets,
             ))
+    issues.extend(check_disk_usage())
     if not args.skip_backfill_runtime:
         issues.extend(check_backfill_runtime())
     if not args.skip_quotes:
