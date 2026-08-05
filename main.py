@@ -1354,12 +1354,10 @@ class QuantSystem:
                 "Fast-cycle quote gate blocked %d/%d tickers individually: %s",
                 len(blocked_tickers), len(quote_tickers), ",".join(blocked_tickers[:20]),
             )
-        if not validation["ok"]:
-            raise RuntimeError(
-                f"[{self.market}] fast live execution quote gate failed: "
-                f"missing={validation['missing']} invalid={validation['invalid']} "
-                f"stale={validation['stale']} untradable={validation['untradable']}"
-            )
+        # Invalid/stale/untradable quotes are excluded per ticker. Accounts with
+        # missing held marks are skipped by each cycle and by _save_all_state;
+        # unaffected accounts continue instead of turning one stale symbol into
+        # a market-wide execution outage.
         self._realtime_prices = {
             ticker: price
             for ticker, price in prices_from_quotes(quotes).items()
