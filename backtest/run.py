@@ -25,6 +25,10 @@ def main():
     parser.add_argument("--adaptive", action="store_true", help="强制启用自适应换仓")
     parser.add_argument("--no-adaptive", action="store_true", help="强制关闭自适应换仓")
     parser.add_argument("--no-telegram", action="store_true", help="不发送Telegram")
+    parser.add_argument("--allow-survivorship-biased", action="store_true",
+                        help="仅探索：允许今天的成分股；结果不可用于资本配置")
+    parser.add_argument("--allow-gp-hindsight", action="store_true",
+                        help="仅探索：允许今天保存的GP表达式；结果带hindsight无效标签")
     args = parser.parse_args()
 
     from backtest.engine import BacktestEngine
@@ -39,7 +43,11 @@ def main():
 
     log.info("启动回测引擎 (回测 %d 天, 自适应=%s)...", args.days,
              "开" if adaptive is True else "关" if adaptive is False else "按配置")
-    engine = BacktestEngine(days=args.days, adaptive_rebalance=adaptive)
+    engine = BacktestEngine(
+        days=args.days, adaptive_rebalance=adaptive,
+        allow_survivorship_biased=args.allow_survivorship_biased,
+        allow_gp_hindsight=args.allow_gp_hindsight,
+    )
     results, benchmarks = engine.run()
 
     if not results:

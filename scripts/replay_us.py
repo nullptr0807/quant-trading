@@ -34,7 +34,7 @@ import sqlite3
 import logging
 from pathlib import Path
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, timezone, date
 from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
@@ -44,10 +44,12 @@ if PROJECT_ROOT not in sys.path:
 import numpy as np
 import pandas as pd
 
-from config.settings import FEES, STOCK_UNIVERSE, BENCHMARKS_BY_MARKET, INITIAL_CASH
+from config.settings import STOCK_UNIVERSE, BENCHMARKS_BY_MARKET, INITIAL_CASH
 from factors.alpha_factors import FactorEngine
 from factors.signal import SignalGenerator
 from accounts.strategies import STRATEGIES
+from trading.costs import MoomooAUCosts
+from research.validity import build_research_metadata
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -59,6 +61,10 @@ DB_PATH = os.path.join(PROJECT_ROOT, "data", "trading.db")
 DEFAULT_LABEL = "US_replay"     # market tag — must NOT equal live "US"
 QQQ = "QQQ"
 SPY = "SPY"
+
+
+class ReplayCoverageError(RuntimeError):
+    """Broker-like replay input coverage is incomplete."""
 
 
 # --------------------------------------------------------------------------
@@ -92,22 +98,50 @@ class USAccount:
         return p.shares if p else 0.0
 
 
+def apply_corporate_actions(account: USAccount, actions: list[dict]) -> None:
+    """Apply ex-date share/cash actions before that day's opening auction."""
+    for action in actions:
+        pos = account.positions.get(str(action["ticker"]))
+        if not pos or pos.shares <= 0:
+            continue
+        kind = str(action["action_type"])
+        if kind in {"split", "bonus_or_transfer"}:
+            ratio = float(action.get("ratio") or 0)
+            if ratio <= 0:
+                raise ReplayCoverageError(f"invalid corporate-action ratio: {action}")
+            pos.shares *= ratio
+            pos.avg_cost /= ratio
+            # total_cost is unchanged by a share-count action.
+        elif kind == "cash_dividend":
+            account.cash += pos.shares * float(action.get("cash_per_share") or 0)
+        else:
+            raise ReplayCoverageError(f"unsupported corporate action: {kind}")
+
+
 # --------------------------------------------------------------------------
 # Replay engine
 # --------------------------------------------------------------------------
 class USReplay:
     def __init__(self, conn: sqlite3.Connection, *,
                  label: str, accounts_filter: set[str] | None,
-                 hysteresis_mult: int, decorrelate: bool = True):
+                 hysteresis_mult: int, decorrelate: bool = True,
+                 execution_mode: str = "broker",
+                 universe_validity: dict | None = None):
         self.conn = conn
         self.label = label
         self.accounts_filter = accounts_filter
         self.hysteresis_mult = hysteresis_mult     # 1 = no hysteresis (legacy)
         self.decorrelate = decorrelate
+        self.execution_mode = execution_mode
+        self.universe_validity = universe_validity or {}
         self.universe = list(STOCK_UNIVERSE)
+        self.costs = MoomooAUCosts()
 
         # Pre-load 1d cache
         self.daily: dict[str, pd.DataFrame] = self._load_daily()
+        self.raw_daily: dict[str, pd.DataFrame] = (
+            self._load_daily(table="prices_raw") if execution_mode == "broker" else {}
+        )
         # Pre-build a set of trading dates from QQQ (proxy for "market open")
         self.trading_dates: list[date] = self._build_trading_dates()
 
@@ -140,10 +174,16 @@ class USReplay:
         self.last_rebalance: dict[str, datetime] = {}
 
     # ---- Cache loaders ----------------------------------------------------
-    def _load_daily(self) -> dict[str, pd.DataFrame]:
+    def _load_daily(self, table: str = "prices") -> dict[str, pd.DataFrame]:
+        if not self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone():
+            if table == "prices_raw":
+                return {}
+            raise ReplayCoverageError(f"missing required table {table}")
         df = pd.read_sql_query(
             "SELECT ticker, datetime, open, high, low, close, volume "
-            "FROM prices WHERE interval='1d' "
+            f"FROM {table} WHERE interval='1d' "
             "AND ticker NOT LIKE '%.SH' AND ticker NOT LIKE '%.SZ'",
             self.conn,
         )
@@ -153,7 +193,7 @@ class USReplay:
             gg = g.sort_values("datetime").reset_index(drop=True)
             gg = gg.set_index("datetime")
             out[tk] = gg
-        log.info("Loaded daily 1d for %d US tickers", len(out))
+        log.info("Loaded %s daily 1d for %d US tickers", table, len(out))
         return out
 
     def _build_trading_dates(self) -> list[date]:
@@ -182,11 +222,111 @@ class USReplay:
         """T+1 execution uses the execution day's open, never the signal close."""
         prices = {}
         day = pd.Timestamp(t_date)
-        for tk, full in self.daily.items():
+        execution_mode = getattr(self, "execution_mode", "signal-only")
+        source = self.raw_daily if execution_mode == "broker" else self.daily
+        for tk, full in source.items():
             row = full[full.index == day]
             if not row.empty:
                 prices[tk] = float(row["open"].iloc[0])
+        configured_universe = getattr(self, "universe", None)
+        if getattr(self, "universe_validity", {}).get("mode") == "point_in_time":
+            expected_scope = {
+                row[0] for row in self.conn.execute(
+                    "SELECT ticker FROM universe_membership WHERE market='US' AND date=?",
+                    (t_date.isoformat(),),
+                ).fetchall()
+            } | {QQQ, SPY}
+        else:
+            expected_scope = (
+                set(configured_universe) | {QQQ, SPY}
+                if configured_universe is not None else set(self.daily)
+            )
+        expected = {
+            tk for tk, full in self.daily.items()
+            if tk in expected_scope and not full[full.index == day].empty
+        }
+        missing = sorted(expected - set(prices))
+        if execution_mode == "broker" and missing:
+            raise ReplayCoverageError(
+                f"missing raw execution price on {t_date}: {missing[:10]}"
+            )
         return prices
+
+    def _actions_for_date(self, t_date: date) -> list[dict]:
+        if self.execution_mode != "broker":
+            return []
+        rows = self.conn.execute(
+            "SELECT ticker,action_type,ratio,cash_per_share FROM corporate_actions "
+            "WHERE market='US' AND ex_date=? ORDER BY ticker,action_type",
+            (t_date.isoformat(),),
+        ).fetchall()
+        return [dict(zip(("ticker", "action_type", "ratio", "cash_per_share"), row)) for row in rows]
+
+    def _ensure_broker_coverage(self, dates: list[date]) -> None:
+        if self.execution_mode != "broker":
+            return
+        if not self.raw_daily:
+            raise ReplayCoverageError("raw execution price table has no US daily data")
+        for t_date in dates:
+            day = pd.Timestamp(t_date)
+            if self.universe_validity.get("mode") == "point_in_time":
+                scope = {
+                    row[0] for row in self.conn.execute(
+                        "SELECT ticker FROM universe_membership WHERE market='US' AND date=?",
+                        (t_date.isoformat(),),
+                    ).fetchall()
+                } | {QQQ, SPY}
+            else:
+                scope = set(self.universe) | {QQQ, SPY}
+            expected = {
+                ticker for ticker in scope
+                if ticker in self.daily
+                and not self.daily[ticker][self.daily[ticker].index == day].empty
+            }
+            available = {
+                ticker for ticker in expected
+                if ticker in self.raw_daily
+                and not self.raw_daily[ticker][self.raw_daily[ticker].index == day].empty
+            }
+            missing_raw = sorted(expected - available)
+            if missing_raw:
+                raise ReplayCoverageError(
+                    f"missing raw execution price on {t_date}: {missing_raw[:10]}"
+                )
+        required_tables = {"corporate_actions", "corporate_action_coverage"}
+        found = {
+            row[0] for row in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if not required_tables <= found:
+            raise ReplayCoverageError(
+                "corporate-action coverage unavailable; required tables: "
+                + ", ".join(sorted(required_tables - found))
+            )
+        start, end = dates[0].isoformat(), dates[-1].isoformat()
+        covered = {
+            row[0] for row in self.conn.execute(
+                "SELECT ticker FROM corporate_action_coverage WHERE market='US' "
+                "AND status='complete' AND start_date<=? AND end_date>=?",
+                (start, end),
+            ).fetchall()
+        }
+        if self.universe_validity.get("mode") == "point_in_time":
+            required = {
+                row[0] for row in self.conn.execute(
+                    "SELECT DISTINCT ticker FROM universe_membership "
+                    "WHERE market='US' AND date BETWEEN ? AND ?",
+                    (start, end),
+                ).fetchall()
+            } | {QQQ, SPY}
+        else:
+            required = set(self.universe) | {QQQ, SPY}
+        missing = sorted(required - covered)
+        if missing:
+            raise ReplayCoverageError(
+                f"corporate-action coverage incomplete for {len(missing)} ticker(s): {missing[:10]}"
+            )
 
     # ---- DB writers -------------------------------------------------------
     def _t_to_iso(self, t_date: date) -> str:
@@ -200,7 +340,8 @@ class USReplay:
             "INSERT INTO trades (account,ticker,side,shares,price,cost,slippage,timestamp,market) "
             "VALUES (?,?,?,?,?,?,?,?,?)",
             (acct, ticker, side, shares, price,
-             fees["total"], fees.get("slippage", 0.0), ts, self.label),
+             fees.get("total_fees", fees.get("total", 0.0)),
+             fees.get("slippage", 0.0), ts, self.label),
         )
         self.trade_count += 1
         self.churn_stats.setdefault(acct, []).append(f"{ticker}:{side}")
@@ -235,23 +376,25 @@ class USReplay:
             qty = math.floor(desired_shares)
             if qty < 1:
                 return False
-            fees = FEES.calc_fees(shares=qty, price=price, is_sell=False)
-            cost_total = qty * price + fees["total"]
+            fees = self.costs.calculate("buy", qty, price)
+            exec_price = fees["exec_price"]
+            cost_total = qty * exec_price + fees["total_fees"]
             if cost_total > acct.cash + 1e-6:
                 new_qty = math.floor(acct.cash * 0.999 / price)
                 if new_qty < 1:
                     return False
                 qty = new_qty
-                fees = FEES.calc_fees(shares=qty, price=price, is_sell=False)
-                cost_total = qty * price + fees["total"]
+                fees = self.costs.calculate("buy", qty, price)
+                exec_price = fees["exec_price"]
+                cost_total = qty * exec_price + fees["total_fees"]
             acct.cash -= cost_total
             p = acct.positions.setdefault(ticker, USPos())
-            new_total_cost = p.total_cost + qty * price + fees["total"]
+            new_total_cost = p.total_cost + qty * exec_price + fees["total_fees"]
             new_shares = p.shares + qty
             p.shares = new_shares
             p.total_cost = new_total_cost
             p.avg_cost = new_total_cost / new_shares if new_shares else 0.0
-            self._write_trade(acct.id, ticker, "buy", qty, price, fees, t_date)
+            self._write_trade(acct.id, ticker, "buy", qty, exec_price, fees, t_date)
             return True
 
         else:  # sell
@@ -261,8 +404,9 @@ class USReplay:
             qty = min(desired_shares, p.shares)
             if qty <= 0:
                 return False
-            fees = FEES.calc_fees(shares=qty, price=price, is_sell=True)
-            proceeds = qty * price - fees["total"]
+            fees = self.costs.calculate("sell", qty, price)
+            exec_price = fees["exec_price"]
+            proceeds = qty * exec_price - fees["total_fees"]
             acct.cash += proceeds
             cost_removed = p.avg_cost * qty
             p.shares -= qty
@@ -271,7 +415,7 @@ class USReplay:
                 p.shares = 0.0
                 p.avg_cost = 0.0
                 p.total_cost = 0.0
-            self._write_trade(acct.id, ticker, "sell", qty, price, fees, t_date)
+            self._write_trade(acct.id, ticker, "sell", qty, exec_price, fees, t_date)
             return True
 
     # ---- Per-account A-group trading logic --------------------------------
@@ -284,7 +428,7 @@ class USReplay:
         placeholders = ",".join(["?"] * len(factor_names))
         df = pd.read_sql_query(
             f"""
-            SELECT ticker, factor_name, value
+            SELECT ticker, factor_name, value, date
             FROM factor_values
             WHERE factor_name IN ({placeholders})
               AND date = (
@@ -299,6 +443,15 @@ class USReplay:
         )
         if df.empty:
             return {}
+        if self.universe_validity.get("mode") == "point_in_time":
+            pairs = {
+                (row[0], row[1]) for row in self.conn.execute(
+                    "SELECT date,ticker FROM universe_membership WHERE market='US' AND date<?",
+                    (t_date.isoformat(),),
+                ).fetchall()
+            }
+            df = df[df.apply(lambda row: (str(row["date"]), row["ticker"]) in pairs, axis=1)]
+        df = df.drop(columns=["date"])
         wide = df.pivot(index="ticker", columns="factor_name", values="value")
         out = {}
         for tkr, row in wide.iterrows():
@@ -371,6 +524,7 @@ class USReplay:
             raise SystemExit(f"No trading days in [{start_date}, {end_date}]")
         log.info("Replay window: %s … %s (%d trading days)",
                  dates[0], dates[-1], len(dates))
+        self._ensure_broker_coverage(dates)
 
         # Wipe prior rows for this label
         log.info("Wiping prior label=%r rows…", self.label)
@@ -382,6 +536,9 @@ class USReplay:
 
         first_date = dates[0]
         for i, t_date in enumerate(dates):
+            actions = self._actions_for_date(t_date)
+            for account in self.accounts.values():
+                apply_corporate_actions(account, actions)
             history = self._slice_history(t_date)
             if not history:
                 continue
@@ -420,6 +577,29 @@ class USReplay:
             if (i + 1) % 5 == 0 or i == len(dates) - 1:
                 log.info("[%d/%d] %s — trades=%d", i+1, len(dates), t_date, self.trade_count)
 
+        warnings = []
+        if self.execution_mode == "signal-only":
+            warnings.append(
+                "Signal-only replay executes on adjusted prices; not broker-like and not valid for capital allocation."
+            )
+        self.result_metadata = build_research_metadata(
+            universe=self.universe_validity,
+            signal_price_mode="adjusted",
+            execution_price_mode="raw" if self.execution_mode == "broker" else "adjusted",
+            model_provenance={"kind": "alpha158_persisted_factors", "capital_allocation_valid": True},
+            look_ahead_validity="valid",
+            warnings=warnings,
+        )
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS research_result_metadata ("
+            "label TEXT PRIMARY KEY, created_at TEXT NOT NULL, metadata_json TEXT NOT NULL)"
+        )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO research_result_metadata VALUES (?,?,?)",
+            (self.label, datetime.now(UTC).isoformat(), json.dumps(self.result_metadata, sort_keys=True)),
+        )
+        self.conn.commit()
+
 
 # --------------------------------------------------------------------------
 def main():
@@ -438,6 +618,11 @@ def main():
                     help="Disable PCA whitening (legacy V1 plain rank-mean composite).")
     ap.add_argument("--allow-survivorship-biased", action="store_true",
                     help="Exploratory only: use today's universe and mark output invalid for capital allocation")
+    ap.add_argument(
+        "--execution-mode", choices=["broker", "signal-only"], default="broker",
+        help=("broker (default): adjusted signals + raw opens + complete corporate actions; "
+              "fails closed on coverage gaps. signal-only: adjusted prices throughout, research-only."),
+    )
     args = ap.parse_args()
 
     if args.label == "US":
@@ -461,8 +646,11 @@ def main():
                       label=args.label,
                       accounts_filter=accounts,
                       hysteresis_mult=args.hysteresis,
-                      decorrelate=args.decorrelate)
+                      decorrelate=args.decorrelate,
+                      execution_mode=args.execution_mode,
+                      universe_validity=validity)
     replay.run(start, end)
+    print("RESULT_METADATA", json.dumps(replay.result_metadata, ensure_ascii=False))
 
     log.info("=== Replay complete ===")
     log.info("Total trades: %d", replay.trade_count)

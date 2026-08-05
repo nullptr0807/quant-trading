@@ -65,6 +65,10 @@ class CheckpointMissingError(FileNotFoundError):
     """No checkpoint exists for (model_id, date, market)."""
 
 
+class CheckpointCoverageError(RuntimeError):
+    """Checkpoint series is incomplete or lacks point-in-time semantics."""
+
+
 def _checkpoint_dir(market: str, model_id: str) -> Path:
     return CHECKPOINT_ROOT / market.upper() / model_id
 
@@ -202,6 +206,10 @@ def save_checkpoint(spec, model, dataset, pred, market: str = "US",
         "pkl_bytes": pkl_size,
         "elapsed_s": elapsed_s,
         "train_window": train_window,
+        "processor_fit_end": (
+            str((train_window or {}).get("train", [None, None])[-1])[:10]
+            if (train_window or {}).get("train") else None
+        ),
         "self_test": self_test,
         "versions": _versions_snapshot(),
         "extra": extra_meta or {},
@@ -233,10 +241,16 @@ def load_checkpoint(model_id: str, date: str, market: str = "US",
 
     payload = joblib.load(pkl_path)
 
-    if verify and json_path.exists():
+    if verify:
+        if not json_path.exists():
+            raise CheckpointCoverageError(f"missing checkpoint sidecar at {json_path}")
         try:
             meta = json.loads(json_path.read_text())
             st = meta.get("self_test")
+            if not st or st.get("expected_score") is None:
+                raise CheckpointCoverageError(
+                    f"checkpoint {market}/{model_id}/{date} has no score self-test"
+                )
             if st and st.get("expected_score") is not None:
                 # Re-predict on the bundled dataset and grab first row
                 pred = payload["model"].predict(payload["dataset"])
@@ -251,12 +265,135 @@ def load_checkpoint(model_id: str, date: str, market: str = "US",
                         f"actual={actual:.6g} drift={actual-expected:.3g} "
                         f"tol={tol:.3g}"
                     )
-        except CheckpointDriftError:
+        except (CheckpointDriftError, CheckpointCoverageError):
             raise
         except Exception as e:
-            log.warning("[%s/%s] verify skipped: %s", market, model_id, e)
+            raise CheckpointCoverageError(
+                f"checkpoint verification failed for {market}/{model_id}/{date}: {e}"
+            ) from e
 
     return payload
+
+
+def _checkpoint_meta(model_id: str, date: str, market: str) -> dict:
+    _, json_path = _checkpoint_paths(market, model_id, date)
+    if not json_path.exists():
+        raise CheckpointCoverageError(f"missing checkpoint sidecar at {json_path}")
+    try:
+        return json.loads(json_path.read_text())
+    except Exception as exc:
+        raise CheckpointCoverageError(f"invalid checkpoint sidecar at {json_path}") from exc
+
+
+def _validate_pit_semantics(meta: dict, payload: dict, market: str) -> None:
+    checkpoint_date = str(meta.get("date", ""))[:10]
+    train_window = meta.get("train_window") or {}
+    train_segment = train_window.get("train") or []
+    if len(train_segment) < 2 or str(train_segment[-1])[:10] > checkpoint_date:
+        raise CheckpointCoverageError(
+            f"checkpoint train window is not bounded by as-of date {checkpoint_date}"
+        )
+    processor_fit_end = str(meta.get("processor_fit_end") or "")[:10]
+    if not processor_fit_end or processor_fit_end > checkpoint_date:
+        raise CheckpointCoverageError(
+            "checkpoint does not prove processors were fitted by its as-of date"
+        )
+    if "dataset" not in payload or "model" not in payload:
+        raise CheckpointCoverageError("checkpoint lacks frozen model/processor dataset")
+    # A frozen model/processor is necessary but not sufficient: the checkpoint
+    # must also prove that its instrument universe was point-in-time. Current
+    # Russell membership cannot be presented as capital-allocation-valid for
+    # either market.
+    if not (meta.get("extra") or {}).get("point_in_time_complete", False):
+        raise CheckpointCoverageError(
+            f"{market.upper()} checkpoint lacks point-in-time universe semantics"
+        )
+
+
+def require_checkpoint_coverage(
+    model_ids: list[str], signal_dates: list[str], *, market: str = "US"
+) -> dict:
+    """Require an exact checkpoint for every model/date; never forward-fill."""
+    market = market.upper()
+    requested = sorted({str(day)[:10] for day in signal_dates})
+    if not requested:
+        raise CheckpointCoverageError("no checkpoint dates requested")
+    available_by_model: dict[str, set[str]] = {}
+    missing: list[str] = []
+    for model_id in model_ids:
+        base = _checkpoint_dir(market, model_id)
+        available = {
+            path.stem for path in base.glob("*.pkl")
+            if (base / f"{path.stem}.json").exists()
+        } if base.exists() else set()
+        available_by_model[model_id] = available
+        missing.extend(
+            f"{model_id}/{day}" for day in requested if day not in available
+        )
+    if missing:
+        raise CheckpointCoverageError(
+            "missing checkpoint coverage: " + ", ".join(missing[:20])
+        )
+    common = set.intersection(*available_by_model.values()) if available_by_model else set()
+    if not common:
+        raise CheckpointCoverageError("models have no common full-coverage date")
+    return {
+        "market": market,
+        "models": list(model_ids),
+        "first_full_coverage_date": min(common),
+        "last_full_coverage_date": max(common),
+        "requested_dates": requested,
+        "complete": True,
+    }
+
+
+def predict_checkpoint_scores(
+    model_id: str,
+    *,
+    as_of: str,
+    execution_date: str,
+    market: str = "US",
+) -> tuple[dict[str, float], dict]:
+    """Load the exact T checkpoint and score T for execution strictly after T."""
+    as_of = str(as_of)[:10]
+    execution_date = str(execution_date)[:10]
+    if execution_date <= as_of:
+        raise CheckpointCoverageError(
+            f"execution_date={execution_date} must be after checkpoint as_of={as_of}"
+        )
+    require_checkpoint_coverage([model_id], [as_of], market=market)
+    payload = load_checkpoint(model_id, as_of, market=market, verify=True)
+    meta = _checkpoint_meta(model_id, as_of, market)
+    _validate_pit_semantics(meta, payload, market)
+    pred = payload["model"].predict(payload["dataset"])
+    if hasattr(pred, "to_frame"):
+        pred = pred.to_frame("score")
+    if not hasattr(pred, "index"):
+        raise CheckpointCoverageError("checkpoint prediction has no dated index")
+    import pandas as pd
+    if isinstance(pred.index, pd.MultiIndex):
+        dates = pd.to_datetime(pred.index.get_level_values(0)).strftime("%Y-%m-%d")
+        day_pred = pred.loc[dates == as_of]
+        instruments = day_pred.index.get_level_values(-1)
+    else:
+        dates = pd.to_datetime(pred.index).strftime("%Y-%m-%d")
+        day_pred = pred.loc[dates == as_of]
+        instruments = day_pred.index
+    if day_pred.empty:
+        raise CheckpointCoverageError(
+            f"checkpoint {model_id}/{as_of} contains no scores for its as-of date"
+        )
+    values = day_pred.iloc[:, 0]
+    scores = {str(ticker): float(score) for ticker, score in zip(instruments, values)}
+    provenance = {
+        "kind": "qlib_daily_checkpoint",
+        "model_id": model_id,
+        "market": market.upper(),
+        "checkpoint_date": as_of,
+        "execution_date": execution_date,
+        "capital_allocation_valid": True,
+    }
+    return scores, provenance
 
 
 def list_checkpoints(model_id: str, market: str = "US") -> list[dict]:
@@ -300,12 +437,24 @@ def coverage_summary(market: str = "US") -> dict:
 # ─── CLI ────────────────────────────────────────────────────────────────────
 
 def _main():
-    """Dump coverage summary as JSON. Useful for dashboard/cron health-check."""
+    """Inspect coverage or replay one exact daily checkpoint without retraining."""
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--market", default="US", choices=["US", "CN"])
+    p.add_argument("--model", help="model id for exact checkpoint replay, e.g. Q01")
+    p.add_argument("--as-of", help="checkpoint/signal date (YYYY-MM-DD; exact, no fallback)")
+    p.add_argument("--execution-date", help="strictly later executable date")
     args = p.parse_args()
-    print(json.dumps(coverage_summary(args.market), indent=2))
+    if any((args.model, args.as_of, args.execution_date)):
+        if not all((args.model, args.as_of, args.execution_date)):
+            p.error("--model, --as-of and --execution-date are required together")
+        scores, provenance = predict_checkpoint_scores(
+            args.model, as_of=args.as_of, execution_date=args.execution_date,
+            market=args.market,
+        )
+        print(json.dumps({"scores": scores, "provenance": provenance}, indent=2))
+    else:
+        print(json.dumps(coverage_summary(args.market), indent=2))
 
 
 if __name__ == "__main__":

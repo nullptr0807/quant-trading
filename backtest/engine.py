@@ -7,6 +7,7 @@ import os
 import sys
 import json
 import logging
+import sqlite3
 from datetime import datetime, timezone
 from dataclasses import dataclass
 
@@ -28,6 +29,7 @@ from trading.costs import MoomooAUCosts
 from accounts.strategies import STRATEGIES
 from accounts.gp_strategies import active_gp_strategies_for_market
 from config.settings import ADAPTIVE_REBALANCE
+from research.validity import build_research_metadata, ensure_gp_provenance, ensure_point_in_time_universe
 
 log = logging.getLogger("backtest")
 
@@ -91,6 +93,7 @@ class BacktestResult:
     beta_vs_spy: float = 0.0
     info_ratio_qqq: float = 0.0  # 年化信息比率
     info_ratio_spy: float = 0.0
+    metadata: dict | None = None
 
 
 @dataclass
@@ -109,7 +112,9 @@ class BacktestEngine:
     """逐日回测引擎，模拟20个账户过去N天的表现。"""
 
     def __init__(self, days: int = 30, initial_cash: float = 10000.0,
-                 adaptive_rebalance: bool | None = None):
+                 adaptive_rebalance: bool | None = None,
+                 allow_survivorship_biased: bool = False,
+                 allow_gp_hindsight: bool = False):
         """
         Args:
             days: 回测天数
@@ -120,6 +125,10 @@ class BacktestEngine:
         """
         self.days = days
         self.initial_cash = initial_cash
+        self.allow_survivorship_biased = allow_survivorship_biased
+        self.allow_gp_hindsight = allow_gp_hindsight
+        self.validity: dict = {}
+        self._pit_cache: dict[str, set[str]] = {}
         if adaptive_rebalance is None:
             self.adaptive = ADAPTIVE_REBALANCE.get("enabled", False)
         else:
@@ -135,6 +144,28 @@ class BacktestEngine:
     def run(self) -> tuple[list[BacktestResult], list[BenchmarkResult]]:
         """运行完整回测，返回 (账户结果, 基准结果)。"""
         log.info("开始回测: 获取 %d 天历史数据...", self.days)
+
+        # Gate against the dates already present in the cache before the fetcher
+        # can make network/cache writes. Re-check the exact simulation window
+        # below after loading.
+        with sqlite3.connect(self.fetcher.store.db_path) as conn:
+            cached_dates = [
+                row[0] for row in conn.execute(
+                    "SELECT DISTINCT substr(datetime,1,10) AS d FROM prices "
+                    "WHERE interval='1d' AND ticker NOT LIKE '%.SH' "
+                    "AND ticker NOT LIKE '%.SZ' AND ticker NOT LIKE '%.BJ' "
+                    "ORDER BY d DESC LIMIT ?",
+                    (self.days,),
+                ).fetchall()
+            ] if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='prices'"
+            ).fetchone() else []
+            pre_start = min(cached_dates) if cached_dates else "0001-01-01"
+            pre_end = max(cached_dates) if cached_dates else "0001-01-01"
+            ensure_point_in_time_universe(
+                conn, market="US", start_date=pre_start, end_date=pre_end,
+                allow_survivorship_biased=self.allow_survivorship_biased,
+            )
 
         # Fetch extra days for factor warm-up (need ~30 extra for rolling windows)
         raw_df = self.fetcher.get_historical(STOCK_UNIVERSE, days=self.days + 40)
@@ -163,6 +194,16 @@ class BacktestEngine:
         log.info("回测区间: %s 至 %s (%d 交易日)",
                  sim_dates[0], sim_dates[-1], len(sim_dates))
 
+        with sqlite3.connect(self.fetcher.store.db_path) as conn:
+            self.validity = ensure_point_in_time_universe(
+                conn, market="US", start_date=str(sim_dates[0])[:10],
+                end_date=str(sim_dates[-1])[:10],
+                allow_survivorship_biased=self.allow_survivorship_biased,
+            )
+        gp_provenance = ensure_gp_provenance(
+            "current_saved_expression", allow_hindsight=self.allow_gp_hindsight
+        )
+
         # Create trading engines for each account
         costs = MoomooAUCosts()
         results = []
@@ -189,6 +230,12 @@ class BacktestEngine:
         # Run B accounts
         for gp_strat in active_gp_strategies_for_market("US"):
             result = self._backtest_gp_account(gp_strat, all_data, sim_dates, costs)
+            result.metadata = build_research_metadata(
+                universe=self.validity, signal_price_mode="adjusted",
+                execution_price_mode="adjusted", model_provenance=gp_provenance,
+                look_ahead_validity=gp_provenance["look_ahead_validity"],
+                warnings=[gp_provenance["warning"]],
+            )
             results.append(result)
 
         # Fetch benchmarks (QQQ, SPY) and compute alpha/beta vs each account
@@ -197,6 +244,21 @@ class BacktestEngine:
             self._attach_alpha_metrics(results, benchmarks)
 
         return results, benchmarks
+
+    def _members_for_date(self, value) -> set[str] | None:
+        """Exact-date PIT members; None only under the explicit biased override."""
+        if self.validity.get("mode") != "point_in_time":
+            return None
+        day = str(value)[:10]
+        if day not in self._pit_cache:
+            with sqlite3.connect(self.fetcher.store.db_path) as conn:
+                self._pit_cache[day] = {
+                    row[0] for row in conn.execute(
+                        "SELECT ticker FROM universe_membership WHERE market='US' AND date=?",
+                        (day,),
+                    ).fetchall()
+                }
+        return self._pit_cache[day]
 
     def _build_benchmarks(self, sim_dates) -> list[BenchmarkResult]:
         """拉取 QQQ/SPY 并归一化到 initial_cash 得到基准权益曲线。"""
@@ -325,10 +387,13 @@ class BacktestEngine:
         # T close forms the signal; the order can only fill at T+1 open.
         # Keeping signal and execution on the same close is explicit look-ahead.
         for i, date in enumerate(sim_dates):
+            members = self._members_for_date(date)
             # Get data strictly before this date for factor computation
             data_to_date = {}
             current_prices = {}
             for ticker, df in all_data.items():
+                if members is not None and ticker not in members:
+                    continue
                 mask = df.index < date
                 sub = df.loc[mask]
                 today = df.loc[df.index == date]
@@ -378,7 +443,17 @@ class BacktestEngine:
             equity = acct.get_equity(current_prices)
             equity_curve.append((str(date), equity))
 
-        return self._build_result(strat.id, strat.name, "Alpha158", acct, equity_curve, sim_dates, all_data)
+        result = self._build_result(strat.id, strat.name, "Alpha158", acct, equity_curve, sim_dates, all_data)
+        warnings = [] if self.validity.get("mode") == "point_in_time" else [
+            "Survivorship-biased current universe; research-only."
+        ]
+        result.metadata = build_research_metadata(
+            universe=self.validity, signal_price_mode="adjusted",
+            execution_price_mode="adjusted",
+            model_provenance={"kind": "alpha158_recomputed", "capital_allocation_valid": True},
+            look_ahead_validity="valid", warnings=warnings,
+        )
+        return result
 
     def _backtest_gp_account(self, gp_strat, all_data, sim_dates, costs) -> BacktestResult:
         """回测单个GP进化账户。"""
@@ -405,10 +480,13 @@ class BacktestEngine:
             )
 
         for i, date in enumerate(sim_dates):
+            members = self._members_for_date(date)
             # GP signal uses bars through T-1 and fills at T open.
             data_to_date = {}
             current_prices = {}
             for ticker, df in all_data.items():
+                if members is not None and ticker not in members:
+                    continue
                 mask = df.index < date
                 sub = df.loc[mask]
                 today = df.loc[df.index == date]

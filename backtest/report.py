@@ -56,6 +56,12 @@ def generate_report(results, days: int = 30, benchmarks=None) -> tuple[str, str 
         f"生成时间: {now.strftime('%Y-%m-%d %H:%M UTC')}",
         "=" * 40,
     ]
+    invalid = [r for r in results if not (r.metadata or {}).get("capital_allocation_valid", False)]
+    if invalid:
+        lines.extend([
+            "⚠️ RESEARCH-ONLY / 不可用于资本配置",
+            f"{len(invalid)}/{len(results)} 个结果未通过时间安全/执行价格有效性门禁。",
+        ])
 
     # 基准概览
     if benchmarks:

@@ -6,6 +6,8 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import argparse
+import sqlite3
 
 from config.settings import STOCK_UNIVERSE
 from data.fetcher import DataFetcher
@@ -14,6 +16,7 @@ from factors.gp_signal import GPSignalGenerator
 from trading.engine import TradingEngine
 from trading.costs import MoomooAUCosts
 from accounts.gp_strategies import GP_STRATEGIES
+from research.validity import build_research_metadata, ensure_gp_provenance, ensure_point_in_time_universe
 
 
 def get_adaptive_rebalance_hours(returns_5d, sigma_ref, base_hours=36, min_h=12, max_h=96):
@@ -28,7 +31,8 @@ def get_adaptive_rebalance_hours(returns_5d, sigma_ref, base_hours=36, min_h=12,
     return max(min_h, min(max_h, hours))
 
 
-def run_b08_backtest(adaptive=False, days=30):
+def run_b08_backtest(adaptive=False, days=30, *, allow_survivorship_biased=False,
+                     allow_gp_hindsight=False):
     """Run B08 backtest with fixed or adaptive rebalancing."""
     gp_strat = [s for s in GP_STRATEGIES if s.id == 'B08'][0]
     costs = MoomooAUCosts()
@@ -43,6 +47,15 @@ def run_b08_backtest(adaptive=False, days=30):
 
     sorted_dates = sorted(set(d for df in all_data.values() for d in df.index.tolist()))
     sim_dates = sorted_dates[-days:]
+    with sqlite3.connect(fetcher.store.db_path) as conn:
+        universe_validity = ensure_point_in_time_universe(
+            conn, market="US", start_date=str(sim_dates[0])[:10],
+            end_date=str(sim_dates[-1])[:10],
+            allow_survivorship_biased=allow_survivorship_biased,
+        )
+    gp_provenance = ensure_gp_provenance(
+        "current_saved_expression", allow_hindsight=allow_gp_hindsight
+    )
 
     # 计算参考波动率 (用sim前60天数据)
     # 用SPY近似市场，或用全股票平均收益率
@@ -205,19 +218,39 @@ def run_b08_backtest(adaptive=False, days=30):
         'trades': trade_count,
         'rebalance_log': rebalance_log,
         'sigma_ref': sigma_ref,
+        'metadata': build_research_metadata(
+            universe=universe_validity, signal_price_mode="adjusted",
+            execution_price_mode="adjusted", model_provenance=gp_provenance,
+            look_ahead_validity="invalid_hindsight",
+            warnings=[gp_provenance["warning"]],
+        ),
     }
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Legacy B08 adaptive GP comparison")
+    parser.add_argument("--allow-survivorship-biased", action="store_true",
+                        help="research-only current-universe override")
+    parser.add_argument("--allow-gp-hindsight", action="store_true",
+                        help="research-only current-expression override")
+    args = parser.parse_args()
     print("=" * 60)
     print("B08 自适应换仓 vs 固定换仓 对比回测")
     print("=" * 60)
 
     print("\n⏳ 运行固定换仓 (36h)...")
-    fixed = run_b08_backtest(adaptive=False, days=30)
+    fixed = run_b08_backtest(
+        adaptive=False, days=30,
+        allow_survivorship_biased=args.allow_survivorship_biased,
+        allow_gp_hindsight=args.allow_gp_hindsight,
+    )
 
     print("⏳ 运行自适应换仓...")
-    adaptive = run_b08_backtest(adaptive=True, days=30)
+    adaptive = run_b08_backtest(
+        adaptive=True, days=30,
+        allow_survivorship_biased=args.allow_survivorship_biased,
+        allow_gp_hindsight=args.allow_gp_hindsight,
+    )
 
     print(f"\n参考波动率 σ_ref = {adaptive['sigma_ref']:.4f}")
 
