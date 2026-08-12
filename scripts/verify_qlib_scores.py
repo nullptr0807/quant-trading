@@ -22,7 +22,12 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _checkpoint_probe(model: str, target: str, market: str) -> subprocess.CompletedProcess:
+def _checkpoint_probe(
+    model: str, target: str, market: str, checkpoint_root: Path | None = None,
+) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    if checkpoint_root is not None:
+        env['QLIB_CHECKPOINT_ROOT'] = str(Path(checkpoint_root).resolve())
     return subprocess.run(
         [
             sys.executable, '-c',
@@ -31,7 +36,7 @@ def _checkpoint_probe(model: str, target: str, market: str) -> subprocess.Comple
             model, target, market,
         ],
         cwd=Path(__file__).resolve().parents[1],
-        capture_output=True, text=True, timeout=600,
+        env=env, capture_output=True, text=True, timeout=600,
     )
 
 
@@ -86,7 +91,7 @@ def verify(db_path: str, market: str, min_coverage: float = 0.80, model_ids=None
                         )
                     if not pkl.exists() or pkl.stat().st_size <= 0:
                         raise RuntimeError('checkpoint payload missing or empty')
-                    probe = _checkpoint_probe(model, target, market)
+                    probe = _checkpoint_probe(model, target, market, CHECKPOINT_ROOT)
                     if probe.returncode != 0:
                         raise RuntimeError((probe.stdout + probe.stderr)[-1500:])
                     checkpoint_status[model] = 'verified'
@@ -120,7 +125,7 @@ def write_publication_marker(result: dict) -> Path:
         pkl=CHECKPOINT_ROOT/market/model/f'{date}.pkl'
         sidecar=CHECKPOINT_ROOT/market/model/f'{date}.json'
         pre={'pkl':_sha256(pkl),'json':_sha256(sidecar)}
-        probe=_checkpoint_probe(model,date,market)
+        probe=_checkpoint_probe(model,date,market,CHECKPOINT_ROOT)
         if probe.returncode!=0:
             raise RuntimeError(
                 f'publication marker refused unverified {market}/{model}/{date}: '

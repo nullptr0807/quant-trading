@@ -30,5 +30,13 @@ PYTHON=/home/gexin/quant-trading/venv/bin/python
 # the flock; the next cron tick can retry.
 TIMEOUT_SECONDS=${QUANT_UPDATE_TIMEOUT_SECONDS:-110}
 ROOT=${QUANT_PROJECT_ROOT:-/home/gexin/quant-trading}
+# During a controlled execution freeze, keep quotes/equity/risk observability
+# alive without allowing protective sells.  Production normally defaults to
+# live; crontab must opt into no-trades explicitly while the freeze is active.
+UPDATE_MODE=${QUANT_UPDATE_MODE:-live}
+case "$UPDATE_MODE" in
+    live|no-trades) ;;
+    *) echo "invalid QUANT_UPDATE_MODE: $UPDATE_MODE (expected live|no-trades)" >&2; exit 2 ;;
+esac
 exec bash "$ROOT/scripts/run_scheduled_job.sh" update_prices ALL /tmp/quant_run_cycle.lock 8 "$TIMEOUT_SECONDS" \
-    "$ROOT/logs/update_prices.log" -- "$PYTHON" -m scripts.update_prices --live
+    "$ROOT/logs/update_prices.log" -- "$PYTHON" -m scripts.update_prices "--$UPDATE_MODE"

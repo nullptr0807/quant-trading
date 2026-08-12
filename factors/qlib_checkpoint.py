@@ -49,7 +49,12 @@ from typing import Any, Optional
 log = logging.getLogger("qlib_checkpoint")
 
 PROJECT_ROOT = Path(os.path.expanduser("~/quant-trading"))
-CHECKPOINT_ROOT = PROJECT_ROOT / "data" / "qlib_checkpoints"
+# The verifier probes checkpoints in a fresh Python process.  An explicit root
+# keeps that process bound to the exact artifact tree selected by its caller
+# (and prevents tests/sandboxes from silently probing production checkpoints).
+CHECKPOINT_ROOT = Path(
+    os.environ.get("QLIB_CHECKPOINT_ROOT", PROJECT_ROOT / "data" / "qlib_checkpoints")
+)
 
 DRIFT_TOLERANCE = 1e-4   # max abs diff between expected_score and re-run score
 

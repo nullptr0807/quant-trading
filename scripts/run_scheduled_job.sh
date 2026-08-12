@@ -8,7 +8,7 @@ ROOT=${QUANT_PROJECT_ROOT:-/home/gexin/quant-trading}
 PYTHON=${QUANT_PYTHON:-$ROOT/venv/bin/python}
 mkdir -p "$(dirname "$LOG")"
 SCHEDULED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-record() { "$PYTHON" "$ROOT/scripts/record_operational_health.py" --component "$COMPONENT" --market "$MARKET" --scheduled-at "$SCHEDULED" "$@" >>"$LOG" 2>&1 || echo "scheduler health write failed component=$COMPONENT" >>"$LOG"; }
+record() { "$PYTHON" "$ROOT/scripts/record_operational_health.py" --db "$ROOT/data/trading.db" --component "$COMPONENT" --market "$MARKET" --scheduled-at "$SCHEDULED" "$@" >>"$LOG" 2>&1 || echo "scheduler health write failed component=$COMPONENT" >>"$LOG"; }
 alert() {
   local text=$1 result="disabled"
   if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then

@@ -24,6 +24,14 @@ ROLL20_FACTORS = [
     "ROC_20", "MA_RATIO_20", "VMOM_20", "VSTD_20", "STD_20", "BBPOS_20", "BETA_20",
 ]
 BACKFILL_LOG = PROJECT_ROOT / "logs" / "backfill.log"
+ACTIVE_BACKFILL_KEYS = {
+    ("US", "1h", "adjusted", "universe"),
+    ("US", "1d", "adjusted", "universe"),
+    ("US", "1d", "raw", "ledger"),
+    ("US", "5m", "raw", "ledger"),
+    ("CN", "1d", "adjusted", "universe"),
+    ("CN", "1d", "raw", "universe"),
+}
 _BACKFILL_WRAPPER_RE = re.compile(
     r"^===== Backfill \[(?P<market>US|CN)/(?P<interval>[^/\]]+)/(?P<price_mode>[^/\]]+)"
     r"(?:/(?P<scope>[^\]]+))?\] "
@@ -811,8 +819,15 @@ def check_backfill_runtime(
             "path": str(log_path),
         })
     else:
+        events = [
+            event for event in parse_backfill_log_events(text)
+            if (
+                str(event.get("market")), str(event.get("interval")),
+                str(event.get("price_mode")), str(event.get("scope") or "universe"),
+            ) in ACTIVE_BACKFILL_KEYS
+        ]
         issues.extend(evaluate_backfill_log_events(
-            parse_backfill_log_events(text),
+            events,
             now=now,
             max_success_age_seconds=max_success_age_seconds,
             max_incomplete_seconds=max_incomplete_seconds,
