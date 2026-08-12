@@ -12,7 +12,12 @@ case "$SCOPE" in universe|ledger) ;; *) echo "invalid scope: $SCOPE" >&2; exit 2
 [[ "$DAYS" =~ ^[0-9]+$ ]] || { echo "invalid days: $DAYS" >&2; exit 2; }
 PYTHON=${QUANT_PYTHON:-$ROOT/venv/bin/python}; LOG=${QUANT_BACKFILL_LOG:-$ROOT/logs/backfill.log}
 LOCK=${QUANT_BACKFILL_LOCK:-/tmp/quant_backfill_${MARKET}.lock}
-WAIT=${QUANT_BACKFILL_LOCK_WAIT_SECONDS:-30}; TIMEOUT=${QUANT_BACKFILL_TIMEOUT_SECONDS:-900}
+WAIT=${QUANT_BACKFILL_LOCK_WAIT_SECONDS:-30}
+# CN's per-ticker Sina/akshare daily endpoint is materially slower and can
+# consume several bounded 120s partial-batch windows. Keep the outer timeout
+# long enough for all 301 names while retaining a hard wall-clock limit.
+if [[ "$MARKET" == "CN" ]]; then DEFAULT_TIMEOUT=1800; else DEFAULT_TIMEOUT=900; fi
+TIMEOUT=${QUANT_BACKFILL_TIMEOUT_SECONDS:-$DEFAULT_TIMEOUT}
 mkdir -p "$(dirname "$LOG")"; scheduled=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 exec 9>"$LOCK"
 if ! /usr/bin/flock -w "$WAIT" 9; then

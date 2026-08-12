@@ -53,6 +53,17 @@ def test_latest_completed_us_session_uses_new_york_close_and_weekdays(now, expec
     assert latest_completed_session_date("US", now) == expected
 
 
+def test_cn_price_health_waits_for_daily_provider_publication_grace():
+    from scripts.health_check import price_health_target_date
+
+    assert price_health_target_date(
+        "CN", datetime(2026, 8, 12, 7, 59, tzinfo=timezone.utc)
+    ) == "2026-08-11"
+    assert price_health_target_date(
+        "CN", datetime(2026, 8, 12, 9, 0, tzinfo=timezone.utc)
+    ) == "2026-08-12"
+
+
 def test_daily_cache_is_fresh_at_preclose_when_latest_completed_session_exists(monkeypatch):
     import data.fetcher as fetcher_module
 

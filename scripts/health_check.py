@@ -12,7 +12,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -31,6 +31,12 @@ ACTIVE_BACKFILL_KEYS = {
     ("US", "5m", "raw", "ledger"),
     ("CN", "1d", "adjusted", "universe"),
     ("CN", "1d", "raw", "universe"),
+}
+DAILY_BAR_PUBLICATION_GRACE = {
+    "US": timedelta(minutes=30),
+    # Sina/akshare commonly publishes the just-closed A-share daily bar
+    # 60-120 minutes after the 15:00 CST close.
+    "CN": timedelta(hours=2),
 }
 _BACKFILL_WRAPPER_RE = re.compile(
     r"^===== Backfill \[(?P<market>US|CN)/(?P<interval>[^/\]]+)/(?P<price_mode>[^/\]]+)"
@@ -218,6 +224,16 @@ def check_price_1d_health(
             target_date=target,
         ))
     return issues
+
+
+def price_health_target_date(market: str, now: datetime) -> str:
+    """Latest daily bar that the configured provider can reasonably publish."""
+    from data.fetcher import latest_completed_session_date
+
+    market = market.upper()
+    return latest_completed_session_date(
+        market, now - DAILY_BAR_PUBLICATION_GRACE[market]
+    ).isoformat()
 
 
 def _runtime_session_open(now: datetime) -> dict[str, str | bool]:
@@ -923,11 +939,10 @@ def main() -> int:
         ))
         if not args.skip_price_health:
             from config.settings import CN_UNIVERSE, STOCK_UNIVERSE
-            from data.fetcher import latest_completed_session_date
 
             now = datetime.now(timezone.utc)
             targets = {
-                market: latest_completed_session_date(market, now).isoformat()
+                market: price_health_target_date(market, now)
                 for market in ("US", "CN")
             }
             issues.extend(check_price_1d_health(
