@@ -54,7 +54,21 @@ def load_candidates(csv_path: str | Path, market: str | None = None) -> list[dic
             if not account or not ticker or len(ex_date) != 10 or row_market not in {"US", "CN"}:
                 raise ValueError(f"invalid dividend identity: {raw}")
             cps = _decimal(raw.get("cash_per_share"))
-            shares = _decimal(raw.get("held_shares_before"))
+            try:
+                shares = Decimal(str(raw.get("held_shares_before") or "0").strip())
+            except (InvalidOperation, ValueError) as exc:
+                raise ValueError(
+                    f"invalid held_shares_before: {raw.get('held_shares_before')!r}"
+                ) from exc
+            if not shares.is_finite() or shares < 0:
+                raise ValueError(
+                    f"held_shares_before must be non-negative: {raw.get('held_shares_before')!r}"
+                )
+            if shares == 0:
+                # The audit includes closed intervals for context. A zero
+                # ex-date holding has no dividend entitlement and must not
+                # create a zero-value review item.
+                continue
             gross = cps * shares
             key = _key(account, row_market, ticker, ex_date, cps)
             candidate = {

@@ -17,6 +17,8 @@ def _csv(path: Path) -> Path:
         "2026-08-01T00:00:00Z,,provider,info,False\n"
         "A01,US,BBB,2026-08-20,split,2,,split,10,True,20,20,,,,"
         "2026-08-01T00:00:00Z,,provider,info,False\n"
+        "A02,US,CCC,2026-08-20,cash_dividend,,0.30,closed,0,False,,,,,"
+        "2026-08-01T00:00:00Z,2026-08-19T00:00:00Z,provider,info,False\n"
     )
     return path
 
