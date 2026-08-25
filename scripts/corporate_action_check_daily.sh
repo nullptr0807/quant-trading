@@ -24,15 +24,28 @@ fi
 # failure must not suppress the other market's corporate-action gate.
 overall=0
 for market in CN US; do
+    out_dir="/tmp/hermes/corporate_action_audit_${market}"
     set +e
     "$RUNNER" corporate_action_gate "$market" "/tmp/quant_corporate_action_audit_${market}.lock" \
         5 "$FAST_TIMEOUT" "$LOG" -- \
+        env QUANT_CORPORATE_ACTION_OUT_DIR="$out_dir" \
         "$PYTHON" "$ROOT/scripts/corporate_action_check.py" \
         --scope fast --markets "$market" --start "$start" --end "$end" \
         --min-fetch-coverage 1.0
     rc=$?
     set -e
     if [[ $rc -ne 0 && $overall -eq 0 ]]; then overall=$rc; fi
+    if [[ $rc -eq 0 ]]; then
+        set +e
+        "$RUNNER" cash_dividend_review_queue "$market" "/tmp/quant_corporate_action_audit_${market}.lock" \
+            5 60 "$LOG" -- \
+            "$PYTHON" "$ROOT/scripts/sync_cash_dividend_reviews.py" \
+            --csv "$out_dir/affected_account_intervals.csv" --db "$ROOT/data/trading.db" \
+            --market "$market" --apply --confirm "SYNC CASH DIVIDEND REVIEW QUEUE"
+        queue_rc=$?
+        set -e
+        if [[ $queue_rc -ne 0 && $overall -eq 0 ]]; then overall=$queue_rc; fi
+    fi
 done
 
 # Full historical-ledger coverage is separately observable and optional. It can

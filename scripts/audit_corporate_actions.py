@@ -28,7 +28,9 @@ import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = PROJECT_ROOT / "data" / "trading.db"
-OUT_DIR = Path("/tmp/hermes/corporate_action_audit")
+OUT_DIR = Path(os.environ.get(
+    "QUANT_CORPORATE_ACTION_OUT_DIR", "/tmp/hermes/corporate_action_audit"
+))
 CN_SUFFIX_RE = re.compile(r"^\d{6}\.(SH|SZ|BJ)$")
 
 
@@ -678,7 +680,7 @@ def run_audit(markets: set[str], focus_accounts: set[str] | None, start: str,
     md.append("- This script does **not** modify the DB.\n")
     md.append("- `critical` means an account appears to still hold shares after a share-count action; current positions likely need adjustment if the action was not already applied.\n")
     md.append("- `warning` means a share-count action occurred during a historical holding interval that later closed; realized PnL should be replayed with the action.\n")
-    md.append("- Cash dividends are listed as `info`; cash-credit policy still needs to be defined before repair.\n")
+    md.append("- Cash dividends are listed as `info` and synchronized to a metadata-only review queue; no cash is credited automatically.\n")
     md_path.write_text("".join(md))
     summary_path = OUT_DIR / "summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2))

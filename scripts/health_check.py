@@ -379,6 +379,51 @@ def check_corporate_action_health(
     return issues
 
 
+def check_cash_dividend_review_health(
+    con: sqlite3.Connection, *, now: datetime | None = None,
+) -> list[dict]:
+    """Require a durable, fresh review queue without treating it as cash."""
+    now = _normalize_utc(now or datetime.now(timezone.utc))
+    issues: list[dict] = []
+    if not _table_exists(con, "cash_dividend_review_queue"):
+        return [{
+            "severity": "critical", "check": "cash_dividend_review_queue",
+            "scope": "ALL", "status": "missing_table",
+        }]
+    health_rows = {}
+    if _table_exists(con, "operational_health"):
+        health_rows = {
+            str(row["market"]): row
+            for row in con.execute(
+                "SELECT market,status,success_at,source_timestamp,details "
+                "FROM operational_health WHERE component='cash_dividend_review_queue'"
+            ).fetchall()
+        }
+    for market in ("US", "CN"):
+        row = health_rows.get(market)
+        observed = _parse_datetime(
+            (row["source_timestamp"] or row["success_at"]) if row else None
+        )
+        stale = observed is None or now - observed > timedelta(hours=36)
+        if row is None or row["status"] != "ok" or stale:
+            issues.append({
+                "severity": "critical", "check": "cash_dividend_review_queue",
+                "market": market, "scope": market,
+                "status": "missing" if row is None else ("stale" if stale else row["status"]),
+            })
+    for row in con.execute(
+        "SELECT market,COUNT(*) AS n,COALESCE(SUM(gross_amount),0) AS gross "
+        "FROM cash_dividend_review_queue WHERE status='pending_review' GROUP BY market"
+    ).fetchall():
+        issues.append({
+            "severity": "warning", "check": "cash_dividend_pending_review",
+            "market": row["market"], "scope": row["market"],
+            "count": int(row["n"]), "gross_amount": round(float(row["gross"]), 8),
+            "cash_credited": False,
+        })
+    return issues
+
+
 def price_health_target_date(market: str, now: datetime) -> str:
     """Latest daily bar that the configured provider can reasonably publish."""
     from data.fetcher import latest_completed_session_date
@@ -1087,6 +1132,7 @@ def main() -> int:
         issues.extend(check_snapshot_diff(con))
         issues.extend(check_ohlc_quality(con))
         issues.extend(check_corporate_action_health(con))
+        issues.extend(check_cash_dividend_review_health(con))
         now_runtime = datetime.now(timezone.utc)
         issues.extend(check_live_runtime_health(
             con, now=now_runtime, session_open=_runtime_session_open(now_runtime)
