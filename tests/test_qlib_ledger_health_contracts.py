@@ -50,6 +50,26 @@ def test_price_health_does_not_accept_quarantined_target_bar():
     }
 
 
+def test_operational_health_accepts_explicit_data_source_timestamp(tmp_path):
+    from scripts.record_operational_health import record_operational_health
+
+    db = tmp_path / "health.db"
+    record_operational_health(
+        db=str(db), component="backfill_1d_raw_ledger", market="US",
+        status="ok", scheduled_at="2026-08-25T21:40:00Z",
+        started_at="2026-08-25T21:40:01Z", stopped_at="2026-08-25T21:41:00Z",
+        exit_code=0, duration=59, source_timestamp="2026-08-25",
+        detail={"target_date": "2026-08-25"},
+    )
+    with sqlite3.connect(db) as con:
+        row = con.execute(
+            "SELECT status,source_timestamp,details FROM operational_health"
+        ).fetchone()
+    assert row[0] == "ok"
+    assert row[1] == "2026-08-25"
+    assert json.loads(row[2])["target_date"] == "2026-08-25"
+
+
 def _qlib_wrapper_env(tmp_path: Path, **overrides: str) -> tuple[dict[str, str], Path]:
     """Build an isolated fake Qlib runtime; never touches the production DB."""
     fake_root = tmp_path / "quant"

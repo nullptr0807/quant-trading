@@ -20,6 +20,7 @@ def record_operational_health(
     exit_code: int | None = None,
     duration: float | None = None,
     detail: dict | None = None,
+    source_timestamp: str | None = None,
     now: str | None = None,
 ) -> None:
     """Persist one scheduler attempt and its latest component health."""
@@ -64,7 +65,10 @@ def record_operational_health(
     )
     con.execute(
         "INSERT OR REPLACE INTO operational_health(component,market,status,success_at,source_timestamp,details) VALUES (?,?,?,?,?,?)",
-        (component, market, status, success_at, stopped_at or started_at, packed),
+        (
+            component, market, status, success_at,
+            source_timestamp or stopped_at or started_at, packed,
+        ),
     )
     con.commit()
     con.close()
@@ -82,6 +86,7 @@ def main() -> int:
     p.add_argument("--exit-code", type=int)
     p.add_argument("--duration", type=float)
     p.add_argument("--detail")
+    p.add_argument("--source-timestamp")
     args = p.parse_args()
     detail = json.loads(args.detail) if args.detail else {}
     record_operational_health(
@@ -89,6 +94,7 @@ def main() -> int:
         status=args.status, scheduled_at=args.scheduled_at,
         started_at=args.started_at, stopped_at=args.stopped_at,
         exit_code=args.exit_code, duration=args.duration, detail=detail,
+        source_timestamp=args.source_timestamp,
     )
     return 0
 

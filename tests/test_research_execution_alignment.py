@@ -61,6 +61,34 @@ def test_broker_replay_never_falls_back_to_adjusted_prices():
         replay._current_prices({}, pd.Timestamp("2026-07-10").date())
 
 
+def test_broker_replay_loader_excludes_quarantined_raw_bar():
+    module = _replay_module()
+    con = sqlite3.connect(":memory:")
+    con.executescript(
+        """
+        CREATE TABLE prices_raw (
+            ticker TEXT, datetime TEXT, interval TEXT,
+            open REAL, high REAL, low REAL, close REAL, volume REAL
+        );
+        CREATE TABLE price_quality_issues (
+            price_mode TEXT, ticker TEXT, datetime TEXT, interval TEXT,
+            issue_type TEXT, detected_at TEXT, detail TEXT
+        );
+        INSERT INTO prices_raw VALUES ('AAA','2026-07-09','1d',10,11,9,10,1);
+        INSERT INTO prices_raw VALUES ('AAA','2026-07-10','1d',10,9,8,11,1);
+        INSERT INTO price_quality_issues VALUES (
+            'raw','AAA','2026-07-10','1d','invalid_ohlc','now','bad'
+        );
+        """
+    )
+    replay = object.__new__(module.USReplay)
+    replay.conn = con
+
+    loaded = replay._load_daily(table="prices_raw")
+
+    assert list(loaded["AAA"].index.strftime("%Y-%m-%d")) == ["2026-07-09"]
+
+
 def test_split_and_cash_dividend_adjust_shares_cash_before_next_bar_execution():
     module = _replay_module()
     account = module.USAccount("A01", 1000.0)

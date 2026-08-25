@@ -174,6 +174,11 @@ def test_operational_wrappers_have_private_umask_and_backup_restore_gate():
         assert "umask 077" in text
     assert "run_module_force_exit.py" in (root / "scripts/refresh_factors_daily.sh").read_text()
     assert "run_module_force_exit.py" in (root / "scripts/backfill_prices_daily.sh").read_text()
+    backfill_wrapper = (root / "scripts/backfill_prices_daily.sh").read_text()
+    assert "HEALTH_WRITE_FAILED" in backfill_wrapper
+    assert "exit 70" in backfill_wrapper
+    assert "record_operational_health.py" in backfill_wrapper
+    assert "|| true" not in backfill_wrapper
     qlib_wrapper = (root / "scripts/qlib_retrain_daily.sh").read_text()
     assert "LOCK_TIMEOUT" in qlib_wrapper
     assert "QLIB_TOTAL_TIMEOUT_SECONDS" in qlib_wrapper

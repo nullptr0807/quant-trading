@@ -181,11 +181,24 @@ class USReplay:
             if table == "prices_raw":
                 return {}
             raise ReplayCoverageError(f"missing required table {table}")
+        quality_clause = ""
+        params: list[str] = []
+        if self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='price_quality_issues'"
+        ).fetchone():
+            price_mode = "raw" if table == "prices_raw" else "adjusted"
+            quality_clause = (
+                " AND NOT EXISTS (SELECT 1 FROM price_quality_issues q "
+                f"WHERE q.price_mode=? AND q.ticker={table}.ticker "
+                f"AND q.datetime={table}.datetime AND q.interval={table}.interval)"
+            )
+            params.append(price_mode)
         df = pd.read_sql_query(
             "SELECT ticker, datetime, open, high, low, close, volume "
             f"FROM {table} WHERE interval='1d' "
-            "AND ticker NOT LIKE '%.SH' AND ticker NOT LIKE '%.SZ'",
-            self.conn,
+            "AND ticker NOT LIKE '%.SH' AND ticker NOT LIKE '%.SZ'"
+            f"{quality_clause}",
+            self.conn, params=params,
         )
         df["datetime"] = pd.to_datetime(df["datetime"])
         out: dict[str, pd.DataFrame] = {}
