@@ -121,15 +121,26 @@ def _latest_by_ticker(
     if not wanted or not _table_exists(con, table):
         return {}
     placeholders = ",".join("?" for _ in wanted)
+    quality_clause = ""
+    params: list[object] = list(wanted)
+    if _table_exists(con, "price_quality_issues"):
+        price_mode = "raw" if table == "prices_raw" else "adjusted"
+        quality_clause = (
+            " AND NOT EXISTS (SELECT 1 FROM price_quality_issues q "
+            f"WHERE q.price_mode=? AND q.ticker={table}.ticker "
+            f"AND q.datetime={table}.datetime AND q.interval={table}.interval)"
+        )
+        params.append(price_mode)
     rows = con.execute(
         f"""
         SELECT ticker, MAX(substr(datetime,1,10)) AS max_date
         FROM {table}
         WHERE interval='1d' AND ({_market_clause(market)})
           AND ticker IN ({placeholders})
+          {quality_clause}
         GROUP BY ticker
         """,
-        wanted,
+        params,
     ).fetchall()
     return {str(r["ticker"]): str(r["max_date"]) for r in rows if r["max_date"]}
 

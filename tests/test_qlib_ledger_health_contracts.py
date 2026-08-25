@@ -22,6 +22,34 @@ def test_cash_dividend_policy_is_explicitly_price_return_only():
     assert CASH_DIVIDEND_ACCOUNTING_POLICY["health"] == "intentional_exclusion"
 
 
+def test_price_health_does_not_accept_quarantined_target_bar():
+    from scripts.health_check import _latest_by_ticker
+
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    con.executescript(
+        """
+        CREATE TABLE prices_raw (
+            ticker TEXT, datetime TEXT, interval TEXT,
+            open REAL, high REAL, low REAL, close REAL, volume REAL
+        );
+        CREATE TABLE price_quality_issues (
+            price_mode TEXT, ticker TEXT, datetime TEXT, interval TEXT,
+            issue_type TEXT, detected_at TEXT, detail TEXT
+        );
+        INSERT INTO prices_raw VALUES ('AAA','2026-08-21 00:00:00','1d',1,1,1,1,1);
+        INSERT INTO prices_raw VALUES ('AAA','2026-08-24 00:00:00','1d',10,9,8,11,1);
+        INSERT INTO price_quality_issues VALUES (
+            'raw','AAA','2026-08-24 00:00:00','1d','invalid_ohlc','now','bad'
+        );
+        """
+    )
+
+    assert _latest_by_ticker(con, "prices_raw", "US", ["AAA"]) == {
+        "AAA": "2026-08-21"
+    }
+
+
 def _qlib_wrapper_env(tmp_path: Path, **overrides: str) -> tuple[dict[str, str], Path]:
     """Build an isolated fake Qlib runtime; never touches the production DB."""
     fake_root = tmp_path / "quant"
