@@ -51,13 +51,20 @@ def test_issue_transitions_distinguish_new_continuing_and_recovered():
 
 
 def test_inactive_symbols_are_explicitly_blocked_without_guessing_mapping():
-    from config.security_master import SECURITY_LIFECYCLE, ticker_lifecycle_block_reason
+    from config.security_master import (
+        SECURITY_LIFECYCLE, active_universe_tickers, ticker_lifecycle_block_reason,
+    )
 
     expected = {"APLS", "BK", "BLD", "CTRA", "CWEN-A", "JHG", "MASI", "NSA"}
     assert expected <= {ticker for market, ticker in SECURITY_LIFECYCLE if market == "US"}
     for ticker in expected:
         assert ticker_lifecycle_block_reason(ticker, "US", "2026-08-01T00:00:00Z") == "temporarily_unavailable"
         assert SECURITY_LIFECYCLE[("US", ticker)]["replacement_ticker"] is None
+
+    all_unavailable = {ticker for market, ticker in SECURITY_LIFECYCLE if market == "US"}
+    assert active_universe_tickers(
+        ["AAPL", *sorted(all_unavailable)], "US", "2026-08-25T00:00:00Z"
+    ) == ["AAPL"]
 
 
 def test_f_account_runtime_state_is_dashboard_consumable(tmp_path):

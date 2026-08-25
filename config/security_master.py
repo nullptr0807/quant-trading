@@ -18,13 +18,24 @@ SYMBOL_CHANGES = {
 # execution layer block new buys from the audit effective date.  A replacement
 # must never be guessed from a similar company name/ticker.
 SECURITY_LIFECYCLE = {
-    ("US", ticker): {
-        "status": "temporarily_unavailable",
-        "effective_at": "2026-07-10T00:00:00+00:00",
-        "replacement_ticker": None,
-        "evidence": "2026-07 universe/provider audit; mapping evidence pending review",
-    }
-    for ticker in ("APLS", "BK", "BLD", "CTRA", "CWEN-A", "JHG", "MASI", "NSA")
+    **{
+        ("US", ticker): {
+            "status": "temporarily_unavailable",
+            "effective_at": "2026-07-10T00:00:00+00:00",
+            "replacement_ticker": None,
+            "evidence": "2026-07 universe/provider audit; mapping evidence pending review",
+        }
+        for ticker in ("APLS", "BK", "BLD", "CTRA", "CWEN-A", "JHG", "MASI", "NSA")
+    },
+    **{
+        ("US", ticker): {
+            "status": "temporarily_unavailable",
+            "effective_at": "2026-08-24T00:00:00+00:00",
+            "replacement_ticker": None,
+            "evidence": "2026-08-25 target-session provider audit: no 2026-08-24 bar; mapping evidence pending review",
+        }
+        for ticker in ("EA", "EQR", "LBRDA", "LBRDK", "WBS")
+    },
 }
 
 
@@ -52,3 +63,17 @@ def ticker_lifecycle_block_reason(ticker: str, market: str, at: str | datetime) 
     if lifecycle and _parse_utc(at) >= _parse_utc(lifecycle["effective_at"]):
         return str(lifecycle["status"])
     return None
+
+
+def active_universe_tickers(
+    tickers, market: str, at: str | datetime,
+) -> list[str]:
+    """Filter unavailable names from new-signal research universe checks.
+
+    This must not be used to drop held symbols from ledger valuation: existing
+    positions remain auditable and fail closed independently.
+    """
+    return [
+        str(ticker) for ticker in tickers
+        if ticker_lifecycle_block_reason(str(ticker), market, at) is None
+    ]

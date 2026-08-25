@@ -108,11 +108,17 @@ def _stale_for_target(coverage: dict, tickers: list[str], target_date: str) -> l
 
 
 def backfill(interval: str, days: int, batch_size: int = 50, market: str = "US", price_mode: str = "adjusted", scope: str = "universe"):
+    from config.security_master import active_universe_tickers
+    now = datetime.now(timezone.utc)
     if market == "CN":
         from config.settings import CN_UNIVERSE, BENCHMARKS_BY_MARKET
         from data.cn_fetcher import CNDataFetcher
         bench_tickers = [bm["ticker"] for bm in BENCHMARKS_BY_MARKET["CN"]]
-        base = _ledger_tickers_for_market("CN", days) if scope == "ledger" else list(CN_UNIVERSE) + _held_tickers_for_market("CN")
+        base = (
+            _ledger_tickers_for_market("CN", days)
+            if scope == "ledger"
+            else active_universe_tickers(CN_UNIVERSE, "CN", now) + _held_tickers_for_market("CN")
+        )
         tickers = _dedupe(base + bench_tickers)
         fetcher = CNDataFetcher()
         # akshare/sina rate limits — smaller batches help
@@ -120,7 +126,11 @@ def backfill(interval: str, days: int, batch_size: int = 50, market: str = "US",
     else:
         from config.settings import STOCK_UNIVERSE
         from data.fetcher import DataFetcher
-        base = _ledger_tickers_for_market("US", days) if scope == "ledger" else list(STOCK_UNIVERSE) + _held_tickers_for_market("US")
+        base = (
+            _ledger_tickers_for_market("US", days)
+            if scope == "ledger"
+            else active_universe_tickers(STOCK_UNIVERSE, "US", now) + _held_tickers_for_market("US")
+        )
         tickers = _dedupe(base + ["QQQ", "SPY"])
         fetcher = DataFetcher()
 

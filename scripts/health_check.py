@@ -1077,6 +1077,7 @@ def main() -> int:
         ))
         if not args.skip_price_health:
             from config.settings import CN_UNIVERSE, STOCK_UNIVERSE
+            from config.security_master import active_universe_tickers
 
             now = datetime.now(timezone.utc)
             targets = {
@@ -1085,7 +1086,10 @@ def main() -> int:
             }
             issues.extend(check_price_1d_health(
                 con,
-                universe_by_market={"US": STOCK_UNIVERSE, "CN": CN_UNIVERSE},
+                universe_by_market={
+                    "US": active_universe_tickers(STOCK_UNIVERSE, "US", now),
+                    "CN": active_universe_tickers(CN_UNIVERSE, "CN", now),
+                },
                 target_dates=targets,
             ))
     issues.extend(check_disk_usage())
