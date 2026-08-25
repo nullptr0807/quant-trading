@@ -457,12 +457,27 @@ def action_in_interval(action_date: str, interval: dict[str, Any]) -> bool:
     return True
 
 
-def estimate_current_impact(pos: sqlite3.Row | None, ratio: float | None) -> tuple[float | None, float | None, float | None]:
+def post_action_raw_price(
+    con: sqlite3.Connection, ticker: str, ex_date: str,
+) -> float | None:
+    row = con.execute(
+        "SELECT close FROM prices_raw WHERE ticker=? AND interval='1d' "
+        "AND datetime>=? AND close>0 ORDER BY datetime DESC LIMIT 1",
+        (ticker, ex_date),
+    ).fetchone()
+    if row is None:
+        return None
+    price = float(row[0])
+    return price if math.isfinite(price) and price > 0 else None
+
+
+def estimate_current_impact(
+    pos: sqlite3.Row | None, ratio: float | None, raw_post_action_price: float | None,
+) -> tuple[float | None, float | None, float | None]:
     if pos is None or ratio is None or not math.isfinite(ratio):
         return None, None, None
     old_sh = float(pos["shares"] or 0.0)
-    px = pos["current_price"]
-    px_f = float(px) if px is not None else None
+    px_f = float(raw_post_action_price) if raw_post_action_price is not None else None
     expected = old_sh * ratio
     impact = (expected - old_sh) * px_f if px_f is not None else None
     return expected, px_f, impact
@@ -539,7 +554,10 @@ def run_audit(markets: set[str], focus_accounts: set[str] | None, start: str,
             held_before = shares_before_action(rows, a.ex_date)
             pos = current_position(con, acct, a.market, a.ticker)
             open_after = pos is not None and float(pos["shares"] or 0.0) > 0
-            expected, current_px, impact = estimate_current_impact(pos, a.ratio)
+            raw_post_action_px = post_action_raw_price(con, a.ticker, a.ex_date)
+            expected, current_px, impact = estimate_current_impact(
+                pos, a.ratio, raw_post_action_px
+            )
             repaired = bool(
                 a.action_type in {"split", "bonus_or_transfer"}
                 and a.ratio is not None

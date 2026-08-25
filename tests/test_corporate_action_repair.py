@@ -118,6 +118,13 @@ def test_split_preview_is_read_only_and_reports_ratio_cost_and_raw_coordinate(tm
 
     db = tmp_path / "trading.db"
     _make_db(db)
+    con = sqlite3.connect(db)
+    con.execute(
+        "UPDATE positions SET avg_cost=180.123 "
+        "WHERE account='A02' AND market='US' AND ticker='AVB'"
+    )
+    con.commit()
+    con.close()
     before = db.read_bytes()
 
     result = repair_open_split(
@@ -129,8 +136,8 @@ def test_split_preview_is_read_only_and_reports_ratio_cost_and_raw_coordinate(tm
     assert db.read_bytes() == before
     assert result["mode"] == "preview"
     assert result["before"]["shares"] == 10.0
-    assert result["after"]["shares"] == pytest.approx(27.93)
-    assert result["after"]["avg_cost"] == pytest.approx(1808.67 / 27.93)
+    assert result["after"]["shares"] == pytest.approx(result["before"]["shares"] * 2.793)
+    assert result["after"]["avg_cost"] == pytest.approx(180.123 / 2.793)
     assert result["after"]["total_cost"] == pytest.approx(1808.67)
     assert result["after"]["current_price"] == 65.0
     assert result["raw_price_timestamp"].startswith("2026-08-17")
@@ -148,6 +155,120 @@ def test_split_apply_requires_verified_backup(tmp_path):
             ex_date="2026-08-17", ratio=2.793, source="yfinance.splits",
             apply=True, backup_handle=None,
         )
+
+
+def test_split_rejects_backup_manifest_from_a_different_canonical_source(tmp_path):
+    from scripts.repair_open_position_split import repair_open_split
+
+    db = tmp_path / "trading.db"
+    other = tmp_path / "other.db"
+    _make_db(db)
+    _make_db(other)
+    backup = _verified_backup(other, tmp_path / "backups")
+
+    with pytest.raises(RuntimeError, match="canonical source"):
+        repair_open_split(
+            db_path=db, account="A02", market="US", ticker="AVB",
+            ex_date="2026-08-17", ratio=2.793, source="yfinance.splits",
+            apply=True, backup_handle=backup,
+        )
+
+
+def test_split_rejects_artifact_and_checksum_without_updated_manifest(tmp_path):
+    from scripts.repair_open_position_split import repair_open_split
+
+    db = tmp_path / "trading.db"
+    _make_db(db)
+    backup = _verified_backup(db, tmp_path / "backups")
+    Path(str(backup) + ".manifest.json").unlink()
+
+    with pytest.raises(RuntimeError, match="manifest"):
+        repair_open_split(
+            db_path=db, account="A02", market="US", ticker="AVB",
+            ex_date="2026-08-17", ratio=2.793, source="yfinance.splits",
+            apply=True, backup_handle=backup,
+        )
+
+
+def test_split_rejects_backup_when_unrelated_pre_state_changed(tmp_path):
+    from scripts.repair_open_position_split import repair_open_split
+
+    db = tmp_path / "trading.db"
+    _make_db(db)
+    backup = _verified_backup(db, tmp_path / "backups")
+    con = sqlite3.connect(db)
+    con.execute("UPDATE account_state SET cash=cash+1 WHERE account='CA02' AND market='CN'")
+    con.commit()
+    con.close()
+
+    with pytest.raises(RuntimeError, match="full pre-state fingerprint"):
+        repair_open_split(
+            db_path=db, account="A02", market="US", ticker="AVB",
+            ex_date="2026-08-17", ratio=2.793, source="yfinance.splits",
+            apply=True, backup_handle=backup,
+        )
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_split_rejects_post_ex_date_trades(tmp_path, side):
+    from scripts.repair_open_position_split import repair_open_split
+
+    db = tmp_path / "trading.db"
+    _make_db(db)
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO trades(account,ticker,side,shares,price,cost,timestamp,market) "
+        "VALUES ('A02','AVB',?,1,65,0,'2026-08-18T14:00:00+00:00','US')",
+        (side,),
+    )
+    con.commit()
+    con.close()
+
+    with pytest.raises(RuntimeError, match="post-ex-date trade"):
+        repair_open_split(
+            db_path=db, account="A02", market="US", ticker="AVB",
+            ex_date="2026-08-17", ratio=2.793, source="yfinance.splits",
+        )
+
+
+def test_split_rejects_position_not_equal_to_ex_date_entitlement(tmp_path):
+    from scripts.repair_open_position_split import repair_open_split
+
+    db = tmp_path / "trading.db"
+    _make_db(db)
+    con = sqlite3.connect(db)
+    con.execute(
+        "UPDATE positions SET shares=9,avg_cost=total_cost/9 "
+        "WHERE account='A02' AND market='US' AND ticker='AVB'"
+    )
+    con.commit()
+    con.close()
+
+    with pytest.raises(RuntimeError, match="ex-date entitlement"):
+        repair_open_split(
+            db_path=db, account="A02", market="US", ticker="AVB",
+            ex_date="2026-08-17", ratio=2.793, source="yfinance.splits",
+        )
+
+
+def test_audit_impact_uses_post_split_raw_price_not_stale_position_mark(tmp_path):
+    from scripts.audit_corporate_actions import estimate_current_impact, post_action_raw_price
+
+    db = tmp_path / "trading.db"
+    _make_db(db)
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    pos = con.execute(
+        "SELECT * FROM positions WHERE account='A02' AND market='US' AND ticker='AVB'"
+    ).fetchone()
+
+    raw_price = post_action_raw_price(con, "AVB", "2026-08-17")
+    expected, price, impact = estimate_current_impact(pos, 2.793, raw_price)
+
+    assert expected == pytest.approx(27.93)
+    assert price == 65.0
+    assert impact == pytest.approx((27.93 - 10.0) * 65.0)
+    con.close()
 
 
 def test_split_apply_is_atomic_audited_idempotent_and_market_isolated(tmp_path):
@@ -211,6 +332,56 @@ def test_split_apply_is_atomic_audited_idempotent_and_market_isolated(tmp_path):
     ).fetchone()
     assert latest[:2] == pytest.approx((1000.0, 1000.0 + 27.93 * 65.0))
     assert latest[2] == applied_at.isoformat()
+    con.close()
+
+
+def test_watchdog_replays_audited_split_in_current_and_historical_state(tmp_path):
+    from scripts.ledger_watchdog import _replay_series, compare_positions, replay_account
+    from scripts.repair_open_position_split import repair_open_split
+
+    db = tmp_path / "trading.db"
+    _make_db(db)
+    con = sqlite3.connect(db)
+    con.execute(
+        "UPDATE positions SET total_cost=1801.92,avg_cost=180.192 "
+        "WHERE account='A02' AND market='US' AND ticker='AVB'"
+    )
+    con.commit()
+    con.close()
+    backup = _verified_backup(db, tmp_path / "backups")
+    applied_at = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
+    con = sqlite3.connect(db)
+    trades_before = con.execute("SELECT * FROM trades ORDER BY id").fetchall()
+    con.close()
+    repair_open_split(
+        db_path=db, account="A02", market="US", ticker="AVB",
+        ex_date="2026-08-17", ratio=2.793, source="yfinance.splits",
+        apply=True, backup_handle=backup, now=applied_at,
+    )
+
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    current = replay_account(
+        con, "A02", "US", 10000.0,
+        "2026-08-25T00:00:00+00:00", "2026-08-26T00:00:00+00:00",
+    )
+    account_rows = con.execute(
+        "SELECT * FROM accounts WHERE name='A02' AND market='US' ORDER BY timestamp,id"
+    ).fetchall()
+    series = _replay_series(con, "A02", "US", 10000.0, account_rows)
+
+    assert current.positions["AVB"]["shares"] == pytest.approx(27.93)
+    assert current.positions["AVB"]["total_cost"] == pytest.approx(1801.92)
+    assert series[0][2]["AVB"]["shares"] == pytest.approx(10.0)
+    assert series[-1][2]["AVB"]["shares"] == pytest.approx(27.93)
+    db_positions = con.execute(
+        "SELECT * FROM positions WHERE account='A02' AND market='US'"
+    ).fetchall()
+    mismatches, _ = compare_positions(current.positions, db_positions, 1e-9, 1e-6)
+    assert mismatches == []
+    assert [tuple(row) for row in con.execute(
+        "SELECT * FROM trades ORDER BY id"
+    ).fetchall()] == trades_before
     con.close()
 
 

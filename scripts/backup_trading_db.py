@@ -9,12 +9,25 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import sqlite3
 import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+MANIFEST_FORMAT = "quant-trading-sqlite-backup-v1"
+
+
+def database_fingerprint(con: sqlite3.Connection) -> str:
+    """Hash the complete logical SQLite state in deterministic dump order."""
+    digest = hashlib.sha256()
+    for statement in con.iterdump():
+        digest.update(statement.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
 
 
 def _quick_check(path: Path) -> None:
@@ -41,6 +54,7 @@ def create_backup(source: Path, out_dir: Path, *, keep: int = 7) -> dict:
     raw = out_dir / f"trading.db.{stamp}"
     compressed = Path(str(raw) + ".zst")
     digest_file = Path(str(compressed) + ".sha256")
+    manifest_file = Path(str(compressed) + ".manifest.json")
     if raw.exists() or compressed.exists():
         raise FileExistsError(compressed)
 
@@ -53,6 +67,11 @@ def create_backup(source: Path, out_dir: Path, *, keep: int = 7) -> dict:
         dst.close(); src.close()
     try:
         _quick_check(raw)
+        snapshot = sqlite3.connect(f"file:{raw}?mode=ro", uri=True)
+        try:
+            fingerprint = database_fingerprint(snapshot)
+        finally:
+            snapshot.close()
         subprocess.run(["zstd", "-T0", "-6", "-f", str(raw), "-o", str(compressed)], check=True)
         subprocess.run(["zstd", "-t", str(compressed)], check=True)
         h = hashlib.sha256()
@@ -60,7 +79,19 @@ def create_backup(source: Path, out_dir: Path, *, keep: int = 7) -> dict:
             for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
                 h.update(chunk)
         digest_file.write_text(f"{h.hexdigest()}  {compressed.name}\n")
-        os.chmod(compressed, 0o600); os.chmod(digest_file, 0o600)
+        manifest = {
+            "format": MANIFEST_FORMAT,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "source_path": str(source),
+            "artifact_name": compressed.name,
+            "artifact_sha256": h.hexdigest(),
+            "pre_state_fingerprint": {
+                "algorithm": "sha256-sqlite-iterdump-v1",
+                "sha256": fingerprint,
+            },
+        }
+        manifest_file.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        os.chmod(compressed, 0o600); os.chmod(digest_file, 0o600); os.chmod(manifest_file, 0o600)
 
         # Restore drill proves the compressed artifact, not merely the raw temp.
         with tempfile.TemporaryDirectory(dir=out_dir) as td:
@@ -73,10 +104,16 @@ def create_backup(source: Path, out_dir: Path, *, keep: int = 7) -> dict:
         for stale in backups[max(1, keep):]:
             stale.unlink(missing_ok=True)
             Path(str(stale) + ".sha256").unlink(missing_ok=True)
+            Path(str(stale) + ".manifest.json").unlink(missing_ok=True)
             _remove_sqlite_sidecars(Path(str(stale)[:-4]))
-        return {"path": str(compressed), "sha256": h.hexdigest(), "quick_check": "ok", "restore_drill": "ok"}
+        return {
+            "path": str(compressed), "sha256": h.hexdigest(),
+            "manifest": str(manifest_file), "pre_state_fingerprint": fingerprint,
+            "quick_check": "ok", "restore_drill": "ok",
+        }
     except Exception:
         compressed.unlink(missing_ok=True); digest_file.unlink(missing_ok=True)
+        manifest_file.unlink(missing_ok=True)
         raise
     finally:
         raw.unlink(missing_ok=True)

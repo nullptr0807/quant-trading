@@ -22,6 +22,8 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.backup_trading_db import MANIFEST_FORMAT, database_fingerprint
+
 
 def _action_key(account: str, market: str, ticker: str, ex_date: str, ratio: float) -> str:
     value = json.dumps(
@@ -47,18 +49,34 @@ def _position(con: sqlite3.Connection, account: str, market: str, ticker: str) -
     }
 
 
-def _held_before(con: sqlite3.Connection, account: str, market: str, ticker: str,
-                 ex_date: str) -> float:
+def _unchanged_ex_date_entitlement(
+    con: sqlite3.Connection, account: str, market: str, ticker: str,
+    ex_date: str, current_shares: float,
+) -> float:
     rows = con.execute(
-        "SELECT side,shares FROM trades WHERE account=? AND market=? AND ticker=? "
-        "AND timestamp<? ORDER BY timestamp,id",
-        (account, market, ticker, f"{ex_date}T00:00:00+00:00"),
+        "SELECT side,shares,timestamp FROM trades WHERE account=? AND market=? AND ticker=? "
+        "ORDER BY timestamp,id",
+        (account, market, ticker),
     ).fetchall()
+    cutoff = datetime.strptime(ex_date, "%Y-%m-%d").date()
     shares = 0.0
-    for side, qty in rows:
-        shares += float(qty) if str(side).lower() == "buy" else -float(qty)
+    for side, qty, timestamp in rows:
+        try:
+            trade_date = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00")).date()
+        except ValueError as exc:
+            raise RuntimeError(f"invalid trade timestamp in entitlement ledger: {timestamp}") from exc
+        if trade_date >= cutoff:
+            raise RuntimeError("post-ex-date trade prevents safe split repair")
+        side = str(side).lower()
+        if side not in {"buy", "sell"}:
+            raise RuntimeError(f"unsupported trade side in entitlement ledger: {side}")
+        shares += float(qty) if side == "buy" else -float(qty)
     if shares <= 1e-9:
         raise RuntimeError("trade ledger does not prove shares held before split")
+    if not math.isclose(current_shares, shares, rel_tol=1e-10, abs_tol=1e-9):
+        raise RuntimeError(
+            "current position does not equal ex-date entitlement; safe split repair is blocked"
+        )
     return shares
 
 
@@ -83,16 +101,41 @@ def _quick_check(path: Path) -> None:
         raise RuntimeError(f"backup quick_check failed: {result}")
 
 
-def _verify_backup(handle: Path, expected: dict[str, Any], *, account: str,
-                   market: str, ticker: str) -> str:
+def _verify_backup(
+    handle: Path, expected: dict[str, Any], *, db_path: Path,
+    live_con: sqlite3.Connection, account: str, market: str, ticker: str,
+) -> tuple[str, str]:
     handle = handle.resolve()
     sidecar = Path(str(handle) + ".sha256")
-    if not handle.is_file() or not sidecar.is_file() or handle.suffix != ".zst":
-        raise RuntimeError("--apply requires a verified backup handle (.zst plus .sha256)")
-    expected_digest = sidecar.read_text().strip().split()[0]
+    manifest_path = Path(str(handle) + ".manifest.json")
+    if (
+        not handle.is_file() or not sidecar.is_file() or not manifest_path.is_file()
+        or handle.suffix != ".zst"
+    ):
+        raise RuntimeError(
+            "--apply requires a verified backup handle (.zst plus .sha256 and manifest)"
+        )
+    sidecar_parts = sidecar.read_text().strip().split()
+    if len(sidecar_parts) != 2 or sidecar_parts[1] != handle.name:
+        raise RuntimeError("verified backup checksum sidecar is not bound to artifact name")
+    expected_digest = sidecar_parts[0]
     digest = hashlib.sha256(handle.read_bytes()).hexdigest()
     if expected_digest != digest:
         raise RuntimeError("verified backup checksum mismatch")
+    try:
+        manifest = json.loads(manifest_path.read_text())
+        fingerprint = manifest["pre_state_fingerprint"]["sha256"]
+        fingerprint_algorithm = manifest["pre_state_fingerprint"]["algorithm"]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("verified backup manifest is invalid") from exc
+    if manifest.get("format") != MANIFEST_FORMAT:
+        raise RuntimeError("verified backup manifest format is unsupported")
+    if Path(str(manifest.get("source_path", ""))).resolve() != db_path.resolve():
+        raise RuntimeError("verified backup manifest canonical source does not match target database")
+    if manifest.get("artifact_name") != handle.name or manifest.get("artifact_sha256") != digest:
+        raise RuntimeError("verified backup manifest does not match artifact")
+    if fingerprint_algorithm != "sha256-sqlite-iterdump-v1":
+        raise RuntimeError("verified backup manifest fingerprint algorithm is unsupported")
     subprocess.run(["zstd", "-t", str(handle)], check=True, capture_output=True)
     with tempfile.TemporaryDirectory() as td:
         restored = Path(td) / "restored.db"
@@ -102,14 +145,19 @@ def _verify_backup(handle: Path, expected: dict[str, Any], *, account: str,
         con = sqlite3.connect(f"file:{restored}?mode=ro", uri=True)
         try:
             backup_state = _position(con, account, market, ticker)
+            restored_fingerprint = database_fingerprint(con)
         finally:
             con.close()
+    if restored_fingerprint != fingerprint:
+        raise RuntimeError("verified backup manifest full pre-state fingerprint mismatch")
+    if database_fingerprint(live_con) != fingerprint:
+        raise RuntimeError("verified backup does not match current full pre-state fingerprint")
     for field in ("shares", "avg_cost", "total_cost", "current_price", "updated_at"):
         if backup_state[field] != expected[field]:
             raise RuntimeError(
                 f"verified backup does not match current pre-repair position: {field}"
             )
-    return digest
+    return digest, fingerprint
 
 
 def _table_exists(con: sqlite3.Connection, name: str) -> bool:
@@ -178,15 +226,17 @@ def repair_open_split(
         if existing is not None:
             return existing
         before = _position(con, account, market, ticker)
-        held_before = _held_before(con, account, market, ticker, ex_date)
+        held_before = _unchanged_ex_date_entitlement(
+            con, account, market, ticker, ex_date, before["shares"]
+        )
         raw_price, raw_price_ts = _post_split_raw_price(con, ticker, ex_date)
-        new_shares = before["shares"] + held_before * (ratio - 1.0)
+        new_shares = before["shares"] * ratio
         if new_shares <= 0 or not math.isfinite(new_shares):
             raise RuntimeError("split calculation produced invalid shares")
         after = {
             **before,
             "shares": new_shares,
-            "avg_cost": before["total_cost"] / new_shares,
+            "avg_cost": before["avg_cost"] / ratio,
             "current_price": raw_price,
         }
         result = {
@@ -202,13 +252,16 @@ def repair_open_split(
             return result
         if backup_handle is None:
             raise RuntimeError("--apply requires a verified backup handle")
-        backup_digest = _verify_backup(
-            Path(backup_handle), before, account=account, market=market, ticker=ticker
+        backup_digest, backup_fingerprint = _verify_backup(
+            Path(backup_handle), before, db_path=db_path, live_con=con,
+            account=account, market=market, ticker=ticker,
         )
         applied_at = (now or datetime.now(timezone.utc)).isoformat()
         after["updated_at"] = applied_at
 
         con.execute("BEGIN IMMEDIATE")
+        if database_fingerprint(con) != backup_fingerprint:
+            raise RuntimeError("database changed after full pre-state backup verification")
         # Fail closed if another writer changed the position after preview/backup verification.
         if _position(con, account, market, ticker) != before:
             raise RuntimeError("position changed during repair preflight")

@@ -124,6 +124,73 @@ def rowdict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
+def _load_corporate_action_repairs(
+    conn: sqlite3.Connection, account: str, market: str, after_ts: str | None = None,
+) -> list[dict[str, Any]]:
+    """Load audited share repairs as immutable replay events."""
+    try:
+        rows = conn.execute(
+            """
+            SELECT action_key,ticker,ex_date,ratio,action_type,applied_at
+            FROM corporate_action_repairs
+            WHERE account=? AND market=?
+              AND action_type IN ('split','bonus_or_transfer')
+            ORDER BY ex_date,applied_at,action_key
+            """,
+            (account, market),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return []
+        raise
+    actions = [dict(row) for row in rows]
+    if after_ts is not None:
+        baseline_dt = parse_ts(after_ts)
+        if baseline_dt is not None:
+            pending = []
+            for action in actions:
+                applied_dt = parse_ts(str(action["applied_at"]))
+                if applied_dt is None or applied_dt <= baseline_dt:
+                    continue
+                # A later repair of an older action is not represented in the
+                # baseline. Apply it immediately after that authoritative reset.
+                action["replay_ts"] = max(
+                    _corporate_action_ts(action), baseline_dt + timedelta(microseconds=1)
+                ).isoformat()
+                pending.append(action)
+            actions = pending
+    return actions
+
+
+def _corporate_action_ts(action: dict[str, Any]) -> datetime:
+    replay_ts = parse_ts(action.get("replay_ts"))
+    if replay_ts is not None:
+        return replay_ts
+    return datetime.strptime(str(action["ex_date"]), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+
+def _apply_corporate_action(
+    positions: dict[str, dict[str, float]], action: dict[str, Any],
+    violations: list[dict[str, Any]], market: str,
+) -> None:
+    ticker = canonical_ticker(str(action["ticker"]), market, str(action["ex_date"]))
+    ratio = float(action["ratio"])
+    position = positions.get(ticker)
+    if (
+        position is None or float(position.get("shares", 0.0)) <= 0
+        or not math.isfinite(ratio) or ratio <= 0
+    ):
+        violations.append({
+            "action_key": action["action_key"], "ex_date": action["ex_date"],
+            "ticker": ticker, "ratio": ratio,
+            "error": "invalid_corporate_action_replay_state",
+        })
+        return
+    # Split changes inventory coordinates only. Total lot cost is immutable;
+    # therefore replayed average cost is inversely adjusted by the same ratio.
+    position["shares"] *= ratio
+
+
 def replay_account(
     conn: sqlite3.Connection,
     account: str,
@@ -134,6 +201,7 @@ def replay_account(
 ) -> AccountReplay:
     costs = CNCosts() if market == "CN" else MoomooAUCosts()
     baseline = _load_repair_baseline(conn, account, market)
+    baseline_ts: str | None = None
     if baseline:
         baseline_ts, cash, pos = baseline
         rows = conn.execute(
@@ -158,10 +226,22 @@ def replay_account(
         cash = float(initial_cash)
         pos: dict[str, dict[str, float]] = {}
     oversells: list[dict[str, Any]] = []
+    actions = _load_corporate_action_repairs(
+        conn, account, market, baseline_ts if baseline else None
+    )
+    action_index = 0
     buys_notional_day = sells_notional_day = fees_day = slippage_day = 0.0
     trade_count_day = 0
 
     for r in rows:
+        trade_ts = parse_ts(str(r["timestamp"]))
+        while (
+            action_index < len(actions)
+            and trade_ts is not None
+            and _corporate_action_ts(actions[action_index]) <= trade_ts
+        ):
+            _apply_corporate_action(pos, actions[action_index], oversells, market)
+            action_index += 1
         side = str(r["side"]).lower()
         ticker = canonical_ticker(str(r["ticker"]), market, str(r["timestamp"]))
         shares = float(r["shares"])
@@ -225,6 +305,10 @@ def replay_account(
                     "error": "unknown_side",
                 }
             )
+
+    while action_index < len(actions):
+        _apply_corporate_action(pos, actions[action_index], oversells, market)
+        action_index += 1
 
     # Daily flow stats are independent of replay baselines: a baseline may be
     # written after today's trades to repair current state, but the watchdog
@@ -353,6 +437,7 @@ def _replay_series(
     """Incrementally replay trades to every account snapshot timestamp."""
     costs = _trade_cash_model(market)
     baseline = _load_repair_baseline(conn, account, market)
+    baseline_ts: str | None = None
     if baseline:
         baseline_ts, cash, positions = baseline
         trades = conn.execute(
@@ -376,6 +461,8 @@ def _replay_series(
     out = []
     ti = 0
     oversells: list[dict[str, Any]] = []
+    actions = _load_corporate_action_repairs(conn, account, market, baseline_ts)
+    ai = 0
 
     def apply_trade(r: sqlite3.Row):
         nonlocal cash
@@ -410,9 +497,23 @@ def _replay_series(
 
     for row in account_rows:
         ts = str(row["timestamp"])
-        while ti < len(trades) and str(trades[ti]["timestamp"]) <= ts:
-            apply_trade(trades[ti])
-            ti += 1
+        snapshot_dt = parse_ts(ts)
+        while snapshot_dt is not None:
+            trade_dt = parse_ts(str(trades[ti]["timestamp"])) if ti < len(trades) else None
+            action_dt = _corporate_action_ts(actions[ai]) if ai < len(actions) else None
+            trade_ready = trade_dt is not None and trade_dt <= snapshot_dt
+            action_ready = action_dt is not None and action_dt <= snapshot_dt
+            if (
+                action_ready and action_dt is not None
+                and (not trade_ready or trade_dt is None or action_dt <= trade_dt)
+            ):
+                _apply_corporate_action(positions, actions[ai], oversells, market)
+                ai += 1
+            elif trade_ready:
+                apply_trade(trades[ti])
+                ti += 1
+            else:
+                break
         snap_pos = {
             t: dict(p) for t, p in positions.items()
             if abs(p.get("shares", 0.0)) > 1e-9

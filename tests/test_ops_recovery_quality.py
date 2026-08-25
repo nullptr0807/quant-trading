@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
@@ -103,8 +104,14 @@ def test_online_backup_compresses_hashes_and_restore_checks(tmp_path):
     assert artifact.exists()
     assert artifact.stat().st_mode & 0o777 == 0o600
     assert Path(str(artifact) + ".sha256").exists()
+    manifest_path = Path(str(artifact) + ".manifest.json")
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest_path.stat().st_mode & 0o777 == 0o600
+    assert manifest["source_path"] == str(db.resolve())
+    assert manifest["artifact_sha256"] == result["sha256"]
+    assert manifest["pre_state_fingerprint"]["sha256"] == result["pre_state_fingerprint"]
     assert result["quick_check"] == result["restore_drill"] == "ok"
-    assert sorted(p.suffix for p in (tmp_path / "backups").iterdir()) == ['.sha256', '.zst']
+    assert sorted(p.suffix for p in (tmp_path / "backups").iterdir()) == ['.json', '.sha256', '.zst']
 
 
 def test_online_backup_removes_snapshot_wal_sidecars(tmp_path, monkeypatch):
