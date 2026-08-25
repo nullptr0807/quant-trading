@@ -256,6 +256,34 @@ def test_health_ledger_history_window_matches_scheduled_raw_coverage(monkeypatch
     assert history_days > 0
 
 
+def test_corporate_action_health_requires_fresh_success_for_each_market():
+    from scripts.health_check import check_corporate_action_health
+
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    con.execute(
+        "CREATE TABLE operational_health(component TEXT,market TEXT,status TEXT,"
+        "success_at TEXT,source_timestamp TEXT,details TEXT,PRIMARY KEY(component,market))"
+    )
+    con.execute(
+        "INSERT INTO operational_health VALUES (?,?,?,?,?,?)",
+        ("corporate_action_gate", "US", "ok", "2026-08-25T00:00:00Z",
+         "2026-08-25T00:00:00Z", "{}"),
+    )
+
+    issues = check_corporate_action_health(
+        con, now=datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
+    )
+    assert [(x["market"], x["status"]) for x in issues] == [("CN", "missing")]
+
+    issues = check_corporate_action_health(
+        con, now=datetime(2026, 8, 27, 12, 1, tzinfo=timezone.utc)
+    )
+    assert {x["market"]: x["status"] for x in issues} == {
+        "US": "stale", "CN": "missing",
+    }
+
+
 def test_stale_held_mark_is_critical_only_for_affected_account():
     from scripts.health_check import check_price_1d_health
 

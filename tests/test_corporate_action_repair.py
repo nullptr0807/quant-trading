@@ -405,6 +405,10 @@ def test_completed_repair_is_recognized_by_subsequent_gate(tmp_path):
         ex_date="2026-08-17", action_type="split", ratio=2.793,
     ) is True
     assert has_applied_share_repair(
+        con, account="A02", market="US", ticker="AVB",
+        ex_date="2026-08-17", action_type="bonus_or_transfer", ratio=2.793,
+    ) is True
+    assert has_applied_share_repair(
         con, account="A02", market="CN", ticker="AVB",
         ex_date="2026-08-17", action_type="split", ratio=2.793,
     ) is False

@@ -390,10 +390,17 @@ def has_applied_share_repair(
     ).fetchone()
     if table is None:
         return False
+    share_types = {"split", "bonus_or_transfer"}
+    if action_type in share_types:
+        type_clause = "action_type IN ('split','bonus_or_transfer')"
+        params = (account, market, ticker, ex_date, ratio)
+    else:
+        type_clause = "action_type=?"
+        params = (account, market, ticker, ex_date, action_type, ratio)
     return con.execute(
         "SELECT 1 FROM corporate_action_repairs WHERE account=? AND market=? "
-        "AND ticker=? AND ex_date=? AND action_type=? AND ABS(ratio-?)<1e-10 LIMIT 1",
-        (account, market, ticker, ex_date, action_type, ratio),
+        f"AND ticker=? AND ex_date=? AND {type_clause} AND ABS(ratio-?)<1e-10 LIMIT 1",
+        params,
     ).fetchone() is not None
 
 

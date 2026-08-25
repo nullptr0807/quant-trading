@@ -8,7 +8,10 @@ ROOT=${QUANT_PROJECT_ROOT:-/home/gexin/quant-trading}
 PYTHON=${QUANT_PYTHON:-$ROOT/venv/bin/python}
 mkdir -p "$(dirname "$LOG")"
 SCHEDULED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-record() { "$PYTHON" "$ROOT/scripts/record_operational_health.py" --db "$ROOT/data/trading.db" --component "$COMPONENT" --market "$MARKET" --scheduled-at "$SCHEDULED" "$@" >>"$LOG" 2>&1 || echo "scheduler health write failed component=$COMPONENT" >>"$LOG"; }
+record() {
+  "$PYTHON" "$ROOT/scripts/record_operational_health.py" --db "$ROOT/data/trading.db" \
+    --component "$COMPONENT" --market "$MARKET" --scheduled-at "$SCHEDULED" "$@" >>"$LOG" 2>&1
+}
 alert() {
   local text=$1 result="disabled"
   if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
@@ -20,7 +23,11 @@ exec 9>"$LOCK"
 if ! /usr/bin/flock -w "$WAIT" 9; then
   NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   echo "SCHEDULER_LOCK_TIMEOUT component=$COMPONENT market=$MARKET scheduled=$SCHEDULED at=$NOW wait=${WAIT}s" >>"$LOG"
-  record --status lock_timeout --stopped-at "$NOW" --exit-code 75 --detail '{"reason":"flock_timeout"}'
+  if ! record --status lock_timeout --stopped-at "$NOW" --exit-code 75 --detail '{"reason":"flock_timeout"}'; then
+    echo "scheduler health write failed component=$COMPONENT" >>"$LOG"
+    alert "⚠️ Quant $COMPONENT/$MARKET health write failed after lock timeout on $(hostname)"
+    exit 70
+  fi
   alert "⚠️ Quant $COMPONENT/$MARKET lock timeout on $(hostname)"
   exit 75
 fi
@@ -31,6 +38,10 @@ RC=$?
 STOP=$(date -u +%Y-%m-%dT%H:%M:%SZ); T1=$(date +%s); DURATION=$((T1-T0))
 if [[ $RC -eq 0 ]]; then STATUS=ok; else STATUS=failed; fi
 echo "SCHEDULER_STOP component=$COMPONENT market=$MARKET exit=$RC duration=${DURATION}s at=$STOP status=$STATUS" >>"$LOG"
-record --status "$STATUS" --started-at "$START" --stopped-at "$STOP" --exit-code "$RC" --duration "$DURATION"
+if ! record --status "$STATUS" --started-at "$START" --stopped-at "$STOP" --exit-code "$RC" --duration "$DURATION"; then
+  echo "scheduler health write failed component=$COMPONENT" >>"$LOG"
+  alert "⚠️ Quant $COMPONENT/$MARKET health write failed on $(hostname)"
+  exit 70
+fi
 if [[ $RC -ne 0 ]]; then alert "⚠️ Quant $COMPONENT/$MARKET failed on $(hostname), exit=$RC"; fi
 exit "$RC"

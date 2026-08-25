@@ -171,6 +171,28 @@ def test_operational_wrappers_have_private_umask_and_backup_restore_gate():
     assert "_quick_check(restored)" in backup
 
 
+def test_generic_scheduler_fails_closed_when_health_write_fails(tmp_path):
+    root = tmp_path / "quant"
+    (root / "scripts").mkdir(parents=True)
+    (root / "data").mkdir()
+    fake_python = root / "fake-python"
+    fake_python.write_text("#!/bin/sh\nexit 1\n")
+    fake_python.chmod(0o755)
+    runner = Path(__file__).parents[1] / "scripts" / "run_scheduled_job.sh"
+    log = root / "scheduler.log"
+
+    proc = subprocess.run(
+        ["/bin/bash", str(runner), "corporate_action_gate", "US", str(root / "gate.lock"),
+         "1", "10", str(log), "--", "/bin/true"],
+        env={**__import__('os').environ, "QUANT_PROJECT_ROOT": str(root),
+             "QUANT_PYTHON": str(fake_python)},
+        text=True, capture_output=True,
+    )
+
+    assert proc.returncode == 70
+    assert "scheduler health write failed component=corporate_action_gate" in log.read_text()
+
+
 def test_force_exit_runner_does_not_wait_for_orphan_provider_thread(tmp_path):
     module = tmp_path / "hanging_provider.py"
     module.write_text(

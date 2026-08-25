@@ -308,21 +308,40 @@ def check_price_1d_health(
     return issues
 
 
-def check_corporate_action_health(con: sqlite3.Connection) -> list[dict]:
-    """Propagate durable fast-gate failures at their recorded market scope."""
+def check_corporate_action_health(
+    con: sqlite3.Connection, *, now: datetime | None = None,
+) -> list[dict]:
+    """Require a fresh successful fast gate for every market, fail closed."""
+    now = _normalize_utc(now or datetime.now(timezone.utc))
     if not _table_exists(con, "operational_health"):
-        return []
+        return [{
+            "severity": "critical", "check": "corporate_action_gate",
+            "market": market, "scope": market, "status": "missing_health_table",
+        } for market in ("US", "CN")]
     rows = con.execute(
-        "SELECT component,market,status,source_timestamp,details "
-        "FROM operational_health WHERE component LIKE 'corporate_action%' "
-        "AND status!='ok' ORDER BY component,market"
+        "SELECT component,market,status,success_at,source_timestamp,details "
+        "FROM operational_health WHERE component='corporate_action_gate' "
+        "ORDER BY market"
     ).fetchall()
+    by_market = {str(row["market"]): row for row in rows}
     issues: list[dict] = []
-    for row in rows:
+    for market in ("US", "CN"):
+        row = by_market.get(market)
+        if row is None:
+            issues.append({
+                "severity": "critical", "check": "corporate_action_gate",
+                "market": market, "scope": market, "status": "missing",
+            })
+            continue
         try:
             detail = json.loads(row["details"] or "{}")
         except (TypeError, json.JSONDecodeError):
             detail = {"raw_details": row["details"]}
+        observed = _parse_datetime(row["source_timestamp"] or row["success_at"])
+        max_age = timedelta(hours=96 if now.weekday() == 0 else 36)
+        stale = observed is None or now - observed > max_age
+        if row["status"] == "ok" and not stale:
+            continue
         issue = {
             "severity": "critical",
             "check": "corporate_action_gate",
@@ -331,8 +350,11 @@ def check_corporate_action_health(con: sqlite3.Connection) -> list[dict]:
             "scope": row["market"],
             "status": row["status"],
             "source_timestamp": row["source_timestamp"],
+            "age_seconds": ((now - observed).total_seconds() if observed else None),
             "detail": detail,
         }
+        if stale and row["status"] == "ok":
+            issue["status"] = "stale"
         if isinstance(detail, dict) and "accounts" in detail:
             issue["accounts"] = detail["accounts"]
         issues.append(issue)
