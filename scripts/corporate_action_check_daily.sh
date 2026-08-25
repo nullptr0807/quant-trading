@@ -1,46 +1,37 @@
 #!/usr/bin/env bash
-# Daily read-only corporate-action audit. Never adjusts holdings automatically.
+# Daily corporate-action gate. The runner owns /usr/bin/flock and /usr/bin/timeout.
+# Alert delivery is centralized there via TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID.
 set -euo pipefail
+umask 077
 
-cd /home/gexin/quant-trading
-PYTHON=/home/gexin/quant-trading/venv/bin/python
-LOG=/home/gexin/quant-trading/logs/corporate_actions.log
+ROOT=${QUANT_PROJECT_ROOT:-/home/gexin/quant-trading}
+PYTHON=${QUANT_PYTHON:-$ROOT/venv/bin/python}
+RUNNER="$ROOT/scripts/run_scheduled_job.sh"
+LOG="$ROOT/logs/corporate_actions.log"
 LOCK=/tmp/quant_corporate_action_audit.lock
-TIMEOUT_SECONDS=${QUANT_CORPORATE_ACTION_TIMEOUT_SECONDS:-1200}
-
-if [ "${QUANT_CORP_ACTION_ALREADY_LOCKED:-0}" != "1" ]; then
-    export QUANT_CORP_ACTION_ALREADY_LOCKED=1
-    exec /usr/bin/flock -n "$LOCK" "$0" "$@"
-fi
-
+FAST_TIMEOUT=${QUANT_CORPORATE_ACTION_FAST_TIMEOUT_SECONDS:-300}
+FULL_TIMEOUT=${QUANT_CORPORATE_ACTION_TIMEOUT_SECONDS:-1200}
 start="${1:-$(date -u -d '14 days ago' +%F)}"
 end="${2:-$(date -u +%F)}"
-echo "===== Corporate-action audit start $(date -u +%Y-%m-%dT%H:%M:%SZ) range=$start..$end =====" >> "$LOG"
-set +e
-/usr/bin/timeout --kill-after=30s "${TIMEOUT_SECONDS}s" \
-    "$PYTHON" scripts/corporate_action_check.py \
-    --markets US,CN --start "$start" --end "$end" --min-fetch-coverage 1.0 \
-    >> "$LOG" 2>&1
-rc=$?
-set -e
 
-end_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-if [ "$rc" -eq 0 ]; then
-    echo "===== Corporate-action audit OK $end_ts =====" >> "$LOG"
-    exit 0
-fi
-
-echo "===== Corporate-action audit FAIL $end_ts exit=$rc =====" >> "$LOG"
-if [ -f "$HOME/.hermes/.env" ]; then
+if [[ -f "$HOME/.hermes/.env" ]]; then
     set -a
     # shellcheck source=/dev/null
     source "$HOME/.hermes/.env"
     set +a
 fi
-if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
-    curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-        -d "chat_id=${TELEGRAM_CHAT_ID}" \
-        --data-urlencode "text=⚠️ Corporate-action audit requires review on $(hostname), exit=$rc. No holdings were changed." \
-        >/dev/null 2>&1 || true
+
+# The safety gate is deliberately bounded to held and recently traded symbols.
+"$RUNNER" corporate_action_gate ALL "$LOCK" 5 "$FAST_TIMEOUT" "$LOG" -- \
+    "$PYTHON" "$ROOT/scripts/corporate_action_check.py" \
+    --scope fast --markets US,CN --start "$start" --end "$end" \
+    --min-fetch-coverage 1.0
+
+# Full historical-ledger coverage is separately observable and optional. It can
+# remain enabled as a slower secondary scan without delaying the primary gate.
+if [[ "${QUANT_CORPORATE_ACTION_FULL_SCAN:-0}" == "1" ]]; then
+    "$RUNNER" corporate_action_full_scan ALL "$LOCK" 5 "$FULL_TIMEOUT" "$LOG" -- \
+        "$PYTHON" "$ROOT/scripts/corporate_action_check.py" \
+        --scope full --markets US,CN --start "$start" --end "$end" \
+        --min-fetch-coverage 1.0
 fi
-exit "$rc"

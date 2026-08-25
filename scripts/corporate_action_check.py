@@ -81,7 +81,9 @@ def run_check(args: argparse.Namespace) -> dict[str, Any]:
 
     markets = {x.strip().upper() for x in args.markets.split(",") if x.strip()}
     focus = {x.strip() for x in args.accounts.split(",") if x.strip()} or None
-    result = run_audit(markets, focus, args.start, args.end, args.max_tickers)
+    result = run_audit(
+        markets, focus, args.start, args.end, args.max_tickers, scope=args.scope
+    )
     return evaluate_audit_result(
         result, min_fetch_coverage=args.min_fetch_coverage
     )
@@ -98,6 +100,10 @@ def parse_args() -> argparse.Namespace:
         "--end", default=datetime.now(timezone.utc).strftime("%Y-%m-%d")
     )
     parser.add_argument("--max-tickers", type=int, default=None)
+    parser.add_argument(
+        "--scope", choices=("fast", "full"), default="fast",
+        help="fast scans open/recent symbols; full scans all ledger symbols",
+    )
     parser.add_argument("--min-fetch-coverage", type=float, default=1.0)
     return parser.parse_args()
 

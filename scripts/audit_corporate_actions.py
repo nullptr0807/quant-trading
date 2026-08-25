@@ -65,6 +65,7 @@ class AffectedInterval:
     interval_end: str | None
     source: str
     severity: str
+    repair_applied: bool
 
 
 def connect() -> sqlite3.Connection:
@@ -126,6 +127,47 @@ def load_relevant_tickers(con: sqlite3.Connection, markets: set[str], focus_acco
     ).fetchall()
     out = {(r["market"], r["ticker"]) for r in rows} | {(r["market"], r["ticker"]) for r in rows2}
     return sorted(out)
+
+
+def load_priority_tickers(
+    con: sqlite3.Connection,
+    markets: set[str],
+    focus_accounts: set[str] | None,
+    *,
+    recent_since: str,
+) -> list[tuple[str, str]]:
+    """Return open holdings first, then bounded recent-trade symbols.
+
+    This is the scheduler-safe gate scope.  It deliberately excludes symbols
+    found only in old closed history; the slower full-ledger audit remains a
+    separate secondary job.
+    """
+    market_marks = ",".join("?" for _ in markets)
+    account_clause = ""
+    account_params: list[Any] = []
+    if focus_accounts:
+        account_clause = " AND account IN (%s)" % ",".join("?" for _ in focus_accounts)
+        account_params = sorted(focus_accounts)
+    open_rows = con.execute(
+        f"SELECT DISTINCT market,ticker FROM positions "
+        f"WHERE shares>0 AND market IN ({market_marks}){account_clause} "
+        "ORDER BY market,ticker",
+        [*sorted(markets), *account_params],
+    ).fetchall()
+    recent_rows = con.execute(
+        f"SELECT DISTINCT market,ticker FROM trades "
+        f"WHERE timestamp>=? AND market IN ({market_marks}){account_clause} "
+        "ORDER BY market,ticker",
+        [recent_since, *sorted(markets), *account_params],
+    ).fetchall()
+    ordered: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in [*open_rows, *recent_rows]:
+        item = (str(row["market"]), str(row["ticker"]))
+        if item not in seen:
+            seen.add(item)
+            ordered.append(item)
+    return ordered
 
 
 def _iter_action_series(raw: Any, preferred_column: str):
@@ -339,6 +381,22 @@ def accounts_for_ticker(con: sqlite3.Connection, market: str, ticker: str, focus
     return sorted({r["account"] for r in rows} | {r["account"] for r in rows2})
 
 
+def has_applied_share_repair(
+    con: sqlite3.Connection, *, account: str, market: str, ticker: str,
+    ex_date: str, action_type: str, ratio: float,
+) -> bool:
+    table = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='corporate_action_repairs'"
+    ).fetchone()
+    if table is None:
+        return False
+    return con.execute(
+        "SELECT 1 FROM corporate_action_repairs WHERE account=? AND market=? "
+        "AND ticker=? AND ex_date=? AND action_type=? AND ABS(ratio-?)<1e-10 LIMIT 1",
+        (account, market, ticker, ex_date, action_type, ratio),
+    ).fetchone() is not None
+
+
 def intervals_held(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     """Approximate holding intervals from trade rows, ignoring corporate actions."""
     intervals: list[dict[str, Any]] = []
@@ -410,7 +468,8 @@ def estimate_current_impact(pos: sqlite3.Row | None, ratio: float | None) -> tup
     return expected, px_f, impact
 
 
-def run_audit(markets: set[str], focus_accounts: set[str] | None, start: str, end: str, max_tickers: int | None) -> dict[str, Any]:
+def run_audit(markets: set[str], focus_accounts: set[str] | None, start: str,
+              end: str, max_tickers: int | None, *, scope: str = "full") -> dict[str, Any]:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     cache_path = OUT_DIR / "corporate_actions_cache.json"
     if cache_path.exists():
@@ -422,7 +481,15 @@ def run_audit(markets: set[str], focus_accounts: set[str] | None, start: str, en
         cache = {}
 
     con = connect()
-    tickers = load_relevant_tickers(con, markets, focus_accounts)
+    if scope == "fast":
+        tickers = load_priority_tickers(
+            con, markets, focus_accounts, recent_since=f"{start}T00:00:00+00:00"
+        )
+    elif scope == "full":
+        tickers = load_relevant_tickers(con, markets, focus_accounts)
+    else:
+        con.close()
+        raise ValueError("scope must be 'fast' or 'full'")
     if max_tickers:
         tickers = tickers[:max_tickers]
     actions: list[Action] = []
@@ -473,8 +540,19 @@ def run_audit(markets: set[str], focus_accounts: set[str] | None, start: str, en
             pos = current_position(con, acct, a.market, a.ticker)
             open_after = pos is not None and float(pos["shares"] or 0.0) > 0
             expected, current_px, impact = estimate_current_impact(pos, a.ratio)
+            repaired = bool(
+                a.action_type in {"split", "bonus_or_transfer"}
+                and a.ratio is not None
+                and has_applied_share_repair(
+                    con, account=acct, market=a.market, ticker=a.ticker,
+                    ex_date=a.ex_date, action_type=a.action_type, ratio=a.ratio,
+                )
+            )
+            if repaired and pos is not None:
+                expected = float(pos["shares"])
+                impact = 0.0
             if a.action_type in {"split", "bonus_or_transfer"} and a.ratio and held_before > 1e-9:
-                severity = "critical" if open_after else "warning"
+                severity = "info" if repaired else ("critical" if open_after else "warning")
             elif a.action_type == "cash_dividend" and held_before > 1e-9:
                 severity = "info"
             else:
@@ -492,6 +570,7 @@ def run_audit(markets: set[str], focus_accounts: set[str] | None, start: str, en
                 estimated_current_equity_impact=impact,
                 interval_start=iv0.get("start"), interval_end=iv0.get("end"),
                 source=a.source, severity=severity,
+                repair_applied=repaired,
             ))
 
     con.close()
@@ -518,12 +597,14 @@ def run_audit(markets: set[str], focus_accounts: set[str] | None, start: str, en
     # Summaries
     df_aff = pd.DataFrame([asdict(a) for a in affected])
     summary: dict[str, Any] = {
+        "scope": scope,
         "tickers_scanned": len(tickers),
         "actions_found": len(actions),
         "share_count_actions_found": sum(1 for a in actions if a.action_type in {"split", "bonus_or_transfer"}),
         "cash_dividends_found": sum(1 for a in actions if a.action_type == "cash_dividend"),
         "affected_intervals": len(affected),
         "fetch_errors": len(fetch_errors),
+        "repairs_already_applied": sum(1 for item in affected if item.repair_applied),
     }
     if not df_aff.empty:
         summary.update({
@@ -597,6 +678,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start", default="2026-01-01")
     p.add_argument("--end", default=datetime.now(timezone.utc).strftime("%Y-%m-%d"))
     p.add_argument("--max-tickers", type=int, default=None)
+    p.add_argument("--scope", choices=("fast", "full"), default="full")
     return p.parse_args()
 
 
@@ -604,7 +686,9 @@ def main():
     args = parse_args()
     markets = {x.strip().upper() for x in args.markets.split(",") if x.strip()}
     focus = {x.strip() for x in args.accounts.split(",") if x.strip()} or None
-    result = run_audit(markets, focus, args.start, args.end, args.max_tickers)
+    result = run_audit(
+        markets, focus, args.start, args.end, args.max_tickers, scope=args.scope
+    )
     print("SUMMARY_JSON")
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

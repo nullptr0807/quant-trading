@@ -256,6 +256,26 @@ def init_db(db_path: str | None = None):
     c.execute("CREATE INDEX IF NOT EXISTS idx_trades_market_ts ON trades(market, timestamp)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_events_market_ts ON events(market, ts)")
 
+    # Immutable audit trail for explicit open-position corporate-action repairs.
+    # The repair CLI also creates this table transactionally for older databases.
+    c.execute("""CREATE TABLE IF NOT EXISTS corporate_action_repairs (
+        action_key TEXT PRIMARY KEY,
+        account TEXT NOT NULL, market TEXT NOT NULL, ticker TEXT NOT NULL,
+        ex_date TEXT NOT NULL, action_type TEXT NOT NULL, ratio REAL NOT NULL,
+        source TEXT NOT NULL, raw TEXT, before_state TEXT NOT NULL,
+        after_state TEXT NOT NULL, raw_price_timestamp TEXT NOT NULL,
+        backup_handle TEXT NOT NULL, backup_sha256 TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+    )""")
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_corporate_action_repairs_scope "
+        "ON corporate_action_repairs(market,account,ticker,ex_date)"
+    )
+    c.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_corporate_action_repair_event "
+        "ON corporate_action_repairs(account,market,ticker,ex_date,action_type)"
+    )
+
     c.execute("""CREATE TABLE IF NOT EXISTS operational_health (
         component TEXT NOT NULL,
         market TEXT NOT NULL,
