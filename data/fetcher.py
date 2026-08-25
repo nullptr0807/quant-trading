@@ -46,12 +46,11 @@ def _utc_now() -> datetime:
 
 
 def latest_completed_session_date(market: str, now: datetime | None = None) -> date:
-    """Return the latest completed weekday trading session for ``market``.
+    """Return the latest completed exchange session for ``market``.
 
-    This deliberately has no online exchange-calendar dependency. It is exact
-    for close-time and weekend boundaries. On an exchange holiday it is
-    conservative: the weekday may be requested, while an empty provider result
-    simply leaves the previous cached session intact.
+    XNYS/XSHG calendars handle holidays, DST and special closes. A bounded
+    weekday fallback remains available if the installed calendar package is
+    unavailable, but production dependencies include exchange_calendars.
     """
     market = market.upper()
     try:
@@ -63,6 +62,18 @@ def latest_completed_session_date(market: str, now: datetime | None = None) -> d
     now = now or _utc_now()
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    try:
+        import exchange_calendars as xcals
+
+        calendar = xcals.get_calendar("XNYS" if market == "US" else "XSHG")
+        session = calendar.date_to_session(now.date(), direction="previous")
+        while calendar.session_close(session).to_pydatetime() > now:
+            session = calendar.previous_session(session)
+        return session.date()
+    except Exception as exc:
+        log.warning("exchange calendar unavailable for %s; using weekday fallback: %s", market, exc)
+
     local_now = now.astimezone(market_tz)
     target = local_now.date()
     if local_now.weekday() >= 5 or local_now.time() < close_time:

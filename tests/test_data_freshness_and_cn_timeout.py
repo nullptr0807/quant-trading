@@ -53,6 +53,23 @@ def test_latest_completed_us_session_uses_new_york_close_and_weekdays(now, expec
     assert latest_completed_session_date("US", now) == expected
 
 
+def test_latest_completed_session_uses_exchange_holidays_and_half_days():
+    from data.fetcher import latest_completed_session_date
+
+    # 2026-07-03 is the observed US Independence Day holiday.
+    assert latest_completed_session_date(
+        "US", datetime(2026, 7, 3, 22, 0, tzinfo=timezone.utc)
+    ) == date(2026, 7, 2)
+    # 2026-11-27 closes at 13:00 ET / 18:00 UTC.
+    assert latest_completed_session_date(
+        "US", datetime(2026, 11, 27, 18, 1, tzinfo=timezone.utc)
+    ) == date(2026, 11, 27)
+    # Golden Week is closed; XSHG's previous completed session is Sep 30.
+    assert latest_completed_session_date(
+        "CN", datetime(2026, 10, 5, 10, 0, tzinfo=timezone.utc)
+    ) == date(2026, 9, 30)
+
+
 def test_cn_price_health_waits_for_daily_provider_publication_grace():
     from scripts.health_check import price_health_target_date
 
