@@ -36,9 +36,14 @@ ACTIVE_BACKFILL_KEYS = {
 # history replay must never claim a wider window than that source can cover.
 RAW_LEDGER_SCHEDULE_DAYS = 5.0
 CASH_DIVIDEND_ACCOUNTING_POLICY = {
-    "mode": "manual_review",
+    "mode": "price_return_only",
+    "cash_dividends_included": False,
     "automatic_historical_cash_credits": False,
-    "health": "policy_not_implemented",
+    "health": "intentional_exclusion",
+    "reason": (
+        "corporate-action sources provide ex-date amounts but not a verified "
+        "pay-date/tax cash ledger; no spendable or historical cash is invented"
+    ),
 }
 DAILY_BAR_PUBLICATION_GRACE = {
     "US": timedelta(minutes=30),

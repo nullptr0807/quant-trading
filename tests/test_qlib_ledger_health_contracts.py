@@ -13,6 +13,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_cash_dividend_policy_is_explicitly_price_return_only():
+    from scripts.health_check import CASH_DIVIDEND_ACCOUNTING_POLICY
+
+    assert CASH_DIVIDEND_ACCOUNTING_POLICY["mode"] == "price_return_only"
+    assert CASH_DIVIDEND_ACCOUNTING_POLICY["cash_dividends_included"] is False
+    assert CASH_DIVIDEND_ACCOUNTING_POLICY["automatic_historical_cash_credits"] is False
+    assert CASH_DIVIDEND_ACCOUNTING_POLICY["health"] == "intentional_exclusion"
+
+
 def _qlib_wrapper_env(tmp_path: Path, **overrides: str) -> tuple[dict[str, str], Path]:
     """Build an isolated fake Qlib runtime; never touches the production DB."""
     fake_root = tmp_path / "quant"
@@ -417,8 +426,7 @@ def test_failed_corporate_action_health_is_market_scoped_and_dividend_policy_exp
     assert issues[0]["severity"] == "critical"
     assert issues[0]["market"] == "US"
     assert issues[0]["accounts"] == ["A02"]
-    assert CASH_DIVIDEND_ACCOUNTING_POLICY == {
-        "mode": "manual_review",
-        "automatic_historical_cash_credits": False,
-        "health": "policy_not_implemented",
-    }
+    assert CASH_DIVIDEND_ACCOUNTING_POLICY["mode"] == "price_return_only"
+    assert CASH_DIVIDEND_ACCOUNTING_POLICY["cash_dividends_included"] is False
+    assert CASH_DIVIDEND_ACCOUNTING_POLICY["automatic_historical_cash_credits"] is False
+    assert CASH_DIVIDEND_ACCOUNTING_POLICY["health"] == "intentional_exclusion"
