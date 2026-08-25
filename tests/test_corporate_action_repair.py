@@ -436,3 +436,7 @@ def test_daily_wrapper_publishes_scheduler_health_and_keeps_full_scan_secondary(
     assert "--scope fast" in wrapper
     assert "--scope full" in wrapper
     assert "QUANT_CORPORATE_ACTION_FULL_SCAN" in wrapper
+    assert 'for market in CN US' in wrapper
+    assert 'corporate_action_gate "$market"' in wrapper
+    assert 'corporate_action_gate ALL' not in wrapper
+    assert 'overall=0' in wrapper and 'exit "$overall"' in wrapper
