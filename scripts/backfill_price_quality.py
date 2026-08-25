@@ -24,8 +24,16 @@ def scan(db: str, apply: bool=False, confirm: str='') -> dict:
             )
             count=con.execute(f'SELECT COUNT(*) FROM {table} WHERE {predicate}').fetchone()[0]
             totals[mode]=count
-            if apply and count:
+            if apply:
                 now=datetime.now(timezone.utc).isoformat()
+                # Synchronize markers to current persisted provider rows. This
+                # removes stale tombstones left behind after a valid refetch,
+                # while preserving every raw OHLC row for audit.
+                con.execute(
+                    "DELETE FROM price_quality_issues "
+                    "WHERE price_mode=? AND issue_type='invalid_ohlc'",
+                    (mode,),
+                )
                 con.execute(f"""
                     INSERT OR REPLACE INTO price_quality_issues
                     (price_mode,ticker,datetime,interval,issue_type,detected_at,detail)

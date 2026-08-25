@@ -77,6 +77,16 @@ def _record_price_quality_issues(conn: sqlite3.Connection, rows: list[tuple], pr
         issue = _price_quality_issue(row)
         if issue:
             issues.append((price_mode, row[0], row[1], row[2], issue[0], now, issue[1]))
+        else:
+            # A later provider refresh may repair a previously invalid bar.
+            # Clear only the matching marker; the original audit row has just
+            # been replaced by the valid provider payload in the same txn.
+            conn.execute(
+                "DELETE FROM price_quality_issues "
+                "WHERE price_mode=? AND ticker=? AND datetime=? AND interval=? "
+                "AND issue_type='invalid_ohlc'",
+                (price_mode, row[0], row[1], row[2]),
+            )
     if issues:
         conn.executemany(
             "INSERT OR REPLACE INTO price_quality_issues "

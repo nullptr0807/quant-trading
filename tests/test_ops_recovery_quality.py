@@ -96,6 +96,13 @@ def test_ohlc_quarantine_filters_research_but_preserves_audit_rows(tmp_path):
     assert set(audit.ticker) == {"OK", "BAD"}
     assert store.count_price_quality_issues(interval="1d")["invalid_ohlc"] == 1
 
+    repaired = rows.loc[rows.ticker == "BAD"].copy()
+    repaired.loc[:, ["open", "high", "low", "close"]] = [10, 12, 8, 11]
+    store.save_prices_bulk(repaired, interval="1d")
+    research = store.load_prices(["BAD"], "2026-07-01", "2026-07-11", interval="1d")
+    assert set(research.ticker) == {"BAD"}
+    assert store.count_price_quality_issues(interval="1d").get("invalid_ohlc", 0) == 0
+
 
 def test_online_backup_compresses_hashes_and_restore_checks(tmp_path):
     from scripts.backup_trading_db import create_backup
