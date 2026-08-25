@@ -39,10 +39,11 @@ def record_operational_health(
         "SELECT success_at FROM operational_health WHERE component=? AND market=?",
         (component, market),
     ).fetchone()
+    last_success_at = row[0] if row and row[0] else None
     success_at = (
         (stopped_at or recorded_at)
         if status == "ok"
-        else (row[0] if row else scheduled_at)
+        else (last_success_at or "")
     )
     stop_scan = None
     if component == "update_prices" and status == "ok":
@@ -51,7 +52,8 @@ def record_operational_health(
         stop_scan = stopped_at or recorded_at
     detail.update({
         "scheduled_at": scheduled_at, "actual_start": started_at,
-        "stopped_at": stopped_at, "exit_code": exit_code,
+        "stopped_at": stopped_at, "attempt_stopped_at": stopped_at,
+        "exit_code": exit_code, "last_success_at": success_at or None,
         "duration_seconds": duration, "last_successful_stop_scan": stop_scan,
     })
     packed = json.dumps(detail, ensure_ascii=False, sort_keys=True)
