@@ -65,7 +65,9 @@ if [ "${QUANT_QLIB_ALREADY_LOCKED:-0}" != "1" ]; then
     if [ "$rc" -eq "$LOCK_CONFLICT_RC" ]; then
         now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo "===== Qlib retrain [$MARKET] LOCK_TIMEOUT $now =====" >> "$LOG"
-        record_health lock_timeout 75 '{"reason":"lock_timeout"}' "$now" "$now" 0 || true
+        if ! record_health lock_timeout 75 '{"reason":"lock_timeout"}' "$now" "$now" 0; then
+            exit 70
+        fi
         exit 75
     fi
     if [ "$rc" -ne 0 ]; then
@@ -90,10 +92,23 @@ total_timeout=${QLIB_TOTAL_TIMEOUT_SECONDS:-14400}
 verify_timeout=${QLIB_VERIFY_TIMEOUT_SECONDS:-600}
 echo "===== Qlib retrain [$MARKET] start $start args=${run_args[*]} =====" >> "$LOG"
 set +e
-/usr/bin/timeout --kill-after=60s "${total_timeout}s" \
-    "$PYTHON" -m scripts.qlib_retrain "${run_args[@]}" >> "$LOG" 2>&1
+phase=universe_snapshot
+/usr/bin/timeout --kill-after=15s "${QLIB_UNIVERSE_SNAPSHOT_TIMEOUT_SECONDS:-120}s" \
+    "$PYTHON" -m scripts.snapshot_universe --db "$DB" --market "$MARKET" \
+    --source qlib_pretrain >> "$LOG" 2>&1
 rc=$?
-phase=retrain
+if [ "$rc" -eq 0 ]; then
+    phase=retrain
+    elapsed=$(($(date +%s)-t0))
+    remaining=$((total_timeout-elapsed))
+    if [ "$remaining" -le 0 ]; then
+        rc=124
+    else
+        /usr/bin/timeout --kill-after=60s "${remaining}s" \
+            "$PYTHON" -m scripts.qlib_retrain "${run_args[@]}" >> "$LOG" 2>&1
+        rc=$?
+    fi
+fi
 if [ "$rc" -eq 0 ]; then
     phase=verify
     elapsed=$(($(date +%s)-t0))
@@ -127,7 +142,10 @@ reason=retrain_or_verify_failed
 if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
     reason=timeout
 fi
-record_health failed "$rc" "{\"reason\":\"$reason\",\"phase\":\"$phase\"}" "$start" "$end" "$duration" || true
+if ! record_health failed "$rc" "{\"reason\":\"$reason\",\"phase\":\"$phase\"}" "$start" "$end" "$duration"; then
+    echo "===== Qlib retrain [$MARKET] FAIL  $end exit=70 phase=health_write =====" >> "$LOG"
+    exit 70
+fi
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
     curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
         -d "chat_id=${TELEGRAM_CHAT_ID}" \

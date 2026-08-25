@@ -86,6 +86,8 @@ if args and args[0].endswith('record_operational_health.py'):
     if os.environ.get('FAKE_HEALTH_RC'):
         raise SystemExit(int(os.environ['FAKE_HEALTH_RC']))
     raise SystemExit(subprocess.run([sys.executable, {str(writer)!r}, *args[1:]]).returncode)
+if args[:2] == ['-m', 'scripts.snapshot_universe']:
+    raise SystemExit(int(os.environ.get('FAKE_SNAPSHOT_RC', '0')))
 if args[:2] == ['-m', 'scripts.qlib_retrain']:
     time.sleep(float(os.environ.get('FAKE_RETRAIN_SLEEP', '0')))
     raise SystemExit(int(os.environ.get('FAKE_RETRAIN_RC', '0')))
@@ -168,6 +170,18 @@ def test_qlib_wrapper_child_rc1_stays_failed_rc1_with_one_record(tmp_path):
 
     assert proc.returncode == 1
     assert _scheduler_rows(db) == [("failed", 1)]
+
+
+def test_qlib_wrapper_snapshot_failure_blocks_training_and_records_phase(tmp_path):
+    env, db = _qlib_wrapper_env(tmp_path, FAKE_SNAPSHOT_RC="6")
+
+    proc = _run_qlib_wrapper(env)
+
+    assert proc.returncode == 6
+    assert _scheduler_rows(db) == [("failed", 6)]
+    with sqlite3.connect(db) as con:
+        detail = json.loads(con.execute("SELECT detail FROM scheduler_runs").fetchone()[0])
+    assert detail["phase"] == "universe_snapshot"
 
 
 def test_qlib_wrapper_contention_maps_only_conflict_to_75_once(tmp_path):
