@@ -320,10 +320,12 @@ def check_corporate_action_health(
         } for market in ("US", "CN")]
     rows = con.execute(
         "SELECT component,market,status,success_at,source_timestamp,details "
-        "FROM operational_health WHERE component='corporate_action_gate' "
-        "ORDER BY market"
+        "FROM operational_health WHERE component IN ('corporate_action_gate','corporate_action_fast') "
+        "ORDER BY market, CASE component WHEN 'corporate_action_gate' THEN 0 ELSE 1 END"
     ).fetchall()
-    by_market = {str(row["market"]): row for row in rows}
+    by_market: dict[str, sqlite3.Row] = {}
+    for row in rows:
+        by_market.setdefault(str(row["market"]), row)
     issues: list[dict] = []
     for market in ("US", "CN"):
         row = by_market.get(market)
