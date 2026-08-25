@@ -221,3 +221,46 @@ def test_cli_requires_explicit_live_flag_and_forwards_safety_modes(monkeypatch):
 
     assert update_prices.main(["--db", "/tmp/test.db", "--live"]) == 0
     assert calls.pop() == ("/tmp/test.db", False, False)
+
+
+def test_stop_loss_market_filter_prevents_cross_market_execution_scope(tmp_path, monkeypatch):
+    db = tmp_path / "trading.db"
+    _seed_account(db)
+    monkeypatch.setattr(update_prices, "_is_market_hours_now", lambda: True)
+    monkeypatch.setattr(update_prices, "_is_market_open_for", lambda market: True)
+    monkeypatch.setitem(update_prices.STOP_LOSS_BY_ACCT, "A01", 0.05)
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        us = update_prices.check_stop_losses(
+            conn, {"AAPL": 90.0}, execute=False, db_path=str(db), markets={"US"}
+        )
+        cn = update_prices.check_stop_losses(
+            conn, {"AAPL": 90.0}, execute=False, db_path=str(db), markets={"CN"}
+        )
+    assert [x["account"] for x in us] == ["A01"]
+    assert cn == []
+
+
+def test_live_market_allowlist_is_validated_before_execution(tmp_path, monkeypatch):
+    db = tmp_path / "trading.db"
+    _seed_account(db)
+    monkeypatch.setenv("QUANT_LIVE_TRADE_MARKETS", "US,INVALID")
+    monkeypatch.setattr(update_prices, "_is_us_market_hours_now", lambda: True)
+    monkeypatch.setattr(update_prices, "_is_us_regular_session_now", lambda: True)
+    monkeypatch.setattr(update_prices, "_is_cn_market_hours_now", lambda: False)
+    now = update_prices._utc_now()
+    monkeypatch.setattr(
+        update_prices, "fetch_quote_metadata",
+        lambda tickers: {
+            "AAPL": __import__("data.quotes", fromlist=["RealtimeQuote"]).RealtimeQuote(
+                ticker="AAPL", price=101.0, source="test", source_timestamp=now,
+                received_at=now, tradable=True,
+            )
+        },
+    )
+    try:
+        update_prices.update_equity_snapshots(str(db))
+    except ValueError as exc:
+        assert "QUANT_LIVE_TRADE_MARKETS" in str(exc)
+    else:
+        raise AssertionError("invalid live market allowlist was accepted")

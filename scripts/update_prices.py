@@ -402,6 +402,7 @@ def check_stop_losses(
     *,
     execute: bool = True,
     db_path: str | None = None,
+    markets: set[str] | None = None,
 ) -> list[dict]:
     """Scan all positions and return triggered protective sells.
 
@@ -443,6 +444,8 @@ def check_stop_losses(
         if acct in retired_accts:
             continue
         acct_market = market_by_acct.get(acct, "US")
+        if markets is not None and acct_market not in markets:
+            continue
         if not _is_market_open_for(acct_market):
             continue
         from config.security_master import ticker_lifecycle_block_reason
@@ -750,6 +753,15 @@ def update_equity_snapshots(
                 len(blocked_force), len(held), ",".join(blocked_force[:20]),
             )
     allow_trades = not (dry_run or no_trades)
+    configured_trade_markets = {
+        value.strip().upper()
+        for value in os.environ.get("QUANT_LIVE_TRADE_MARKETS", "US,CN").split(",")
+        if value.strip()
+    }
+    if not configured_trade_markets <= {"US", "CN"}:
+        raise ValueError(
+            "QUANT_LIVE_TRADE_MARKETS must contain only US and/or CN"
+        )
     if allow_trades and us_extended_open and not us_regular_open:
         LOG.info("US extended-hours tick: protective sells disabled; snapshots only")
     execution_quotes = {
@@ -770,12 +782,19 @@ def update_equity_snapshots(
     # 1. Stop-loss check FIRST. CN needs prev-close/volume metadata. Safety
     # modes call the same decision path with execute=False; the helper itself
     # guarantees no transaction or audit-event writes in that mode.
-    stop_candidates = check_stop_losses(
-        conn, execution_quotes,
-        execute=allow_trades,
-        db_path=db_path,
-    )
-    stop_executed = [] if not allow_trades else stop_candidates
+    stop_candidates: list[dict] = []
+    stop_executed: list[dict] = []
+    for execution_market in ("US", "CN"):
+        market_execute = allow_trades and execution_market in configured_trade_markets
+        market_candidates = check_stop_losses(
+            conn, execution_quotes,
+            execute=market_execute,
+            db_path=db_path,
+            markets={execution_market},
+        )
+        stop_candidates.extend(market_candidates)
+        if market_execute:
+            stop_executed.extend(market_candidates)
     if dry_run:
         conn.close()
         LOG.info(
@@ -796,6 +815,13 @@ def update_equity_snapshots(
         LOG.info(
             "No-trades mode: suppressed %d otherwise executable protective sells",
             len(stop_candidates),
+        )
+    elif allow_trades and len(stop_candidates) > len(stop_executed):
+        LOG.info(
+            "Market-scoped live mode: executed %d and suppressed %d protective sells; "
+            "allowed_markets=%s",
+            len(stop_executed), len(stop_candidates) - len(stop_executed),
+            ",".join(sorted(configured_trade_markets)),
         )
     if stop_executed:
         conn.commit()  # persist before equity recomputation
