@@ -1226,7 +1226,16 @@ class QuantSystem:
                 f for f in self._per_account_mined.get(gp_strat.id, [])
                 if self._is_active_mined_factor(f)
             ]
-            names = [f.get("name") for f in mined if f.get("name")]
+            names = [str(f.get("name")) for f in mined if f.get("name")]
+            if not names:
+                # Runtime readiness was already published as non_tradeable by
+                # _publish_gp_runtime_statuses. Do not run the persisted-data
+                # gate for an intentionally empty configuration: that produces
+                # a false operational error on every otherwise healthy cycle.
+                self._per_account_gp_factors[gp_strat.id] = {}
+                self._prepared_gp_signals[gp_strat.id] = {"buy": [], "sell": []}
+                log.info("[%s] skipped: runtime non-tradeable (no active factors)", gp_strat.id)
+                continue
             prefix = "fmgp" if getattr(gp_strat, "family", "B") == "F" else "gp"
             frames = self._load_latest_persisted_factor_frames(
                 account_id=gp_strat.id,

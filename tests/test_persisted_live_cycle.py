@@ -136,6 +136,32 @@ def test_persisted_gp_and_f_load_only_their_group_and_active_factor_names(
     assert system._prepared_gp_signals["F11"]["buy"][0] == "CCC"
 
 
+def test_persisted_cycle_skips_explicit_empty_gp_config_without_data_gate_error(
+    tmp_path, monkeypatch
+):
+    system = _bare_system(tmp_path, universe=("AAA",))
+    system.gp_strategies = [
+        SimpleNamespace(
+            id="F12", family="F", factor_selection="all",
+            scoring_method="equal_weight", top_n=1, rebalance_hours=4,
+        ),
+    ]
+    system._per_account_mined = {
+        "F12": [{"name": "old", "expression": "X0", "active": False}],
+    }
+    system.engine.create_account("F12", initial_cash=10_000)
+    monkeypatch.setattr(
+        system, "_load_latest_persisted_factor_frames",
+        lambda **kwargs: pytest.fail("empty config must skip persisted data gate"),
+    )
+
+    quote_tickers = system.prepare_fast_live_cycle()
+
+    assert system._per_account_gp_factors["F12"] == {}
+    assert system._prepared_gp_signals["F12"] == {"buy": [], "sell": []}
+    assert quote_tickers == {"SPY"}
+
+
 @pytest.mark.parametrize(
     ("factor_date", "covered", "reason"),
     [
