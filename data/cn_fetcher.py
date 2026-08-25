@@ -28,8 +28,17 @@ log = logging.getLogger("quant.cn")
 
 CN_HISTORICAL_BATCH_TIMEOUT_S = 120.0
 
-# A-share index codes we treat specially (akshare uses stock_zh_index_daily for these)
-INDEX_CODES = {"000300", "000001", "399001", "399006", "000016", "000905"}
+# A-share index tickers we treat specially (akshare uses
+# stock_zh_index_daily for these).  The exchange suffix is part of the
+# identity: 000001.SZ is Ping An Bank, while 000001.SH is the SSE Composite.
+INDEX_TICKERS = {
+    "000300.SH", "000001.SH", "399001.SZ", "399006.SZ", "000016.SH", "000905.SH",
+}
+
+
+def _utc_now() -> datetime:
+    """Injectable UTC clock for daily-session boundary tests."""
+    return datetime.now(timezone.utc)
 
 
 def _split_code(ticker: str) -> tuple[str, str]:
@@ -56,7 +65,7 @@ def _hist_one(ticker: str, start: str, end: str, interval: str,
         log.warning("skip bad CN ticker: %s", e)
         return pd.DataFrame()
 
-    is_index = code in INDEX_CODES
+    is_index = ticker.upper() in INDEX_TICKERS
     last_err = None
     for attempt in range(max_retries):
         try:
@@ -186,9 +195,20 @@ class CNDataFetcher:
                        price_mode: str = "adjusted",
                        batch_timeout_s: float = CN_HISTORICAL_BATCH_TIMEOUT_S,
                        historical_workers: int = 1) -> pd.DataFrame:
-        end = datetime.now(timezone.utc).replace(tzinfo=None)
+        now_utc = _utc_now()
+        end = now_utc.replace(tzinfo=None)
         start = end - timedelta(days=days)
         s, e = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+        if interval == "1d":
+            from data.fetcher import latest_completed_session_date
+            target_session = latest_completed_session_date("CN", now_utc)
+            # Index filtering below uses an exclusive end boundary. Request
+            # through the day after the latest completed session so the target
+            # bar is never silently omitted after the CN close.
+            fetch_e = (target_session + timedelta(days=1)).isoformat()
+        else:
+            target_session = None
+            fetch_e = e
         # DataStore.load_prices uses an exclusive end bound. Daily bars are
         # stamped at midnight, so querying through today's date would otherwise
         # silently drop the latest completed CN session.
@@ -216,10 +236,15 @@ class CNDataFetcher:
                 if not c or c[2] < expected:
                     missing.append(t)
                     continue
-                # Freshness: max datetime within 3 days of end
+                # Daily freshness is exact against the latest completed CN
+                # session. Intraday keeps the bounded three-day tolerance.
                 try:
                     max_d = datetime.fromisoformat(c[1].replace("Z", "").split("+")[0])
-                    if (end - max_d).days > 3:
+                    if interval == "1d":
+                        assert target_session is not None
+                        if max_d.date() < target_session:
+                            missing.append(t)
+                    elif (end - max_d).days > 3:
                         missing.append(t)
                 except Exception:
                     missing.append(t)
@@ -233,7 +258,7 @@ class CNDataFetcher:
             log.info("📥 [CN %s] %dd | CACHE %d/%d (%d rows) | DOWNLOADING %d via akshare...",
                      interval, days, hit, len(tickers), len(cached), len(missing))
             frames = _fetch_historical_batch(
-                missing, s, e, interval, price_mode, batch_timeout_s,
+                missing, s, fetch_e, interval, price_mode, batch_timeout_s,
                 max_workers=historical_workers,
             )
             dl_rows = sum(len(f) for f in frames)
@@ -248,7 +273,7 @@ class CNDataFetcher:
 
         # use_cache=False — force refresh
         frames = _fetch_historical_batch(
-            tickers, s, e, interval, price_mode, batch_timeout_s,
+            tickers, s, fetch_e, interval, price_mode, batch_timeout_s,
             max_workers=historical_workers,
         )
         if not frames:

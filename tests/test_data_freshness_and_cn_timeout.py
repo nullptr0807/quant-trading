@@ -139,6 +139,57 @@ def test_daily_yahoo_request_includes_completed_target_with_exclusive_end(monkey
     assert calls[0][2] == "2026-07-11"
 
 
+def test_cn_index_identity_includes_exchange_suffix():
+    from data.cn_fetcher import INDEX_TICKERS
+
+    assert "000001.SH" in INDEX_TICKERS
+    assert "000001.SZ" not in INDEX_TICKERS
+
+
+def test_cn_daily_request_includes_completed_target_with_exclusive_end(monkeypatch):
+    import data.cn_fetcher as cn_fetcher
+
+    calls = []
+
+    class Store:
+        def save_prices_bulk(self, *args, **kwargs):
+            pass
+
+    fetcher = object.__new__(cn_fetcher.CNDataFetcher)
+    fetcher.store = Store()
+    monkeypatch.setattr(
+        cn_fetcher,
+        "_utc_now",
+        lambda: datetime(2026, 8, 24, 9, 0, tzinfo=timezone.utc),
+    )
+
+    def fake_batch(tickers, start, end, interval, price_mode, timeout_s, max_workers=1):
+        calls.append((tickers, start, end, interval, price_mode))
+        return []
+
+    monkeypatch.setattr(cn_fetcher, "_fetch_historical_batch", fake_batch)
+    result = fetcher.get_historical(
+        ["000300.SH"], days=5, interval="1d", use_cache=False,
+    )
+
+    assert result.empty
+    assert calls[0][2] == "2026-08-25"
+
+
+def test_backfill_target_date_staleness_checks_latest_bar_not_lifetime_count():
+    from scripts.backfill_prices import _stale_for_target
+
+    coverage = {
+        "FRESH": ("2020-01-01", "2026-08-24 00:00:00", 1000),
+        "STALE": ("2020-01-01", "2026-08-21 00:00:00", 2000),
+        "BAD": ("2020-01-01", "not-a-date", 3000),
+    }
+
+    assert _stale_for_target(
+        coverage, ["FRESH", "STALE", "BAD", "MISSING"], "2026-08-24"
+    ) == ["STALE", "BAD", "MISSING"]
+
+
 class _RecordingHistoricalExecutor:
     instances = []
 

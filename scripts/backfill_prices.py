@@ -89,6 +89,24 @@ def _dedupe(seq):
     return list(dict.fromkeys(seq))
 
 
+def _stale_for_target(coverage: dict, tickers: list[str], target_date: str) -> list[str]:
+    """Return tickers whose newest daily bar is older than target_date."""
+    stale = []
+    for ticker in tickers:
+        row = coverage.get(ticker)
+        if not row or not row[1]:
+            stale.append(ticker)
+            continue
+        try:
+            latest = datetime.fromisoformat(str(row[1]).replace("Z", "").split("+")[0]).date()
+        except (TypeError, ValueError):
+            stale.append(ticker)
+            continue
+        if latest.isoformat() < target_date:
+            stale.append(ticker)
+    return stale
+
+
 def backfill(interval: str, days: int, batch_size: int = 50, market: str = "US", price_mode: str = "adjusted", scope: str = "universe"):
     if market == "CN":
         from config.settings import CN_UNIVERSE, BENCHMARKS_BY_MARKET
@@ -130,6 +148,38 @@ def backfill(interval: str, days: int, batch_size: int = 50, market: str = "US",
     missing = [t for t in tickers if t not in cov]
     if missing:
         log.warning("Missing %d tickers (first 20): %s", len(missing), missing[:20])
+
+    if interval == "1d":
+        from data.fetcher import latest_completed_session_date
+        target_date = latest_completed_session_date(market).isoformat()
+        stale = _stale_for_target(cov, tickers, target_date)
+        if stale:
+            # Batch providers can return a non-empty historical frame while
+            # silently omitting a few target-session bars. Retry only the stale
+            # set once, then verify the persisted cache instead of declaring a
+            # false green based on lifetime row counts.
+            log.warning(
+                "Target-date retry: %d/%d stale for %s (first 20): %s",
+                len(stale), len(tickers), target_date, stale[:20],
+            )
+            fetcher.get_historical(
+                stale, days=days, interval=interval, use_cache=False,
+                price_mode=price_mode,
+            )
+            cov = fetcher.store.get_price_coverage(
+                tickers, interval=interval, price_mode=price_mode,
+            )
+            stale = _stale_for_target(cov, tickers, target_date)
+
+        fresh = len(tickers) - len(stale)
+        log.info(
+            "Target-date coverage: %d/%d at %s", fresh, len(tickers), target_date,
+        )
+        if stale:
+            raise RuntimeError(
+                f"target-date coverage incomplete for {market}/{price_mode}/{scope}: "
+                f"{fresh}/{len(tickers)} at {target_date}; stale={stale[:20]}"
+            )
 
 
 def main():
