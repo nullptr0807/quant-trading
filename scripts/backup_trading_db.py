@@ -27,6 +27,12 @@ def _quick_check(path: Path) -> None:
         raise RuntimeError(f"quick_check failed for {path}: {result}")
 
 
+def _remove_sqlite_sidecars(path: Path) -> None:
+    """Remove transient WAL/SHM files created while verifying a snapshot."""
+    for suffix in ("-wal", "-shm"):
+        Path(str(path) + suffix).unlink(missing_ok=True)
+
+
 def create_backup(source: Path, out_dir: Path, *, keep: int = 7) -> dict:
     source = source.resolve(); out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -67,12 +73,14 @@ def create_backup(source: Path, out_dir: Path, *, keep: int = 7) -> dict:
         for stale in backups[max(1, keep):]:
             stale.unlink(missing_ok=True)
             Path(str(stale) + ".sha256").unlink(missing_ok=True)
+            _remove_sqlite_sidecars(Path(str(stale)[:-4]))
         return {"path": str(compressed), "sha256": h.hexdigest(), "quick_check": "ok", "restore_drill": "ok"}
     except Exception:
         compressed.unlink(missing_ok=True); digest_file.unlink(missing_ok=True)
         raise
     finally:
         raw.unlink(missing_ok=True)
+        _remove_sqlite_sidecars(raw)
 
 
 def main() -> int:

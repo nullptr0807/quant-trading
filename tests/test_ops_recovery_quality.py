@@ -107,6 +107,30 @@ def test_online_backup_compresses_hashes_and_restore_checks(tmp_path):
     assert sorted(p.suffix for p in (tmp_path / "backups").iterdir()) == ['.sha256', '.zst']
 
 
+def test_online_backup_removes_snapshot_wal_sidecars(tmp_path, monkeypatch):
+    from scripts import backup_trading_db as backup
+
+    db = tmp_path / "source.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE t(x INTEGER)")
+    con.execute("INSERT INTO t VALUES (1)")
+    con.commit(); con.close()
+
+    original = backup._quick_check
+    def checking_with_sidecars(path):
+        original(path)
+        Path(str(path) + "-wal").touch()
+        Path(str(path) + "-shm").touch()
+
+    monkeypatch.setattr(backup, "_quick_check", checking_with_sidecars)
+    result = backup.create_backup(db, tmp_path / "backups", keep=2)
+
+    artifact = Path(result["path"])
+    raw = Path(str(artifact)[:-4])
+    assert not Path(str(raw) + "-wal").exists()
+    assert not Path(str(raw) + "-shm").exists()
+
+
 def test_permissions_are_dry_run_by_default_and_apply_is_explicit(tmp_path):
     root = tmp_path / "quant"
     (root / "logs").mkdir(parents=True)
