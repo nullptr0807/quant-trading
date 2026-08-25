@@ -1,5 +1,6 @@
 import importlib.util
 import sqlite3
+from datetime import timedelta
 from pathlib import Path
 
 
@@ -139,6 +140,36 @@ def test_no_trades_updates_snapshots_without_selling(tmp_path, monkeypatch):
         assert conn.execute("SELECT cash FROM account_state WHERE account='A01'").fetchone()[0] == 9000
         assert conn.execute("SELECT current_price FROM positions WHERE account='A01'").fetchone()[0] == 90
         assert conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == before_counts["accounts"] + 1
+
+
+def test_force_no_trades_rejects_stale_provider_quote_without_overwriting_mark(tmp_path, monkeypatch):
+    db = tmp_path / "trading.db"
+    _seed_account(db)
+    before_counts = _table_counts(db)
+    now = update_prices._utc_now()
+    monkeypatch.setenv("QUANT_FORCE_PRICE_UPDATE", "1")
+    monkeypatch.setattr(update_prices, "_is_us_market_hours_now", lambda: False)
+    monkeypatch.setattr(update_prices, "_is_us_regular_session_now", lambda: False)
+    monkeypatch.setattr(update_prices, "_is_cn_market_hours_now", lambda: False)
+    monkeypatch.setattr(
+        update_prices,
+        "fetch_quote_metadata",
+        lambda tickers: {
+            "AAPL": __import__("data.quotes", fromlist=["RealtimeQuote"]).RealtimeQuote(
+                ticker="AAPL", price=184.06, source="stale-pre-split-test",
+                source_timestamp=now - timedelta(days=10), received_at=now,
+                tradable=True,
+            )
+        },
+    )
+
+    stats = update_prices.update_equity_snapshots(str(db), no_trades=True)
+
+    assert stats["no_trades"] is True
+    assert stats["accounts_updated"] == 0
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT current_price FROM positions").fetchone()[0] == 100
+        assert conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == before_counts["accounts"]
 
 
 def test_no_trades_routes_risk_regime_to_selected_database(tmp_path, monkeypatch):

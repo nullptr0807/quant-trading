@@ -729,12 +729,26 @@ def update_equity_snapshots(
         for ticker, price in prices_from_quotes(quote_metadata).items()
         if ticker in valid_live
     }
-    # Closed-market force-refresh quotes without a provider timestamp remain
-    # display-only; include their positive prices but never use them for trades.
+    # Closed-market force refresh is allowed to use the latest completed-session
+    # quote for display, but it must never bypass provider timestamp/tradability.
+    # Otherwise a pre-split stale quote can overwrite a repaired raw coordinate.
     if force_update:
+        force_max_age = float(
+            os.environ.get("QUANT_FORCE_MAX_QUOTE_AGE_SECONDS", "129600")
+        )
+        valid_force = valid_quote_tickers(
+            quote_metadata, held, now=now, max_age_seconds=force_max_age,
+        )
         for ticker, quote in quote_metadata.items():
-            if quote.price and quote.price > 0:
+            if ticker in valid_force and quote.price and quote.price > 0:
                 prices[ticker] = float(quote.price)
+        blocked_force = sorted(set(held) - valid_force)
+        if blocked_force:
+            LOG.warning(
+                "Force-refresh quote gate rejected %d/%d stale, timestamp-less, or "
+                "non-tradable quotes: %s",
+                len(blocked_force), len(held), ",".join(blocked_force[:20]),
+            )
     allow_trades = not (dry_run or no_trades)
     if allow_trades and us_extended_open and not us_regular_open:
         LOG.info("US extended-hours tick: protective sells disabled; snapshots only")
