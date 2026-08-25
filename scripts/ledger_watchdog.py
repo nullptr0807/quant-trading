@@ -787,14 +787,22 @@ def check_account(
         else:
             mv += float(p["shares"] or 0.0) * float(px)
         upd = parse_ts(p.get("updated_at"))
-        if status != "retired" and upd is not None:
-            age_h = (now - upd).total_seconds() / 3600.0
-            if age_h > args.stale_price_hours:
-                stale_positions.append({"ticker": ticker, "updated_at": p.get("updated_at"), "age_hours": round(age_h, 1)})
+        if status != "retired":
+            if upd is None:
+                stale_positions.append({
+                    "ticker": ticker,
+                    "updated_at": p.get("updated_at"),
+                    "age_hours": None,
+                    "reason": "missing_mark_timestamp",
+                })
+            else:
+                age_h = (now - upd).total_seconds() / 3600.0
+                if age_h > args.stale_price_hours:
+                    stale_positions.append({"ticker": ticker, "updated_at": p.get("updated_at"), "age_hours": round(age_h, 1)})
     if missing_prices:
         issues.append(Issue("critical", account, "position_prices", f"{len(missing_prices)} current position(s) have missing/non-positive current_price", {"tickers": missing_prices}))
     if stale_positions:
-        issues.append(Issue("warning", account, "stale_prices", f"{len(stale_positions)} position price(s) stale > {args.stale_price_hours}h", {"positions": stale_positions[:12]}))
+        issues.append(Issue("critical", account, "stale_prices", f"{len(stale_positions)} held position price(s) stale > {args.stale_price_hours}h; account must remain trade-blocked", {"market": market, "positions": stale_positions[:12]}))
 
     latest = latest_account_row(conn, account, market)
     if latest and state_cash is not None and not missing_prices:

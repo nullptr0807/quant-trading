@@ -32,6 +32,14 @@ ACTIVE_BACKFILL_KEYS = {
     ("CN", "1d", "adjusted", "universe"),
     ("CN", "1d", "raw", "universe"),
 }
+# The production raw-ledger jobs retain five calendar days. The health-owned
+# history replay must never claim a wider window than that source can cover.
+RAW_LEDGER_SCHEDULE_DAYS = 5.0
+CASH_DIVIDEND_ACCOUNTING_POLICY = {
+    "mode": "manual_review",
+    "automatic_historical_cash_credits": False,
+    "health": "policy_not_implemented",
+}
 DAILY_BAR_PUBLICATION_GRACE = {
     "US": timedelta(minutes=30),
     # Sina/akshare commonly publishes the just-closed A-share daily bar
@@ -150,6 +158,74 @@ def _active_held_tickers(con: sqlite3.Connection, market: str) -> list[str]:
     return [str(r[0]) for r in rows]
 
 
+def _active_held_by_account(
+    con: sqlite3.Connection, market: str
+) -> dict[str, list[str]]:
+    """Return positive holdings grouped at the smallest trade-blocking scope."""
+    if not _table_exists(con, "positions"):
+        return {}
+    if _table_exists(con, "account_meta"):
+        rows = con.execute(
+            """
+            SELECT p.account,p.ticker
+            FROM positions p
+            LEFT JOIN account_meta m
+              ON m.account_id=p.account
+             AND COALESCE(m.market,p.market,'US')=COALESCE(p.market,'US')
+            WHERE COALESCE(p.market,'US')=? AND COALESCE(p.shares,0)>0
+              AND COALESCE(m.status,'active')='active'
+            ORDER BY p.account,p.ticker
+            """,
+            (market,),
+        ).fetchall()
+    else:
+        rows = con.execute(
+            "SELECT account,ticker FROM positions "
+            "WHERE COALESCE(market,'US')=? AND COALESCE(shares,0)>0 "
+            "ORDER BY account,ticker",
+            (market,),
+        ).fetchall()
+    grouped: dict[str, list[str]] = {}
+    for row in rows:
+        grouped.setdefault(str(row[0]), []).append(str(row[1]))
+    return grouped
+
+
+def _held_raw_price_issues(
+    con: sqlite3.Connection, market: str, target_date: str
+) -> list[dict]:
+    """Fail only affected accounts closed for missing/stale held raw marks."""
+    issues: list[dict] = []
+    for account, tickers in _active_held_by_account(con, market).items():
+        latest = _latest_by_ticker(con, "prices_raw", market, tickers)
+        missing = sorted(set(tickers) - set(latest))
+        stale = sorted(ticker for ticker, day in latest.items() if day < target_date)
+        common = {
+            "severity": "critical",
+            "market": market,
+            "account": account,
+            "scope": f"{market}:{account}",
+            "price_mode": "raw",
+            "table": "prices_raw",
+            "target_date": target_date,
+            "expected": len(set(tickers)),
+        }
+        if missing:
+            issues.append({
+                **common,
+                "check": "held_raw_price_coverage",
+                "missing_sample": missing[:20],
+            })
+        if stale:
+            issues.append({
+                **common,
+                "check": "held_raw_price_freshness",
+                "stale_sample": stale[:20],
+                "freshest_stale_date": max(latest[t] for t in stale),
+            })
+    return issues
+
+
 def _price_set_issues(
     *,
     con: sqlite3.Connection,
@@ -216,13 +292,50 @@ def check_price_1d_health(
             tickers=universe_by_market.get(market, ()),
             target_date=target,
         ))
-        issues.extend(_price_set_issues(
+        # Preserve aggregate visibility as non-blocking coverage telemetry, then
+        # publish account-scoped critical gates for actual held-mark failures.
+        aggregate_raw = _price_set_issues(
             con=con,
             market=market,
             price_mode="raw",
             tickers=_active_held_tickers(con, market),
             target_date=target,
-        ))
+        )
+        for issue in aggregate_raw:
+            issue["severity"] = "warning"
+        issues.extend(aggregate_raw)
+        issues.extend(_held_raw_price_issues(con, market, target))
+    return issues
+
+
+def check_corporate_action_health(con: sqlite3.Connection) -> list[dict]:
+    """Propagate durable fast-gate failures at their recorded market scope."""
+    if not _table_exists(con, "operational_health"):
+        return []
+    rows = con.execute(
+        "SELECT component,market,status,source_timestamp,details "
+        "FROM operational_health WHERE component LIKE 'corporate_action%' "
+        "AND status!='ok' ORDER BY component,market"
+    ).fetchall()
+    issues: list[dict] = []
+    for row in rows:
+        try:
+            detail = json.loads(row["details"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            detail = {"raw_details": row["details"]}
+        issue = {
+            "severity": "critical",
+            "check": "corporate_action_gate",
+            "component": row["component"],
+            "market": row["market"],
+            "scope": row["market"],
+            "status": row["status"],
+            "source_timestamp": row["source_timestamp"],
+            "detail": detail,
+        }
+        if isinstance(detail, dict) and "accounts" in detail:
+            issue["accounts"] = detail["accounts"]
+        issues.append(issue)
     return issues
 
 
@@ -904,7 +1017,7 @@ def check_ohlc_quality(con: sqlite3.Connection) -> list[dict]:
 
 
 def run_ledger(market: str) -> list[dict]:
-    cmd = [sys.executable, str(PROJECT_ROOT / "scripts" / "ledger_watchdog.py"), "--market", market, "--history-days", "0", "--quiet-ok", "--fail-on-critical"]
+    cmd = [sys.executable, str(PROJECT_ROOT / "scripts" / "ledger_watchdog.py"), "--market", market, "--history-days", str(RAW_LEDGER_SCHEDULE_DAYS), "--quiet-ok", "--fail-on-critical"]
     proc = subprocess.run(cmd, cwd=PROJECT_ROOT, text=True, capture_output=True, timeout=180)
     if proc.returncode == 0:
         return []
@@ -933,6 +1046,7 @@ def main() -> int:
         issues.extend(check_model_factor_freshness(con))
         issues.extend(check_snapshot_diff(con))
         issues.extend(check_ohlc_quality(con))
+        issues.extend(check_corporate_action_health(con))
         now_runtime = datetime.now(timezone.utc)
         issues.extend(check_live_runtime_health(
             con, now=now_runtime, session_open=_runtime_session_open(now_runtime)
@@ -962,6 +1076,7 @@ def main() -> int:
     result = {
         "ok": not any(i["severity"] == "critical" for i in issues),
         "checked_at": datetime.now(timezone.utc).isoformat(),
+        "policies": {"cash_dividend_accounting": CASH_DIVIDEND_ACCOUNTING_POLICY},
         "issues": issues,
     }
     if args.json:
