@@ -43,8 +43,10 @@ def _checkpoint_probe(
 def verify(db_path: str, market: str, min_coverage: float = 0.80, model_ids=None,
            verify_checkpoints: bool = True) -> dict:
     market = market.upper()
+    models = list([f"Q{i:02d}" for i in range(1, 11)] if model_ids is None else model_ids)
+    if not models:
+        return {"market": market, "models": [], "skipped": "no_active_qlib_accounts"}
     universe = list(UNIVERSES[market])
-    models = list(model_ids or [f"Q{i:02d}" for i in range(1, 11)])
     if not universe:
         raise RuntimeError(f"empty {market} universe")
     con = sqlite3.connect(f"file:{Path(db_path).resolve()}?mode=ro", uri=True)
@@ -149,10 +151,27 @@ def main() -> int:
     p.add_argument('--db', default='data/trading.db')
     p.add_argument('--market', choices=['US','CN'], required=True)
     p.add_argument('--models', default='')
+    p.add_argument('--model-manifest', default='')
     p.add_argument('--min-coverage', type=float, default=.80)
     a = p.parse_args()
-    models = [x.strip() for x in a.models.split(',') if x.strip()] or None
+    from factors.qlib_signal import MODEL_SPECS
+    from scripts.qlib_model_selection import select_qlib_model_ids
+    if a.model_manifest:
+        manifest = json.loads(Path(a.model_manifest).read_text())
+        if manifest.get('market') != a.market or not isinstance(manifest.get('models'), list):
+            raise RuntimeError('invalid or wrong-market Qlib model manifest')
+        if Path(manifest.get('db', '')).resolve() != Path(a.db).resolve():
+            raise RuntimeError('Qlib model manifest DB mismatch')
+        models = manifest['models']
+    else:
+        requested = [x.strip() for x in a.models.split(',') if x.strip()] if a.models else None
+        models = select_qlib_model_ids(
+            a.db, a.market, [spec.id for spec in MODEL_SPECS], requested,
+        )
     result = verify(a.db, a.market, a.min_coverage, models)
+    if result.get('skipped'):
+        print(f"QLIB_PUBLISH_SKIPPED market={a.market} reason={result['skipped']}")
+        return 0
     marker = write_publication_marker(result)
     print(f"QLIB_PUBLISH_OK market={result['market']} date={result['date']} coverage={result['coverage']} marker={marker}")
     return 0

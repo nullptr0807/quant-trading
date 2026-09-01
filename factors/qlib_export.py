@@ -31,7 +31,7 @@ import pandas as pd
 PROJECT_ROOT = os.path.expanduser("~/quant-trading")
 sys.path.insert(0, PROJECT_ROOT)
 
-DB_PATH = os.path.join(PROJECT_ROOT, "data", "trading.db")
+DB_PATH = os.environ.get("QUANT_DB_PATH", os.path.join(PROJECT_ROOT, "data", "trading.db"))
 QLIB_DIR = os.path.expanduser("~/.qlib/qlib_data/us_data")
 
 # Fields qlib's Alpha158 expects (we have all of these in `prices` table).

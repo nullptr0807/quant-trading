@@ -60,7 +60,7 @@ def retire(account_id: str, reason: str, market: str = "US") -> int:
         _emit_event(
             conn, category="lifecycle", severity="warning",
             account=account_id,
-            title=f"🟡 {account_id} 已退役 ({strat})",
+            title=f"🟡 {account_id} 已退役",
             detail=f'{{"reason": {reason!r}, "retired_at": {now!r}}}',
             market=market,
         )

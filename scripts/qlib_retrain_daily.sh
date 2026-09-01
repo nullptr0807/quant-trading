@@ -77,11 +77,13 @@ if [ "${QUANT_QLIB_ALREADY_LOCKED:-0}" != "1" ]; then
     exec "${lock_args[@]}"
 fi
 
-run_args=(--market "$MARKET" --model-timeout-seconds "${QLIB_MODEL_TIMEOUT_SECONDS:-10800}")
+MODEL_MANIFEST=$(mktemp "/tmp/qlib_models_${MARKET}.XXXXXX.json")
+trap 'rm -f "$MODEL_MANIFEST"' EXIT
+run_args=(--market "$MARKET" --db "$DB" --model-manifest "$MODEL_MANIFEST" --model-timeout-seconds "${QLIB_MODEL_TIMEOUT_SECONDS:-10800}")
 if [ -n "$MODELS" ]; then
     run_args+=(--models "$MODELS")
 fi
-verify_args=(--market "$MARKET")
+verify_args=(--market "$MARKET" --db "$DB" --model-manifest "$MODEL_MANIFEST")
 if [ -n "$MODELS" ]; then
     verify_args+=(--models "$MODELS")
 fi
@@ -128,6 +130,13 @@ fi
 set -e
 end="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 duration=$(($(date +%s)-t0))
+if [ "$rc" -eq 3 ] && [ "$phase" = retrain ]; then
+    if ! record_health skipped 0 '{"phase":"skipped","reason":"no_active_qlib_accounts"}' "$start" "$end" "$duration"; then
+        exit 70
+    fi
+    echo "===== Qlib retrain [$MARKET] SKIPPED $end no active accounts =====" >> "$LOG"
+    exit 0
+fi
 if [ "$rc" -eq 0 ]; then
     if ! record_health ok 0 '{"phase":"verified"}' "$start" "$end" "$duration"; then
         echo "===== Qlib retrain [$MARKET] FAIL  $end exit=70 phase=health_write =====" >> "$LOG"

@@ -1,7 +1,9 @@
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -37,12 +39,61 @@ class FactorMinerFamilyConfigTest(unittest.TestCase):
         self.assertIn("F11", cn_ids)
         self.assertIn("B11", cn_ids)
 
+    def test_pb16_is_an_exact_us_only_signal_clone_of_b16(self):
+        from accounts.gp_strategies import GP_STRATEGIES, active_gp_strategies_for_market
+
+        by_id = {g.id: g for g in GP_STRATEGIES}
+        b16, clone = by_id["B16"], by_id["PB16"]
+        self.assertEqual(clone.signal_source_id, "B16")
+        for field in (
+            "top_n", "rebalance_hours", "stop_loss", "max_position_pct",
+            "factor_selection", "scoring_method", "gp_seed", "gp_population",
+            "gp_generations", "gp_n_runs", "gp_parsimony", "gp_n_factors",
+            "gp_y_target", "gp_feature_subset", "gp_dedup_threshold",
+        ):
+            self.assertEqual(getattr(clone, field), getattr(b16, field), field)
+        self.assertIn("PB16", {g.id for g in active_gp_strategies_for_market("US")})
+        self.assertNotIn("PB16", {g.id for g in active_gp_strategies_for_market("CN")})
+
     def test_minute_updater_stop_loss_map_includes_cn_factor_miner_accounts(self):
         from scripts.update_prices import STOP_LOSS_BY_ACCT
 
         self.assertIn("F11", STOP_LOSS_BY_ACCT)
         self.assertIn("CF11", STOP_LOSS_BY_ACCT)
         self.assertEqual(STOP_LOSS_BY_ACCT["F11"], STOP_LOSS_BY_ACCT["CF11"])
+        self.assertEqual(STOP_LOSS_BY_ACCT["PB16"], STOP_LOSS_BY_ACCT["B16"])
+
+    def test_health_uses_b16_factor_provenance_for_pb16(self):
+        from scripts.health_check import check_model_factor_freshness
+
+        con = sqlite3.connect(":memory:")
+        con.row_factory = sqlite3.Row
+        con.executescript(
+            '''
+            CREATE TABLE account_meta(
+                account_id TEXT, market TEXT, "group" TEXT, status TEXT, factors TEXT
+            );
+            CREATE TABLE account_state(account TEXT, market TEXT);
+            CREATE TABLE prices(ticker TEXT, datetime TEXT, interval TEXT);
+            CREATE TABLE factor_values(
+                ticker TEXT, date TEXT, factor_name TEXT, value REAL, factor_group TEXT
+            );
+            '''
+        )
+        con.execute(
+            "INSERT INTO account_meta VALUES(?,?,?,?,?)",
+            ("PB16", "US", "B", "active", "GP(paper_clone=true,signal_source=B16)"),
+        )
+        con.execute("INSERT INTO account_state VALUES('PB16','US')")
+        con.execute("INSERT INTO prices VALUES('AAA','2026-08-27','1d')")
+        con.execute(
+            "INSERT INTO factor_values VALUES('AAA','2026-08-27','b16_factor',1,'gp_B16')"
+        )
+        mined = {"B16": [{"name": "b16_factor", "expression": "X0", "active": True}]}
+        with patch("scripts.health_check._load_json", side_effect=[mined, {}]):
+            issues = check_model_factor_freshness(con)
+
+        self.assertEqual(issues, [])
 
 
 class FactorMinerFeatureTest(unittest.TestCase):

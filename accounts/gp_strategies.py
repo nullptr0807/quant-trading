@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Optional, Tuple
 
 
@@ -33,6 +33,9 @@ class GPStrategyConfig:
     # FactorMiner-style global family correlation / replacement controls.
     gp_global_corr_threshold: float = 0.6
     gp_replacement_ic_mult: float = 1.3
+    # A paper clone may reuse another account's mined factors/ranking. Portfolio
+    # cash, positions, fills, cooldowns and rebalance state remain account-local.
+    signal_source_id: Optional[str] = None
 
 
 GP_STRATEGIES: List[GPStrategyConfig] = [
@@ -221,6 +224,18 @@ GP_STRATEGIES: List[GPStrategyConfig] = [
         gp_global_corr_threshold=0.6,
     ),
 ]
+
+# Fresh paper control for the live B16 rollout. ``replace`` keeps every B16
+# portfolio parameter identical; only identity/label and signal provenance vary.
+_B16 = next(g for g in GP_STRATEGIES if g.id == "B16")
+GP_STRATEGIES.append(replace(
+    _B16,
+    id="PB16",
+    name="反转捕手·实盘对照",
+    description="B16同因子同排名的独立Paper对照账户（2026-08-27起）",
+    enabled_markets=("US",),
+    signal_source_id="B16",
+))
 
 
 def active_gp_strategies_for_market(market: str) -> List[GPStrategyConfig]:

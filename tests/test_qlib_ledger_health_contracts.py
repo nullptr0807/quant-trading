@@ -482,7 +482,9 @@ def test_failed_corporate_action_health_is_market_scoped_and_dividend_policy_exp
         ],
     )
 
-    issues = check_corporate_action_health(con)
+    issues = check_corporate_action_health(
+        con, now=datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
+    )
 
     assert len(issues) == 1
     assert issues[0]["severity"] == "critical"

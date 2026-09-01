@@ -191,6 +191,19 @@ def _apply_corporate_action(
     position["shares"] *= ratio
 
 
+def _canonicalize_position_symbols(
+    positions: dict[str, dict[str, float]], market: str, at: str,
+) -> dict[str, dict[str, float]]:
+    """Apply audited identifier changes to replay inventory at the audit cutoff."""
+    out: dict[str, dict[str, float]] = {}
+    for ticker, position in positions.items():
+        canonical = canonical_ticker(ticker, market, at)
+        target = out.setdefault(canonical, {"shares": 0.0, "total_cost": 0.0})
+        target["shares"] += float(position.get("shares", 0.0))
+        target["total_cost"] += float(position.get("total_cost", 0.0))
+    return out
+
+
 def replay_account(
     conn: sqlite3.Connection,
     account: str,
@@ -341,8 +354,9 @@ def replay_account(
         elif side == "sell":
             sells_notional_day += notional
 
+    canonical_pos = _canonicalize_position_symbols(pos, market, day_end)
     clean_pos = {
-        t: p for t, p in pos.items()
+        t: p for t, p in canonical_pos.items()
         if abs(p.get("shares", 0.0)) > 1e-9
     }
     return AccountReplay(
@@ -514,8 +528,9 @@ def _replay_series(
                 ti += 1
             else:
                 break
+        canonical_snapshot = _canonicalize_position_symbols(positions, market, ts)
         snap_pos = {
-            t: dict(p) for t, p in positions.items()
+            t: dict(p) for t, p in canonical_snapshot.items()
             if abs(p.get("shares", 0.0)) > 1e-9
         }
         out.append((row, cash, snap_pos, list(oversells)))

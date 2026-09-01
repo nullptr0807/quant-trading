@@ -632,8 +632,10 @@ def check_model_factor_freshness(con: sqlite3.Connection) -> list[dict]:
     legacy = _load_json(PROJECT_ROOT / "factors" / "mined_alphas_per_account.json")
     fmgp = _load_json(PROJECT_ROOT / "factors" / "factor_miner_gp" / "mined_alphas_f.json")
 
+    meta_columns = {row[1] for row in con.execute("PRAGMA table_info(account_meta)")}
+    factors_select = "factors" if "factors" in meta_columns else "'' AS factors"
     meta_rows = con.execute(
-        "SELECT account_id, market, \"group\" AS grp, status FROM account_meta "
+        f"SELECT account_id, market, \"group\" AS grp, status, {factors_select} FROM account_meta "
         "WHERE COALESCE(status,'active')='active' AND \"group\" IN ('Q','B','F') "
         "ORDER BY market, account_id"
     ).fetchall()
@@ -642,6 +644,10 @@ def check_model_factor_freshness(con: sqlite3.Connection) -> list[dict]:
         acct = r["account_id"]
         market = r["market"] or "US"
         grp = r["grp"]
+        source_match = re.search(
+            r"(?:^|,)signal_source=([A-Z0-9_]+)", r["factors"] or ""
+        )
+        source_acct = source_match.group(1) if source_match else acct
         # Ignore inert metadata placeholders (e.g. C01) with no operational rows.
         if not _has_account_activity(con, acct, market):
             continue
@@ -685,7 +691,7 @@ def check_model_factor_freshness(con: sqlite3.Connection) -> list[dict]:
                     })
             continue
 
-        mined = fmgp.get(acct) if grp == "F" else legacy.get(acct)
+        mined = fmgp.get(source_acct) if grp == "F" else legacy.get(source_acct)
         active_count = _active_factor_count(mined)
         failure_count = _failure_marker_count(mined)
         if active_count == 0:
@@ -704,13 +710,14 @@ def check_model_factor_freshness(con: sqlite3.Connection) -> list[dict]:
                 "severity": "warning",
                 "check": "model_factor",
                 "account": acct,
+                "signal_source": source_acct,
                 "group": grp,
                 "status": "mining_failed" if failure_count else "no_active_factor",
                 "failure_markers": failure_count,
             })
             continue
 
-        factor_group = f"fmgp_{acct}" if grp == "F" else f"gp_{acct}"
+        factor_group = f"fmgp_{source_acct}" if grp == "F" else f"gp_{source_acct}"
         row = con.execute(
             "SELECT MAX(date) max_date, COUNT(DISTINCT ticker) tickers, COUNT(*) rows "
             "FROM factor_values WHERE factor_group=?",
@@ -723,6 +730,7 @@ def check_model_factor_freshness(con: sqlite3.Connection) -> list[dict]:
                 "severity": "warning",
                 "check": "model_factor",
                 "account": acct,
+                "signal_source": source_acct,
                 "group": grp,
                 "factor_group": factor_group,
                 "detail": "active mined factors exist but no persisted runtime values",
@@ -730,12 +738,12 @@ def check_model_factor_freshness(con: sqlite3.Connection) -> list[dict]:
             })
         elif lag is not None and lag > 3:
             issues.append({
-                # Persisted GP/F factor_values are diagnostics, not the live trading
-                # source of truth (main.py recomputes runtime matrices in memory each
-                # cycle). Treat stale persisted rows as warning; Alpha/Q remain stricter.
+                # Fast paper cycles consume these persisted rows directly. Keep the
+                # existing warning policy here, but identify the exact source group.
                 "severity": "warning",
                 "check": "model_factor",
                 "account": acct,
+                "signal_source": source_acct,
                 "group": grp,
                 "factor_group": factor_group,
                 "factor_date": max_date,

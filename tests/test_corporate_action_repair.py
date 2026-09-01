@@ -337,6 +337,7 @@ def test_split_apply_is_atomic_audited_idempotent_and_market_isolated(tmp_path):
 
 def test_watchdog_replays_audited_split_in_current_and_historical_state(tmp_path):
     from scripts.ledger_watchdog import _replay_series, compare_positions, replay_account
+    from scripts.migrate_security_symbol import migrate
     from scripts.repair_open_position_split import repair_open_split
 
     db = tmp_path / "trading.db"
@@ -358,6 +359,8 @@ def test_watchdog_replays_audited_split_in_current_and_historical_state(tmp_path
         ex_date="2026-08-17", ratio=2.793, source="yfinance.splits",
         apply=True, backup_handle=backup, now=applied_at,
     )
+    migrated = migrate(str(db), "US", "AVB", apply=True)
+    assert migrated["migrated"] == 1
 
     con = sqlite3.connect(db)
     con.row_factory = sqlite3.Row
@@ -370,10 +373,10 @@ def test_watchdog_replays_audited_split_in_current_and_historical_state(tmp_path
     ).fetchall()
     series = _replay_series(con, "A02", "US", 10000.0, account_rows)
 
-    assert current.positions["AVB"]["shares"] == pytest.approx(27.93)
-    assert current.positions["AVB"]["total_cost"] == pytest.approx(1801.92)
+    assert current.positions["VMRK"]["shares"] == pytest.approx(27.93)
+    assert current.positions["VMRK"]["total_cost"] == pytest.approx(1801.92)
     assert series[0][2]["AVB"]["shares"] == pytest.approx(10.0)
-    assert series[-1][2]["AVB"]["shares"] == pytest.approx(27.93)
+    assert series[-1][2]["VMRK"]["shares"] == pytest.approx(27.93)
     db_positions = con.execute(
         "SELECT * FROM positions WHERE account='A02' AND market='US'"
     ).fetchall()

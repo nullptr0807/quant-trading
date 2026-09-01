@@ -510,6 +510,13 @@ class QuantSystem:
                     parts.append(f"feat={'/'.join(feat)}")
                 backend = getattr(g, "mining_backend", "gplearn")
                 prefix = "FMGP" if backend == "factor_miner_gp" else "GP"
+                source_id = self._gp_signal_source_id(g)
+                if source_id != g.id:
+                    parts.extend([
+                        "paper_clone=true", f"signal_source={source_id}",
+                        f"ranking_source={source_id}", f"execution_account={g.id}",
+                        "comparison_start=2026-08-27",
+                    ])
                 gp_factors_str = f"{prefix}({','.join(parts)})"
                 entries.append((g.id, g.name, g.description, getattr(g, "family", "B"), gp_factors_str))
             for q in self.qlib_strategies:
@@ -520,7 +527,7 @@ class QuantSystem:
                                 bm.get("ticker", "")))
             for acct_id, strat_name, desc, grp, factors in entries:
                 exists = conn.execute(
-                    "SELECT 1 FROM account_meta WHERE account_id=? AND market=?",
+                    "SELECT status FROM account_meta WHERE account_id=? AND market=?",
                     (acct_id, self.market),
                 ).fetchone()
                 if exists:
@@ -533,7 +540,9 @@ class QuantSystem:
                             "UPDATE account_meta SET strategy_name=?, description=?, "
                             "\"group\"=?, factors=? "
                             "WHERE account_id=? AND market=?",
-                            (strat_name, desc, grp, factors, acct_id, self.market),
+                            (strat_name, desc, grp,
+                             factors if exists[0] == "active" else "",
+                             acct_id, self.market),
                         )
                     except Exception:
                         pass
@@ -1222,8 +1231,9 @@ class QuantSystem:
             )
 
         for gp_strat in self.gp_strategies:
+            source_id = self._gp_signal_source_id(gp_strat)
             mined = [
-                f for f in self._per_account_mined.get(gp_strat.id, [])
+                f for f in self._per_account_mined.get(source_id, [])
                 if self._is_active_mined_factor(f)
             ]
             names = [str(f.get("name")) for f in mined if f.get("name")]
@@ -1239,7 +1249,7 @@ class QuantSystem:
             prefix = "fmgp" if getattr(gp_strat, "family", "B") == "F" else "gp"
             frames = self._load_latest_persisted_factor_frames(
                 account_id=gp_strat.id,
-                factor_group=f"{prefix}_{gp_strat.id}",
+                factor_group=f"{prefix}_{source_id}",
                 factor_names=names,
             )
             self._per_account_gp_factors[gp_strat.id] = frames
@@ -1568,6 +1578,11 @@ class QuantSystem:
     def _active_mined_count(cls, factors: list[dict] | None) -> int:
         return sum(1 for f in (factors or []) if cls._is_active_mined_factor(f))
 
+    @staticmethod
+    def _gp_signal_source_id(strategy) -> str:
+        """Resolve factor/ranking provenance without sharing portfolio state."""
+        return str(getattr(strategy, "signal_source_id", None) or strategy.id)
+
     def _publish_gp_runtime_statuses(self) -> None:
         """Expose factor readiness without abusing lifecycle ``status``.
 
@@ -1579,25 +1594,28 @@ class QuantSystem:
         if setter is None:
             return
         for strategy in self.gp_strategies:
-            factors = list(self._per_account_mined.get(strategy.id) or [])
+            source_id = self._gp_signal_source_id(strategy)
+            factors = list(self._per_account_mined.get(source_id) or [])
             active = self._active_mined_count(factors)
             marker = next(
                 (f for f in factors if f.get("status") == "mining_failed"), None
             )
             if marker:
+                detail = dict(marker)
+                detail["signal_source"] = source_id
                 setter(
                     strategy.id, self.market, "non_tradeable",
-                    str(marker.get("reason") or "NO_ADMISSIBLE_FACTOR"), marker,
+                    str(marker.get("reason") or "NO_ADMISSIBLE_FACTOR"), detail,
                 )
             elif active:
                 setter(
                     strategy.id, self.market, "ready", None,
-                    {"active_factors": active},
+                    {"active_factors": active, "signal_source": source_id},
                 )
             else:
                 setter(
                     strategy.id, self.market, "non_tradeable", "empty_config",
-                    {"active_factors": 0},
+                    {"active_factors": 0, "signal_source": source_id},
                 )
 
     def _publish_qlib_runtime_statuses(self) -> None:
@@ -1696,10 +1714,33 @@ class QuantSystem:
         known-failed accounts. Legacy B/CB keeps the old behavior: empty factor
         lists are treated as missing and can be retried.
         """
+        conn = self.store._conn()
+        try:
+            rows = conn.execute(
+                "SELECT account_id,status FROM account_meta WHERE market=?",
+                (self.market,),
+            ).fetchall()
+        finally:
+            conn.close()
+        status_by_id = {str(row[0]): row[1] for row in rows}
+        configured_ids = {self._gp_signal_source_id(g) for g in self.gp_strategies}
+        absent = sorted(configured_ids - set(status_by_id))
+        if absent:
+            raise RuntimeError(f"GP lifecycle metadata incomplete for {self.market}: {absent}")
+
         missing = []
         for g in self.gp_strategies:
-            factors = self._per_account_mined.get(g.id)
-            if g.id not in self._per_account_mined:
+            source_id = self._gp_signal_source_id(g)
+            status = status_by_id.get(source_id)
+            if status == "retired":
+                continue
+            if status != "active":
+                raise RuntimeError(f"GP lifecycle status invalid for {self.market}/{source_id}: {status!r}")
+            # A signal-only clone must never launch an independent mining run.
+            if source_id != g.id:
+                continue
+            factors = self._per_account_mined.get(source_id)
+            if source_id not in self._per_account_mined:
                 missing.append(g)
                 continue
             if getattr(g, "mining_backend", "gplearn") == "factor_miner_gp":
@@ -1802,7 +1843,8 @@ class QuantSystem:
         gp_history = self._load_gp_compute_history()
         self._per_account_gp_factors = {}
         for gp_strat in self.gp_strategies:
-            mined = [f for f in self._per_account_mined.get(gp_strat.id, []) if self._is_active_mined_factor(f)]
+            source_id = self._gp_signal_source_id(gp_strat)
+            mined = [f for f in self._per_account_mined.get(source_id, []) if self._is_active_mined_factor(f)]
             if not mined:
                 self._per_account_gp_factors[gp_strat.id] = {}
                 continue
@@ -1817,6 +1859,8 @@ class QuantSystem:
             if gp_factors:
                 try:
                     acct_cfg = next((g for g in self.gp_strategies if g.id == acct_id), None)
+                    if acct_cfg and self._gp_signal_source_id(acct_cfg) != acct_id:
+                        continue
                     group_prefix = "fmgp" if acct_cfg and getattr(acct_cfg, "family", "B") == "F" else "gp"
                     self.store.save_factor_df(gp_factors, group=f"{group_prefix}_{acct_id}")
                 except Exception as e:
@@ -1958,7 +2002,8 @@ class QuantSystem:
                     if len(fdf.iloc[i].dropna()) > 0:
                         usable += 1
                         break
-            active_factor_count = self._active_mined_count(self._per_account_mined.get(gp_strat.id, []))
+            source_id = self._gp_signal_source_id(gp_strat)
+            active_factor_count = self._active_mined_count(self._per_account_mined.get(source_id, []))
             log.warning(
                 "[%s] GP signals empty — skipping rebalance to preserve positions "
                 "(active_factors=%d, factor_frames=%d, nonempty_frames=%d, usable_last5=%d, top_n=%d)",
@@ -2067,7 +2112,8 @@ class QuantSystem:
 
     def _filter_gp_factors(self, gp_strat, gp_factors_dict: dict) -> dict:
         """Filter GP factors based on strategy's factor_selection and scoring_method."""
-        mined_factors = self._per_account_mined.get(gp_strat.id, [])
+        source_id = self._gp_signal_source_id(gp_strat)
+        mined_factors = self._per_account_mined.get(source_id, [])
         if not mined_factors or not gp_factors_dict:
             return gp_factors_dict
         mined_factors = [f for f in mined_factors if self._is_active_mined_factor(f)]

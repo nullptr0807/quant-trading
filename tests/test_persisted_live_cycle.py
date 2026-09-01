@@ -136,6 +136,44 @@ def test_persisted_gp_and_f_load_only_their_group_and_active_factor_names(
     assert system._prepared_gp_signals["F11"]["buy"][0] == "CCC"
 
 
+def test_pb16_reuses_b16_ranking_but_keeps_independent_portfolio_state(tmp_path, monkeypatch):
+    system = _bare_system(tmp_path, universe=("AAA", "BBB", "CCC"))
+    common = dict(
+        family="B", factor_selection="all", scoring_method="equal_weight",
+        top_n=1, rebalance_hours=12,
+    )
+    system.gp_strategies = [
+        SimpleNamespace(id="B16", signal_source_id=None, **common),
+        SimpleNamespace(id="PB16", signal_source_id="B16", **common),
+    ]
+    for strategy in system.gp_strategies:
+        system.engine.create_account(strategy.id, initial_cash=10_000)
+    with system.store._conn() as con:
+        con.executemany(
+            "INSERT INTO account_meta(account_id,market,status) VALUES (?, 'US', 'active')",
+            [("B16",), ("PB16",)],
+        )
+    system._per_account_mined = {
+        "B16": [{"name": "b16_active", "expression": "X0", "active": True, "ic": 0.2}],
+    }
+    _insert_prices_and_factors(
+        system,
+        rows=[
+            (ticker, "2026-07-09", "b16_active", value, "gp_B16")
+            for ticker, value in (("AAA", 3), ("BBB", 2), ("CCC", 1))
+        ],
+    )
+    monkeypatch.setattr("main.emit_event", lambda *args, **kwargs: None)
+
+    system.prepare_fast_live_cycle()
+
+    assert system._prepared_gp_signals["PB16"] == system._prepared_gp_signals["B16"]
+    assert system._missing_gp_strategies() == []
+    system.engine.get_account("PB16").cash -= 100
+    assert system.engine.get_account("B16").cash == 10_000
+    assert system.engine.get_account("PB16").cash == 9_900
+
+
 def test_persisted_cycle_skips_explicit_empty_gp_config_without_data_gate_error(
     tmp_path, monkeypatch
 ):

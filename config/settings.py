@@ -133,7 +133,7 @@ STOCK_UNIVERSE = [
     "STLD", "SW", "VMC", "WLK",
 
     # Real Estate (64)
-    "ADC", "AMH", "AMT", "ARE", "AVB", "BRX", "BXP", "CBRE", "CCI", "COLD",
+    "ADC", "AMH", "AMT", "ARE", "VMRK", "BRX", "BXP", "CBRE", "CCI", "COLD",
     "CPT", "CSGP", "CUBE", "CUZ", "DLR", "DOC", "EGP", "ELS", "EPR", "EQIX",
     "EQR", "ESS", "EXR", "FR", "FRMI", "FRT", "GLPI", "HHH", "HIW", "HR",
     "HST", "INVH", "IRM", "JLL", "KIM", "KRC", "LAMR", "LINE", "MAA", "MPT",

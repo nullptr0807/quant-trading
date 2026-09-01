@@ -41,6 +41,14 @@ def test_verify_qlib_accepts_complete_target_date(tmp_path, monkeypatch):
     assert result['coverage']=={'Q01':2}
 
 
+def test_verify_empty_frozen_manifest_is_successful_noop_without_prices(tmp_path):
+    import scripts.verify_qlib_scores as verify
+    db = tmp_path / 'empty.db'
+    assert verify.verify(str(db), 'US', model_ids=[], verify_checkpoints=False) == {
+        'market': 'US', 'models': [], 'skipped': 'no_active_qlib_accounts'
+    }
+
+
 def test_verify_qlib_rejects_checkpoint_without_pit_proof(tmp_path, monkeypatch):
     import scripts.verify_qlib_scores as verify
     import factors.qlib_checkpoint as checkpoint

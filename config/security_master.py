@@ -11,6 +11,16 @@ SYMBOL_CHANGES = {
         "ratio": 1.0,
         "evidence": "SEC CIK 1800227: IAC Inc. renamed People Inc; current Nasdaq ticker PPLI",
     },
+    ("US", "AVB"): {
+        "new_ticker": "VMRK",
+        "effective_at": "2026-08-25T00:00:00+00:00",
+        "ratio": 1.0,
+        "evidence": (
+            "Yahoo symbol search and quote history identify Vivmark Residential as VMRK; "
+            "AVB history ends 2026-08-24 and VMRK continues 2026-08-25. The 2.793 share "
+            "conversion was already applied separately, so this identifier migration is 1:1."
+        ),
+    },
 }
 
 # Audit findings with insufficient evidence for a safe identifier mapping.  They

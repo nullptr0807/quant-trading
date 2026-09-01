@@ -40,12 +40,14 @@ logging.basicConfig(
 log = logging.getLogger("qlib_retrain")
 
 
-def run_export(market: str) -> int:
+def run_export(market: str, db_path: str) -> int:
     log.info("[export] refreshing qlib bin for %s", market)
     t0 = time.time()
+    env = os.environ.copy()
+    env["QUANT_DB_PATH"] = str(Path(db_path).expanduser().resolve())
     r = subprocess.run(
         [sys.executable, "-m", "factors.qlib_export", "--market", market],
-        cwd=PROJECT_ROOT, capture_output=True, text=True,
+        cwd=PROJECT_ROOT, capture_output=True, text=True, env=env,
     )
     elapsed = time.time() - t0
     if r.returncode != 0:
@@ -60,7 +62,7 @@ def run_export(market: str) -> int:
 
 def run_one_model(model_id: str, market: str,
                   train_days: int, valid_days: int, predict_days: int,
-                  log_dir: Path,
+                  log_dir: Path, db_path: str,
                   model_timeout_seconds: int | None = None) -> dict:
     """Run one model in a subprocess. Stream stdout to log file."""
     log.info("[%s] training... (subprocess, timeout=%s)",
@@ -84,12 +86,15 @@ def run_one_model(model_id: str, market: str,
         lf.write(f"# timeout_seconds: {model_timeout_seconds or 'none'}\n")
         lf.flush()
         try:
+            env = os.environ.copy()
+            env["QUANT_DB_PATH"] = str(Path(db_path).expanduser().resolve())
             r = subprocess.run(
                 cmd,
                 cwd=PROJECT_ROOT,
                 stdout=lf,
                 stderr=subprocess.STDOUT,
                 timeout=model_timeout_seconds,
+                env=env,
             )
             returncode = r.returncode
         except subprocess.TimeoutExpired:
@@ -125,6 +130,9 @@ def main():
     p.add_argument("--models", default=None,
                    help="comma-separated model ids (default: all Q01..Q10)")
     p.add_argument("--market", default="US", choices=["US", "CN"])
+    p.add_argument("--db", default=os.environ.get("QUANT_DB_PATH", "data/trading.db"),
+                   help="trading DB used for market-scoped active-account selection")
+    p.add_argument("--model-manifest", default="")
     p.add_argument("--train-days", type=int, default=360)
     p.add_argument("--valid-days", type=int, default=60)
     p.add_argument("--predict-days", type=int, default=5)
@@ -136,10 +144,17 @@ def main():
     args = p.parse_args()
 
     from factors.qlib_signal import MODEL_SPECS
-    if args.models:
-        ids = [m.strip() for m in args.models.split(",") if m.strip()]
-    else:
-        ids = [s.id for s in MODEL_SPECS]
+    from scripts.qlib_model_selection import select_qlib_model_ids
+    available = [s.id for s in MODEL_SPECS]
+    requested = [m.strip() for m in args.models.split(",") if m.strip()] if args.models else None
+    ids = select_qlib_model_ids(args.db, args.market, available, requested)
+    if args.model_manifest:
+        Path(args.model_manifest).write_text(json.dumps({
+            "market": args.market,
+            "db": str(Path(args.db).expanduser().resolve()),
+            "models": ids,
+            "selected_at": datetime.now(timezone.utc).isoformat(),
+        }, indent=2))
     log.info("retrain plan: market=%s models=%s", args.market, ids)
 
     # Per-day log dir
@@ -148,9 +163,21 @@ def main():
     log_dir.mkdir(parents=True, exist_ok=True)
     log.info("per-model logs: %s", log_dir)
 
+    if not ids:
+        summary_path = log_dir / "summary.json"
+        summary_path.write_text(json.dumps({
+            "market": args.market,
+            "started_utc": datetime.now(timezone.utc).isoformat(),
+            "n_ok": 0, "n_total": 0, "batch_elapsed_s": 0.0,
+            "models": [], "skipped": "no_active_qlib_accounts",
+        }, indent=2))
+        log.info("no active Qlib accounts for %s; export/training skipped", args.market)
+        log.info("summary: %s", summary_path)
+        raise SystemExit(3)
+
     # 1. Export
     if not args.skip_export:
-        rc = run_export(args.market)
+        rc = run_export(args.market, args.db)
         if rc != 0:
             log.error("export failed, aborting batch")
             sys.exit(1)
@@ -164,7 +191,7 @@ def main():
         s = run_one_model(
             mid, args.market,
             args.train_days, args.valid_days, args.predict_days,
-            log_dir,
+            log_dir, args.db,
             args.model_timeout_seconds,
         )
         summaries.append(s)

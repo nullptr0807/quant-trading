@@ -32,6 +32,25 @@ def test_gp_runtime_status_distinguishes_ready_and_non_tradeable():
     assert rows["F16"][2:4] == ("non_tradeable", "empty_config")
 
 
+def test_gp_signal_clone_inherits_source_readiness():
+    system = object.__new__(QuantSystem)
+    system.market = "US"
+    system.store = Store()
+    system.gp_strategies = [
+        SimpleNamespace(id="B16", signal_source_id=None),
+        SimpleNamespace(id="PB16", signal_source_id="B16"),
+    ]
+    system._per_account_mined = {
+        "B16": [{"expression": "X0", "active": True}],
+    }
+
+    system._publish_gp_runtime_statuses()
+
+    rows = {row[0]: row for row in system.store.rows}
+    assert rows["B16"][2] == rows["PB16"][2] == "ready"
+    assert rows["PB16"][4]["signal_source"] == "B16"
+
+
 def test_qlib_runtime_status_tracks_checkpoint_publication(tmp_path, monkeypatch):
     db=tmp_path/'q.db';con=sqlite3.connect(db)
     con.executescript(

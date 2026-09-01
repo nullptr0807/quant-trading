@@ -55,6 +55,25 @@ def test_iac_symbol_change_is_effective_only_from_sec_change_date():
     assert ticker_lifecycle_block_reason("PPLI", "US", "2026-07-10T14:00:00+00:00") is None
 
 
+def test_avb_symbol_change_starts_when_vmrk_history_takes_over():
+    from config.security_master import canonical_ticker, ticker_lifecycle_block_reason
+    from config.settings import STOCK_UNIVERSE
+
+    assert canonical_ticker("AVB", "US", "2026-08-24T23:59:59+00:00") == "AVB"
+    assert canonical_ticker("AVB", "US", "2026-08-25T00:00:00+00:00") == "VMRK"
+    assert ticker_lifecycle_block_reason("AVB", "US", "2026-08-25T00:00:00+00:00") == "symbol_changed_to_VMRK"
+    assert "VMRK" in STOCK_UNIVERSE and "AVB" not in STOCK_UNIVERSE
+
+
+def test_replay_inventory_canonicalizes_avb_to_vmrk_at_cutoff():
+    from scripts.ledger_watchdog import _canonicalize_position_symbols
+
+    before = {"AVB": {"shares": 27.93, "total_cost": 1808.673375}}
+    assert set(_canonicalize_position_symbols(before, "US", "2026-08-24T23:59:59+00:00")) == {"AVB"}
+    after = _canonicalize_position_symbols(before, "US", "2026-08-25T00:00:00+00:00")
+    assert after == {"VMRK": {"shares": 27.93, "total_cost": 1808.673375}}
+
+
 def test_main_execution_gate_rejects_old_symbol_even_with_a_price(monkeypatch):
     import main
 

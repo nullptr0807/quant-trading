@@ -228,7 +228,11 @@ class BacktestEngine:
             results.append(result)
 
         # Run B accounts
+        # Operational paper clones are forward controls, not independent mined
+        # strategies. Exclude them from ordinary historical strategy reports.
         for gp_strat in active_gp_strategies_for_market("US"):
+            if getattr(gp_strat, "signal_source_id", None):
+                continue
             result = self._backtest_gp_account(gp_strat, all_data, sim_dates, costs)
             result.metadata = build_research_metadata(
                 universe=self.validity, signal_price_mode="adjusted",
